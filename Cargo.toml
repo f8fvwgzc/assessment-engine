@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/assessment-core", "crates/assessment-grpc", "crates/assessment-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["nexc-engine contributors"]
+repository = "https://github.com/f8fvwgzc/assessment-engine"
+homepage = "https://github.com/f8fvwgzc/assessment-engine"
+keywords = ["impact-analysis", "semver", "planning", "grpc", "change-assessment"]
+categories = ["algorithms", "science", "network-programming"]
+
+[workspace.dependencies]
+assessment-core = { path = "crates/assessment-core", version = "0.1.0" }
+assessment-grpc = { path = "crates/assessment-grpc", version = "0.1.0" }
+
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+prost = "0.14"
+prost-types = "0.14"
+protox = "0.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+tonic = { version = "0.14", features = ["transport", "codegen", "router", "server", "channel"] }
+tonic-health = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tonic-reflection = "0.14"
+tower = { version = "0.5", features = ["util", "limit", "timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+proptest = "1.12"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

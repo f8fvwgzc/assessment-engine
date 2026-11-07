@@ -1,0 +1,12 @@
+target/
+data/
+.claude/
+.github/
+.git/
+.env
+.env.*
+*.log
+Dockerfile
+.dockerignore
+.DS_Store
+rust-toolchain.toml

@@ -1,0 +1,82 @@
+{
+  "now": "2026-11-07T09:00:00Z",
+  "changes": [
+    {
+      "entity_id": "ENG-12",
+      "before": {
+        "id": "ENG-12",
+        "kind": "issue",
+        "parent_id": "PRJ-1",
+        "version": "1.2.0",
+        "fields": {
+          "title": { "type": "text", "value": "Authentication for the customer portal" },
+          "description": { "type": "text", "value": "Customers sign in to the portal.\n\n## Acceptance criteria\n- [ ] Sign up and log in with email and password\n- [ ] Password reset by email link\n- [ ] Sessions expire after 30 days\n- [ ] Rate-limit failed logins" },
+          "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } },
+          "estimate": { "type": "number", "value": 13 },
+          "due_date": { "type": "timestamp", "value": "2026-11-28T00:00:00Z" }
+        }
+      },
+      "after": {
+        "id": "ENG-12",
+        "kind": "issue",
+        "parent_id": "PRJ-1",
+        "version": "1.2.0",
+        "fields": {
+          "title": { "type": "text", "value": "Authentication for the customer portal" },
+          "description": { "type": "text", "value": "Customers sign in to the portal with their company identity.\n\n## Acceptance criteria\n- [ ] Log in with Google Workspace (OAuth 2.0 / OIDC)\n- [ ] Log in with Microsoft Entra ID (OIDC)\n- [ ] Sessions expire after 7 days\n- [ ] Rate-limit failed logins\n\nPassword login is no longer needed." },
+          "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } },
+          "estimate": { "type": "number", "value": 13 },
+          "due_date": { "type": "timestamp", "value": "2026-11-28T00:00:00Z" }
+        }
+      }
+    }
+  ],
+  "context": [
+    {
+      "id": "PRJ-1",
+      "kind": "project",
+      "version": "1.4.0",
+      "fields": {
+        "title": { "type": "text", "value": "Customer portal v2" },
+        "status": { "type": "status", "value": { "category": "started", "name": "Started" } }
+      }
+    },
+    {
+      "id": "ENG-13",
+      "kind": "sub_issue",
+      "parent_id": "ENG-12",
+      "basis": [{ "entity_id": "ENG-12", "version": "1.2.0" }],
+      "fields": {
+        "title": { "type": "text", "value": "Email and password sign-up form" },
+        "description": { "type": "text", "value": "Form with email, password and confirmation; hash passwords with argon2." },
+        "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } },
+        "estimate": { "type": "number", "value": 5 },
+        "assignee": { "type": "reference", "value": "dorj" }
+      }
+    },
+    {
+      "id": "ENG-14",
+      "kind": "sub_issue",
+      "parent_id": "ENG-12",
+      "basis": [{ "entity_id": "ENG-12", "version": "1.2.0" }],
+      "fields": {
+        "title": { "type": "text", "value": "Password reset email flow" },
+        "description": { "type": "text", "value": "Send a reset link by email; the token expires after one hour." },
+        "status": { "type": "status", "value": { "category": "unstarted", "name": "Todo" } },
+        "estimate": { "type": "number", "value": 3 }
+      }
+    },
+    {
+      "id": "ENG-15",
+      "kind": "sub_issue",
+      "parent_id": "ENG-12",
+      "basis": [{ "entity_id": "ENG-12", "version": "1.2.0" }],
+      "fields": {
+        "title": { "type": "text", "value": "Session expiry and refresh" },
+        "description": { "type": "text", "value": "Sessions expire after 30 days of inactivity; refresh tokens rotate." },
+        "status": { "type": "status", "value": { "category": "unstarted", "name": "Todo" } },
+        "estimate": { "type": "number", "value": 2 }
+      }
+    }
+  ]
+}

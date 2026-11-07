@@ -1,0 +1,64 @@
+{
+  "requestId": "parent-rewrite-1",
+  "now": "2026-11-07T09:00:00Z",
+  "changes": [
+    {
+      "entityId": "ENG-12",
+      "before": {
+        "id": "ENG-12",
+        "kind": "issue",
+        "parentId": "PRJ-1",
+        "version": { "major": 1, "minor": 2, "patch": 0 },
+        "fields": {
+          "title": { "text": "Authentication for the customer portal" },
+          "description": { "text": "Customers sign in to the portal.\n\n## Acceptance criteria\n- [ ] Sign up and log in with email and password\n- [ ] Password reset by email link\n- [ ] Sessions expire after 30 days\n- [ ] Rate-limit failed logins" },
+          "status": { "status": { "category": "STATUS_CATEGORY_STARTED", "name": "In Progress" } },
+          "estimate": { "number": 13 }
+        }
+      },
+      "after": {
+        "id": "ENG-12",
+        "kind": "issue",
+        "parentId": "PRJ-1",
+        "version": { "major": 1, "minor": 2, "patch": 0 },
+        "fields": {
+          "title": { "text": "Authentication for the customer portal" },
+          "description": { "text": "Customers sign in to the portal with their company identity.\n\n## Acceptance criteria\n- [ ] Log in with Google Workspace (OAuth 2.0 / OIDC)\n- [ ] Log in with Microsoft Entra ID (OIDC)\n- [ ] Sessions expire after 7 days\n- [ ] Rate-limit failed logins\n\nPassword login is no longer needed." },
+          "status": { "status": { "category": "STATUS_CATEGORY_STARTED", "name": "In Progress" } },
+          "estimate": { "number": 13 }
+        }
+      }
+    }
+  ],
+  "context": [
+    {
+      "id": "PRJ-1",
+      "kind": "project",
+      "fields": { "title": { "text": "Customer portal v2" } }
+    },
+    {
+      "id": "ENG-14",
+      "kind": "sub_issue",
+      "parentId": "ENG-12",
+      "basis": [{ "entityId": "ENG-12", "version": { "major": 1, "minor": 2 } }],
+      "fields": {
+        "title": { "text": "Password reset email flow" },
+        "description": { "text": "Send a reset link by email; the token expires after one hour." },
+        "status": { "status": { "category": "STATUS_CATEGORY_UNSTARTED", "name": "Todo" } },
+        "estimate": { "number": 3 }
+      }
+    },
+    {
+      "id": "ENG-15",
+      "kind": "sub_issue",
+      "parentId": "ENG-12",
+      "basis": [{ "entityId": "ENG-12", "version": { "major": 1, "minor": 2 } }],
+      "fields": {
+        "title": { "text": "Session expiry and refresh" },
+        "description": { "text": "Sessions expire after 30 days of inactivity; refresh tokens rotate." },
+        "status": { "status": { "category": "STATUS_CATEGORY_UNSTARTED", "name": "Todo" } },
+        "estimate": { "number": 2 }
+      }
+    }
+  ]
+}

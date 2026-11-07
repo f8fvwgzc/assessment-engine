@@ -1,0 +1,659 @@
+// The Assessment Engine API.
+//
+// Scores how much a change to a versioned work item (a project, an epic, an
+// issue, a sub-issue …) matters for the item itself and for everything
+// planned around it, ranks the affected items, and recommends whether to
+// re-plan. Every item is semantically versioned: MAJOR = breaking (plans made
+// against the previous version need revisiting), MINOR = compatible
+// additions, PATCH = cosmetic.
+//
+// Two ways to use it:
+//
+// * Stateless — `Assess`, `AssessBatch`, `AssessStream`: send the change
+//   (before/after snapshots or field deltas) with the related items as
+//   context; get an assessment back. Nothing is stored.
+// * Stateful — `PutEntity`, `DeleteEntity`, `RecordActivity`, `GetEntity`,
+//   `GetHistory`, `CompareVersions`, `ListStale`, `Acknowledge`: the server
+//   keeps every item's versions and history, builds the context itself, and
+//   tracks which plans are behind a breaking change.
+//
+// Scores are in [0, 1]. Timestamps are UTC. Unknown string values of open
+// vocabularies (entity kinds, field names) are accepted.
+syntax = "proto3";
+
+package assessment.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "dev.assessment.v1";
+option go_package = "github.com/f8fvwgzc/assessment-engine/gen/go/assessment/v1;assessmentv1";
+option csharp_namespace = "Assessment.V1";
+
+service AssessmentEngine {
+  // Assesses one set of changes, together, against the given context.
+  rpc Assess(AssessRequest) returns (AssessResponse);
+  // Assesses several independent requests; a failing one reports its error
+  // in its own response and does not fail the others.
+  rpc AssessBatch(AssessBatchRequest) returns (AssessBatchResponse);
+  // One response per request, in order; errors are reported per response
+  // and do not end the stream.
+  rpc AssessStream(stream AssessRequest) returns (stream AssessResponse);
+  // Compares two texts (titles, descriptions) and returns every measure.
+  rpc CompareText(CompareTextRequest) returns (CompareTextResponse);
+  // The server's effective policy (every tunable number), as JSON.
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+
+  // Creates or updates an item in the registry: assesses the change against
+  // the stored version and stores it under its next version (unless dry_run).
+  rpc PutEntity(PutEntityRequest) returns (PutEntityResponse);
+  // Deletes an item and assesses what the deletion leaves behind.
+  rpc DeleteEntity(DeleteEntityRequest) returns (DeleteEntityResponse);
+  // Assesses comments and other activity on a stored item (no version change).
+  rpc RecordActivity(RecordActivityRequest) returns (RecordActivityResponse);
+  // The current item, or a past version of it.
+  rpc GetEntity(GetEntityRequest) returns (GetEntityResponse);
+  // The version history of an item, oldest first.
+  rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
+  // Assesses the difference between two stored versions of an item.
+  rpc CompareVersions(CompareVersionsRequest) returns (CompareVersionsResponse);
+  // Items whose plan is behind what they were planned against.
+  rpc ListStale(ListStaleRequest) returns (ListStaleResponse);
+  // Re-pins an item to the current versions of what it was planned against.
+  rpc Acknowledge(AcknowledgeRequest) returns (AcknowledgeResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Input model
+// ---------------------------------------------------------------------------
+
+message SemVer {
+  uint64 major = 1;
+  uint64 minor = 2;
+  uint64 patch = 3;
+}
+
+enum StatusCategory {
+  STATUS_CATEGORY_UNSPECIFIED = 0;
+  STATUS_CATEGORY_BACKLOG = 1;
+  STATUS_CATEGORY_UNSTARTED = 2;
+  STATUS_CATEGORY_STARTED = 3;
+  STATUS_CATEGORY_COMPLETED = 4;
+  STATUS_CATEGORY_CANCELED = 5;
+}
+
+// A workflow state: what it means (category) and what the team calls it.
+message Status {
+  StatusCategory category = 1;
+  string name = 2;
+}
+
+// A rank on a bounded scale; higher is more important. Map Linear-style
+// priorities (1 urgent … 4 low, 0 none) as urgent → 4, high → 3,
+// medium → 2, low → 1, none → 0, with scale 4.
+message Ordinal {
+  uint32 rank = 1;
+  uint32 scale = 2;
+}
+
+message StringSet {
+  repeated string values = 1;
+}
+
+// A typed field value. An absent FieldValue (or an empty `kind`) is null.
+message FieldValue {
+  oneof kind {
+    string text = 1;
+    double number = 2;
+    bool flag = 3;
+    google.protobuf.Timestamp timestamp = 4;
+    Status status = 5;
+    Ordinal ordinal = 6;
+    // An identifier of something else (a user, a project, a cycle).
+    string reference = 7;
+    StringSet set = 8;
+  }
+}
+
+enum RelationKind {
+  RELATION_KIND_UNSPECIFIED = 0;
+  // This item must finish before the target can.
+  RELATION_KIND_BLOCKS = 1;
+  // The target must finish before this item can.
+  RELATION_KIND_BLOCKED_BY = 2;
+  RELATION_KIND_RELATES_TO = 3;
+  RELATION_KIND_DUPLICATES = 4;
+}
+
+message Relation {
+  RelationKind kind = 1;
+  string target_id = 2;
+}
+
+// "This item was planned against version `version` of `entity_id`."
+message BasisPin {
+  string entity_id = 1;
+  SemVer version = 2;
+}
+
+// A versioned work item at one moment.
+//
+// Well-known field names (with tuned defaults): title (text),
+// description (text, Markdown), estimate (number), status (status),
+// priority (ordinal), assignee (reference), due_date (timestamp),
+// start_date (timestamp), labels (set), project (reference),
+// cycle (reference), team (reference). Any other name works with the
+// default field policy.
+message Entity {
+  string id = 1;
+  // initiative | project | milestone | epic | issue | sub_issue | task | any other string.
+  string kind = 2;
+  optional string parent_id = 3;
+  // The item's current version, if the caller tracks one. The registry
+  // (PutEntity) honours it only when an id is first recorded; afterwards it
+  // assigns versions itself.
+  SemVer version = 4;
+  map<string, FieldValue> fields = 5;
+  repeated Relation relations = 6;
+  repeated BasisPin basis = 7;
+  // A semantic embedding of title + description from the caller's model;
+  // when both sides of a comparison have one of the same size, text scores
+  // blend it in, and impact relevance uses the change direction.
+  repeated float embedding = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+enum ActivityKind {
+  ACTIVITY_KIND_UNSPECIFIED = 0;
+  ACTIVITY_KIND_COMMENT = 1;
+  ACTIVITY_KIND_MENTION = 2;
+  ACTIVITY_KIND_ATTACHMENT = 3;
+  ACTIVITY_KIND_LINK = 4;
+  ACTIVITY_KIND_OTHER = 5;
+}
+
+// Something that happened on an item without changing its fields. Its text
+// is scanned for blockers, scope changes, risks, schedule slips, questions.
+message ActivityEvent {
+  // May be empty inside a ChangeSet (the change's entity is meant).
+  string entity_id = 1;
+  ActivityKind kind = 2;
+  string author = 3;
+  string body = 4;
+  google.protobuf.Timestamp at = 5;
+}
+
+// One field's old and new value; an absent value is null. The field name
+// `parent` (with reference values) moves the item to another parent.
+message FieldChange {
+  string field = 1;
+  FieldValue before = 2;
+  FieldValue after = 3;
+}
+
+// One item's change:
+//  * before + after → update; only after → creation; only before → deletion;
+//  * field_changes (no before) → update given as deltas against `after`, or
+//    against the context entity with this id when `after` is absent;
+//  * only events → activity on an item found in the context.
+message ChangeSet {
+  string entity_id = 1;
+  Entity before = 2;
+  Entity after = 3;
+  repeated FieldChange field_changes = 4;
+  repeated ActivityEvent events = 5;
+}
+
+// A past change, for churn and anomaly statistics.
+message HistoryPoint {
+  string entity_id = 1;
+  google.protobuf.Timestamp at = 2;
+  // The content score of that change, [0, 1].
+  double magnitude = 3;
+}
+
+message AssessOptions {
+  // At most this many impacts (0 = all); the total is always reported.
+  // Unset = 100.
+  optional uint32 top_k = 1;
+  // Include each impact's contributions. Unset = true.
+  optional bool explain = 2;
+  // At most this many contributions per impact. Unset = 5.
+  optional uint32 max_contributions = 3;
+}
+
+message AssessRequest {
+  // Echoed in the response (useful on streams).
+  string request_id = 1;
+  repeated ChangeSet changes = 2;
+  // The current state of related items: parent chain, children, siblings,
+  // blockers, dependents. The more of the neighbourhood is here, the
+  // further the engine sees and the higher its confidence.
+  repeated Entity context = 3;
+  repeated HistoryPoint history = 4;
+  // Reference time for deadline pressure; defaults to the server's clock.
+  google.protobuf.Timestamp now = 5;
+  // A partial policy, merged over the server's (see GetPolicy for the shape).
+  google.protobuf.Struct policy_overrides = 6;
+  AssessOptions options = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Output model
+// ---------------------------------------------------------------------------
+
+enum ImpactLevel {
+  IMPACT_LEVEL_UNSPECIFIED = 0;
+  IMPACT_LEVEL_NONE = 1;
+  IMPACT_LEVEL_LOW = 2;
+  IMPACT_LEVEL_MEDIUM = 3;
+  IMPACT_LEVEL_HIGH = 4;
+  IMPACT_LEVEL_CRITICAL = 5;
+}
+
+enum Recommendation {
+  RECOMMENDATION_UNSPECIFIED = 0;
+  RECOMMENDATION_NO_ACTION = 1;
+  RECOMMENDATION_NOTIFY = 2;
+  RECOMMENDATION_REVIEW = 3;
+  // Re-plan the subtree under `replan_root`.
+  RECOMMENDATION_PARTIAL_REPLAN = 4;
+  RECOMMENDATION_FULL_REPLAN = 5;
+}
+
+enum Action {
+  ACTION_UNSPECIFIED = 0;
+  ACTION_NONE = 1;
+  ACTION_NOTIFY = 2;
+  ACTION_REVIEW = 3;
+  ACTION_UPDATE_SCOPE = 4;
+  ACTION_RE_ESTIMATE = 5;
+  ACTION_RESCHEDULE = 6;
+  ACTION_REVERIFY = 7;
+  ACTION_OBSOLETE_CANDIDATE = 8;
+  ACTION_CANCEL_OR_REHOME = 9;
+  ACTION_REPRIORITIZE = 10;
+  ACTION_REPLAN = 11;
+  ACTION_RESOLVE_CONFLICT = 12;
+}
+
+enum ChangeType {
+  CHANGE_TYPE_UNSPECIFIED = 0;
+  CHANGE_TYPE_CREATED = 1;
+  CHANGE_TYPE_UPDATED = 2;
+  CHANGE_TYPE_DELETED = 3;
+  CHANGE_TYPE_ACTIVITY = 4;
+}
+
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_SELF = 1;
+  CHANNEL_DOWN = 2;
+  CHANNEL_UP = 3;
+  CHANNEL_DEPENDENCY = 4;
+  CHANNEL_UPSTREAM = 5;
+  CHANNEL_RELATED = 6;
+  CHANNEL_SIBLING = 7;
+}
+
+enum BasisStatus {
+  BASIS_STATUS_UNSPECIFIED = 0;
+  BASIS_STATUS_NOT_PINNED = 1;
+  BASIS_STATUS_CURRENT = 2;
+  BASIS_STATUS_COMPATIBLE = 3;
+  BASIS_STATUS_REVIEW_SUGGESTED = 4;
+  BASIS_STATUS_INCOMPATIBLE = 5;
+  BASIS_STATUS_REMOVED = 6;
+}
+
+enum VersionBump {
+  VERSION_BUMP_UNSPECIFIED = 0;
+  VERSION_BUMP_NONE = 1;
+  VERSION_BUMP_PATCH = 2;
+  VERSION_BUMP_MINOR = 3;
+  VERSION_BUMP_MAJOR = 4;
+  VERSION_BUMP_INITIAL = 5;
+}
+
+enum FieldChangeKind {
+  FIELD_CHANGE_KIND_UNSPECIFIED = 0;
+  FIELD_CHANGE_KIND_ADDED = 1;
+  FIELD_CHANGE_KIND_REMOVED = 2;
+  FIELD_CHANGE_KIND_MODIFIED = 3;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_NONE = 1;
+  DIRECTION_INCREASE = 2;
+  DIRECTION_DECREASE = 3;
+}
+
+enum SignalCategory {
+  SIGNAL_CATEGORY_UNSPECIFIED = 0;
+  SIGNAL_CATEGORY_BLOCKER = 1;
+  SIGNAL_CATEGORY_SCOPE = 2;
+  SIGNAL_CATEGORY_RISK = 3;
+  SIGNAL_CATEGORY_SCHEDULE = 4;
+  SIGNAL_CATEGORY_UNCERTAINTY = 5;
+  SIGNAL_CATEGORY_RESOLUTION = 6;
+}
+
+enum ViolationKind {
+  VIOLATION_KIND_UNSPECIFIED = 0;
+  VIOLATION_KIND_ORPHANED_WORK = 1;
+  VIOLATION_KIND_CYCLIC_DEPENDENCY = 2;
+  VIOLATION_KIND_SCHEDULE_CONFLICT = 3;
+  VIOLATION_KIND_DEPENDENCY_CONFLICT = 4;
+  VIOLATION_KIND_BLOCKED_BY_CLOSED = 5;
+  VIOLATION_KIND_PREMATURE_CLOSE = 6;
+  VIOLATION_KIND_ESTIMATE_OVERFLOW = 7;
+  VIOLATION_KIND_OVERDUE = 8;
+}
+
+// A context factor applied to a score (γ in 1 − (1 − s)^γ).
+message Modifier {
+  string name = 1;
+  double factor = 2;
+  string detail = 3;
+}
+
+message Signal {
+  SignalCategory category = 1;
+  double weight = 2;
+  repeated string terms = 3;
+  string excerpt = 4;
+}
+
+message FieldAssessment {
+  string field = 1;
+  FieldChangeKind change = 2;
+  Direction direction = 3;
+  double magnitude = 4;
+  double severity = 5;
+  // severity × magnitude.
+  double risk = 6;
+  bool breaking = 7;
+  bool additive = 8;
+  optional string before = 9;
+  optional string after = 10;
+  map<string, double> metrics = 11;
+  string explanation = 12;
+}
+
+message ChangeAssessment {
+  string entity_id = 1;
+  string kind = 2;
+  ChangeType change_type = 3;
+  // Content score (noisy-OR of field risks); drives the version bump.
+  double raw_score = 4;
+  // With activity and context (phase, deadline, churn).
+  double local_score = 5;
+  repeated Modifier modifiers = 6;
+  repeated FieldAssessment fields = 7;
+  repeated Signal signals = 8;
+  VersionBump bump = 9;
+  SemVer previous_version = 10;
+  SemVer next_version = 11;
+  optional double anomaly_z = 12;
+  string explanation = 13;
+  // The propagation step budget ran out for this change's seeds; impacts
+  // reachable only beyond that point are missing.
+  bool propagation_truncated = 14;
+}
+
+message Contribution {
+  string source_id = 1;
+  string field = 2;
+  Channel channel = 3;
+  repeated string path = 4;
+  double value = 5;
+  string detail = 6;
+}
+
+message EntityImpact {
+  string entity_id = 1;
+  string kind = 2;
+  uint32 rank = 3;
+  double score = 4;
+  ImpactLevel level = 5;
+  Action action = 6;
+  Channel channel = 7;
+  uint32 distance = 8;
+  bool changed = 9;
+  BasisStatus basis_status = 10;
+  double effort = 11;
+  double effort_at_risk = 12;
+  repeated Contribution contributions = 13;
+  repeated string reasons = 14;
+  // This change made the entity's basis worse (e.g. compatible → incompatible);
+  // false when the pin was already stale before.
+  bool basis_introduced = 15;
+}
+
+message Violation {
+  ViolationKind kind = 1;
+  // The first one is the item that needs action.
+  repeated string entities = 2;
+  double severity = 3;
+  // Introduced by the assessed changes (not there before).
+  bool introduced = 4;
+  string message = 5;
+}
+
+message Assessment {
+  // The re-plan score.
+  double score = 1;
+  ImpactLevel level = 2;
+  Recommendation recommendation = 3;
+  double confidence = 4;
+  double severity = 5;
+  double breadth = 6;
+  double effort_at_risk = 7;
+  double effort_total = 8;
+  optional string replan_root = 9;
+  repeated ChangeAssessment changes = 10;
+  repeated EntityImpact impacts = 11;
+  uint32 impacts_total = 12;
+  repeated Violation violations = 13;
+  string summary = 14;
+  string engine_version = 15;
+  google.protobuf.Timestamp assessed_at = 16;
+}
+
+// A per-item error inside a batch or a stream.
+message AssessError {
+  // invalid_request | not_found | conflict | invalid_policy | storage | internal
+  string kind = 1;
+  string message = 2;
+}
+
+message AssessResponse {
+  string request_id = 1;
+  // Exactly one of `assessment` and `error` is set.
+  Assessment assessment = 2;
+  AssessError error = 3;
+}
+
+message AssessBatchRequest {
+  repeated AssessRequest requests = 1;
+}
+
+message AssessBatchResponse {
+  repeated AssessResponse responses = 1;
+}
+
+message CompareTextRequest {
+  string before = 1;
+  string after = 2;
+  repeated float before_embedding = 3;
+  repeated float after_embedding = 4;
+}
+
+message StructureDiff {
+  uint32 items_before = 1;
+  uint32 items_after = 2;
+  uint32 items_added = 3;
+  uint32 items_removed = 4;
+  uint32 items_modified = 5;
+  uint32 items_checked = 6;
+  uint32 items_unchecked = 7;
+  uint32 headings_added = 8;
+  uint32 headings_removed = 9;
+}
+
+message CompareTextResponse {
+  double magnitude = 1;
+  double lexical_similarity = 2;
+  optional double char_similarity = 3;
+  double token_jaccard = 4;
+  double shingle_similarity = 5;
+  double tfidf_cosine = 6;
+  optional double embedding_cosine = 7;
+  StructureDiff structure = 8;
+  uint32 negation_flips = 9;
+  uint32 modal_shifts = 10;
+  uint32 numbers_changed = 11;
+  repeated string added_terms = 12;
+  repeated string removed_terms = 13;
+  uint64 chars_before = 14;
+  uint64 chars_after = 15;
+  bool low_information = 16;
+  // Passages (sentences, list items) only in the new text / only in the old
+  // text / reworded (negations and requirement-strength changes included).
+  uint32 passages_added = 17;
+  uint32 passages_removed = 18;
+  uint32 passages_modified = 19;
+  // Same content, only order or layout changed.
+  bool reordered = 20;
+}
+
+message GetPolicyRequest {
+  // A partial policy to preview merged over the server's.
+  google.protobuf.Struct overrides = 1;
+}
+
+message GetPolicyResponse {
+  google.protobuf.Struct policy = 1;
+  string policy_json = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+message VersionRecord {
+  SemVer version = 1;
+  VersionBump bump = 2;
+  google.protobuf.Timestamp at = 3;
+  ChangeType change_type = 4;
+  double raw_score = 5;
+  ImpactLevel level = 6;
+  repeated string changed_fields = 7;
+  // Absent for a deletion.
+  Entity snapshot = 8;
+}
+
+message PutEntityRequest {
+  // Its `version` is ignored: the registry assigns versions.
+  Entity entity = 1;
+  // Assess without storing (what-if).
+  bool dry_run = 2;
+  // Fail with ABORTED unless the stored version is this one.
+  SemVer expected_version = 3;
+  repeated ActivityEvent events = 4;
+  google.protobuf.Timestamp now = 5;
+  // Do not pin the parent's / blockers' versions on creation and re-parenting.
+  bool disable_auto_pin = 6;
+  AssessOptions options = 7;
+}
+
+message PutEntityResponse {
+  // As stored (or as it would be, on a dry run), with its version.
+  Entity entity = 1;
+  bool created = 2;
+  bool stored = 3;
+  VersionBump bump = 4;
+  Assessment assessment = 5;
+}
+
+message DeleteEntityRequest {
+  string id = 1;
+  bool dry_run = 2;
+  SemVer expected_version = 3;
+  google.protobuf.Timestamp now = 4;
+}
+
+message DeleteEntityResponse {
+  Assessment assessment = 1;
+  bool deleted = 2;
+}
+
+message RecordActivityRequest {
+  string entity_id = 1;
+  repeated ActivityEvent events = 2;
+  google.protobuf.Timestamp now = 3;
+}
+
+message RecordActivityResponse {
+  Assessment assessment = 1;
+}
+
+message GetEntityRequest {
+  string id = 1;
+  // Absent = the current version.
+  SemVer version = 2;
+}
+
+message GetEntityResponse {
+  Entity entity = 1;
+}
+
+message GetHistoryRequest {
+  string id = 1;
+  // Only the newest `limit` records (0 = all).
+  uint32 limit = 2;
+}
+
+message GetHistoryResponse {
+  repeated VersionRecord records = 1;
+}
+
+message CompareVersionsRequest {
+  string id = 1;
+  SemVer from = 2;
+  SemVer to = 3;
+  google.protobuf.Timestamp now = 4;
+}
+
+message CompareVersionsResponse {
+  Assessment assessment = 1;
+}
+
+message ListStaleRequest {
+  // Only this item and its descendants; empty = everything.
+  string root_id = 1;
+}
+
+message StaleEntry {
+  string entity_id = 1;
+  string basis_entity_id = 2;
+  SemVer pinned = 3;
+  // Absent when the pinned item was deleted.
+  SemVer current = 4;
+  BasisStatus status = 5;
+}
+
+message ListStaleResponse {
+  repeated StaleEntry entries = 1;
+}
+
+message AcknowledgeRequest {
+  string id = 1;
+  google.protobuf.Timestamp now = 2;
+}
+
+message AcknowledgeResponse {
+  Entity entity = 1;
+}
