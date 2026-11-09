@@ -221,8 +221,8 @@ impl Corpus {
 
     /// Adds one document.
     pub fn add_document(&mut self, text: &str, policy: &TextPolicy) {
-        let analysis = analyze(text, policy);
-        self.add_terms(analysis.counts.keys());
+        let counts = term_counts(text, &Lexicon::new(policy));
+        self.add_terms(counts.keys());
     }
 
     pub(crate) fn add_terms<'a>(&mut self, terms: impl IntoIterator<Item = &'a String>) {
@@ -625,14 +625,17 @@ enum Word {
     Stop,
 }
 
-struct Lexicon<'p> {
+/// The words a text policy reads specially. Building one costs a few
+/// microseconds, so a caller that analyses many texts under one policy
+/// builds it once and passes it to [`analyze_with`] / [`term_counts`].
+pub(crate) struct Lexicon<'p> {
     /// Negations, modal verbs and (when enabled) stop-words, in one lookup;
     /// a word in several lists reads as negation, then strong, then weak modal.
     words: HashMap<&'p str, Word, std::hash::BuildHasherDefault<Fnv>>,
 }
 
 impl<'p> Lexicon<'p> {
-    fn new(policy: &'p TextPolicy) -> Self {
+    pub(crate) fn new(policy: &'p TextPolicy) -> Self {
         let mut words: HashMap<&'p str, Word, std::hash::BuildHasherDefault<Fnv>> =
             HashMap::default();
         if policy.stopwords {
@@ -687,10 +690,67 @@ enum LineKind {
     Plain,
 }
 
-/// Analyzes a text once for every measure (each sentence is tokenized once
-/// and each token's term computed once).
+/// [`analyze_with`] with a lexicon built for this one text. Tests only: the
+/// engine builds one lexicon per call and passes it down.
+#[cfg(test)]
 pub(crate) fn analyze(text: &str, policy: &TextPolicy) -> Analysis {
-    let lex = Lexicon::new(policy);
+    analyze_with(text, &Lexicon::new(policy))
+}
+
+/// The body of a Markdown line that carries terms, or `None` for a code
+/// fence: a heading's text, a list item's text, or the line without its
+/// indentation and quote markers.
+fn line_body(line: &str) -> Option<(LineKind, &str)> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        return None;
+    }
+    Some(if let Some(h) = heading_text(line) {
+        (LineKind::Heading, h)
+    } else if let Some((checked, rest)) = parse_list_item(line) {
+        (LineKind::Item(checked), rest)
+    } else {
+        (LineKind::Plain, trimmed.trim_start_matches('>'))
+    })
+}
+
+/// Term counts from a list of terms: one sort instead of a map lookup per token.
+fn count_terms(mut terms: Vec<String>) -> BTreeMap<String, u32> {
+    terms.sort_unstable();
+    let mut runs: Vec<(String, u32)> = Vec::new();
+    for t in terms {
+        match runs.last_mut() {
+            Some((last, c)) if *last == t => *c += 1,
+            _ => runs.push((t, 1)),
+        }
+    }
+    runs.into_iter().collect()
+}
+
+/// The term counts of a text, exactly as [`analyze_with`] computes
+/// `Analysis::counts`, without building passages, segments, list items,
+/// headings or the normalized copy. For texts whose only use is a TF-IDF
+/// vector (context documents and titles).
+pub(crate) fn term_counts(text: &str, lex: &Lexicon<'_>) -> BTreeMap<String, u32> {
+    let mut terms: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((_, body)) = line_body(line) else {
+            continue;
+        };
+        for sentence in split_sentences(body) {
+            for t in raw_tokens(sentence) {
+                if let Role::Term(term) = lex.classify(&t) {
+                    terms.push(term);
+                }
+            }
+        }
+    }
+    count_terms(terms)
+}
+
+/// Analyzes a text once for every measure (each sentence is tokenized once
+/// and each token's term computed once), with the caller's lexicon.
+pub(crate) fn analyze_with(text: &str, lex: &Lexicon<'_>) -> Analysis {
     let mut items = Vec::new();
     let mut headings = BTreeSet::new();
     let mut passages = Vec::new();
@@ -698,16 +758,8 @@ pub(crate) fn analyze(text: &str, policy: &TextPolicy) -> Analysis {
     let mut raw: Vec<String> = Vec::new();
     let mut all_terms: Vec<String> = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        let Some((kind, body)) = line_body(line) else {
             continue;
-        }
-        let (kind, body) = if let Some(h) = heading_text(line) {
-            (LineKind::Heading, h)
-        } else if let Some((checked, rest)) = parse_list_item(line) {
-            (LineKind::Item(checked), rest)
-        } else {
-            (LineKind::Plain, trimmed.trim_start_matches('>'))
         };
         let first_token = raw.len();
         let first_term = all_terms.len();
@@ -750,16 +802,7 @@ pub(crate) fn analyze(text: &str, policy: &TextPolicy) -> Analysis {
             LineKind::Plain => {}
         }
     }
-    // Counts from the sorted terms: one sort instead of a map lookup per token.
-    all_terms.sort_unstable();
-    let mut runs: Vec<(String, u32)> = Vec::new();
-    for t in all_terms {
-        match runs.last_mut() {
-            Some((last, c)) if *last == t => *c += 1,
-            _ => runs.push((t, 1)),
-        }
-    }
-    let counts: BTreeMap<String, u32> = runs.into_iter().collect();
+    let counts = count_terms(all_terms);
     let mut normalized = String::with_capacity(text.len());
     for (k, w) in text.split_whitespace().enumerate() {
         if k > 0 {
@@ -977,7 +1020,8 @@ fn swap_or_slip(w: &[char], c: &[char], allow_slip: bool) -> bool {
 ///   or one slip to a neighbouring key (not `http`/`https`, `sync`/`async`,
 ///   `mysql`/`mssql`);
 /// * longer words: OSA similarity ≥ 0.75 with at most one letter dropped or
-///   doubled, and not at the start (`review`/`preview` is another word).
+///   doubled, and not a change of morpheme ([`changes_morpheme`]:
+///   `review`/`preview`, `increase`/`decrease`, `maximize`/`minimize`).
 fn is_typo_of(w: &[char], c: &[char], budget: &mut usize) -> Option<usize> {
     let short = w.len().min(c.len());
     let long = w.len().max(c.len());
@@ -993,10 +1037,47 @@ fn is_typo_of(w: &[char], c: &[char], budget: &mut usize) -> Option<usize> {
     if short <= SHORT_WORD_CHARS {
         return swap_or_slip(w, c, true).then_some(1);
     }
-    if short != long && w.first() != c.first() {
+    if changes_morpheme(w, c) {
         return None;
     }
     osa_within(w, c, long / 4, budget)
+}
+
+/// Whether two long words differ the way two *different* words do rather
+/// than the way a slip of the hand does:
+///
+/// * another first letter (`increase`/`decrease`, `internal`/`external`,
+///   `review`/`preview`), unless the first two letters are swapped;
+/// * one run of two or more letters replaced by other letters
+///   (`maximize`/`minimize`, `interstate`/`intrastate`,
+///   `hyperthermia`/`hypothermia`), unless it is one adjacent swap;
+/// * the prefixes `micro`/`macro`.
+///
+/// A typo changes one letter, swaps two, or drops or doubles one.
+fn changes_morpheme(w: &[char], c: &[char]) -> bool {
+    let swapped =
+        |a: &[char], b: &[char]| a.len() == 2 && b.len() == 2 && a[0] == b[1] && a[1] == b[0];
+    if w[0] != c[0] {
+        return !(w.len() == c.len() && swapped(&w[..2], &c[..2]) && w[2..] == c[2..]);
+    }
+    let prefix = w.iter().zip(c).take_while(|(a, b)| a == b).count();
+    let room = w.len().min(c.len()) - prefix;
+    let suffix = w
+        .iter()
+        .rev()
+        .zip(c.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (a, b) = (&w[prefix..w.len() - suffix], &c[prefix..c.len() - suffix]);
+    if a.len().min(b.len()) >= 1 && a.len().max(b.len()) >= 2 {
+        return !swapped(a, b) && a.iter().zip(b).all(|(x, y)| x != y);
+    }
+    let pair = |x: &[char], y: &[char]| {
+        x.iter().copied().take(5).eq("micro".chars())
+            && y.iter().copied().take(5).eq("macro".chars())
+    };
+    pair(w, c) || pair(c, w)
 }
 
 /// For each word only in `ours` that is a likely misspelling of a word only
@@ -1065,8 +1146,7 @@ fn typo_map<'a>(
 /// Rewrites `b` so that words that are misspellings of words in `a` read as
 /// those words: a typo fix then changes neither the term statistics nor the
 /// added/removed terms, only the character-level distance.
-pub(crate) fn align_typos(a: &Analysis, b: &mut Analysis, policy: &TextPolicy) {
-    let lex = Lexicon::new(policy);
+pub(crate) fn align_typos(a: &Analysis, b: &mut Analysis, lex: &Lexicon<'_>) {
     let raws = typo_map(b.raw.iter(), a.raw.iter());
     let mut terms: BTreeMap<String, String> = BTreeMap::new();
     for tok in &mut b.raw {
@@ -1771,9 +1851,10 @@ pub fn compare(
     corpus: Option<&Corpus>,
     embeddings: Option<(&[f32], &[f32])>,
 ) -> TextDiff {
-    let a = analyze(before, policy);
-    let mut b = analyze(after, policy);
-    align_typos(&a, &mut b, policy);
+    let lex = Lexicon::new(policy);
+    let a = analyze_with(before, &lex);
+    let mut b = analyze_with(after, &lex);
+    align_typos(&a, &mut b, &lex);
     let local;
     let corpus = match corpus {
         Some(c) if !c.is_empty() => c,
@@ -1977,6 +2058,44 @@ mod tests {
 
     fn p() -> TextPolicy {
         TextPolicy::default()
+    }
+
+    /// The counts-only path must give exactly the full analysis's counts:
+    /// the engine uses it for context documents and titles.
+    #[test]
+    fn term_counts_equal_the_full_analysis() {
+        let pol = p();
+        let lex = Lexicon::new(&pol);
+        let texts = [
+            "",
+            "Hello world",
+            "# Heading here\n- [ ] item one\n- [x] item two\n> quoted text\n\
+             ```\ncode block\n```\nPlain. Second sentence! Third?",
+            "Хэрэглэгч нэвтэрч чадахгүй. 10,000 users at 1.5x speed",
+            "can't won't shouldn't; it isn't",
+            "a b c",
+            "  * nested\n    1. numbered item\n~~~\nfenced\n~~~\n## Done",
+            "Must not support SSO. Should be optional?",
+        ];
+        for t in texts {
+            assert_eq!(term_counts(t, &lex), analyze(t, &pol).counts, "{t:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+        #[test]
+        fn term_counts_match_the_full_analysis(
+            lines in proptest::collection::vec(
+                "(# |## |- |- \\[ \\] |- \\[x\\] |> |```|1\\. |  )?[a-zA-Zа-яөүё0-9 ,.;:!?'-]{0,48}",
+                0..8,
+            )
+        ) {
+            let text = lines.join("\n");
+            let pol = p();
+            let lex = Lexicon::new(&pol);
+            proptest::prop_assert_eq!(term_counts(&text, &lex), analyze(&text, &pol).counts);
+        }
     }
 
     #[test]
@@ -2204,6 +2323,11 @@ mod tests {
         s
     }
 
+    /// The wall-clock bound of the timing tests. They guard against
+    /// quadratic work, which takes minutes, so an unoptimised build on a
+    /// busy machine gets a wide margin.
+    const TIME_LIMIT_SECS: f64 = if cfg!(debug_assertions) { 10.0 } else { 1.0 };
+
     /// Runs `f`, returning its result and wall time. Timing tests hold a
     /// lock so they do not compete with each other for the CPU.
     fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
@@ -2221,9 +2345,10 @@ mod tests {
     /// What `fields.rs` does for one text field.
     fn assess_text(before: &str, after: &str) -> (TextDiff, TextDelta) {
         let pol = p();
-        let a = analyze(before, &pol);
-        let mut b = analyze(after, &pol);
-        align_typos(&a, &mut b, &pol);
+        let lex = Lexicon::new(&pol);
+        let a = analyze_with(before, &lex);
+        let mut b = analyze_with(after, &lex);
+        align_typos(&a, &mut b, &lex);
         let mut corpus = Corpus::new();
         corpus.add_terms(a.counts.keys());
         corpus.add_terms(b.counts.keys());
@@ -2341,6 +2466,44 @@ mod tests {
     }
 
     /// #8: units, versions, protocols and engines are not typos.
+    #[test]
+    fn opposite_words_are_not_typos_of_each_other() {
+        let typo = |a: &str, b: &str| {
+            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            let mut budget = usize::MAX;
+            is_typo_of(&a, &b, &mut budget).is_some() || is_typo_of(&b, &a, &mut budget).is_some()
+        };
+        for (a, b) in [
+            ("increase", "decrease"),
+            ("internal", "external"),
+            ("encryption", "decryption"),
+            ("maximize", "minimize"),
+            ("maximum", "minimum"),
+            ("interstate", "intrastate"),
+            ("hyperthermia", "hypothermia"),
+            ("microservice", "macroservice"),
+            ("include", "exclude"),
+            ("review", "preview"),
+            ("affect", "effect"),
+        ] {
+            assert!(!typo(a, b), "{a} / {b}");
+        }
+        for (a, b) in [
+            ("authentication", "authentcation"),
+            ("authentication", "authenticaton"),
+            ("receive", "recieve"),
+            ("environment", "enviroment"),
+            ("deployment", "deploymnet"),
+            ("deployment", "depolyment"),
+            ("deployment", "edployment"),
+            ("separate", "seperate"),
+            ("committed", "commited"),
+            ("authentication", "authentocatian"),
+        ] {
+            assert!(typo(a, b), "{a} / {b}");
+        }
+    }
+
     #[test]
     fn units_versions_and_affixes_are_not_typos() {
         for (before, after, numeric) in [
@@ -2461,7 +2624,7 @@ mod tests {
             let before = format!("Spec {} end", "a".repeat(n));
             let after = format!("Spec {}b end", "a".repeat(n - 1));
             let ((d, _), secs) = timed(|| assess_text(&before, &after));
-            assert!(secs < 1.0, "token of {n} chars took {secs:.3}s");
+            assert!(secs < TIME_LIMIT_SECS, "token of {n} chars took {secs:.3}s");
             assert!(d.magnitude > 0.0 && d.magnitude <= 1.0);
         }
         // Many medium tokens, each edited once.
@@ -2475,7 +2638,10 @@ mod tests {
             after.push_str("z ");
         }
         let (_, secs) = timed(|| assess_text(&before, &after));
-        assert!(secs < 1.0, "500 edited 100-char tokens took {secs:.3}s");
+        assert!(
+            secs < TIME_LIMIT_SECS,
+            "500 edited 100-char tokens took {secs:.3}s"
+        );
         // The cell budget bounds a typo pass whatever the input.
         let words: Vec<String> = (0..500)
             .map(|i| {
@@ -2487,7 +2653,7 @@ mod tests {
             })
             .collect();
         let (_, secs) = timed(|| typo_map(words.iter(), words.iter().rev()));
-        assert!(secs < 1.0, "{secs:.3}s");
+        assert!(secs < TIME_LIMIT_SECS, "{secs:.3}s");
     }
 
     /// #10: exact matching is hashed and fuzzy pairing is bounded: the
@@ -2505,7 +2671,7 @@ mod tests {
             .join("\n");
         assert!(before.len() > 170_000);
         let ((d, delta), secs) = timed(|| assess_text(&before, &after));
-        assert!(secs < 1.0, "{n} reworded items took {secs:.3}s");
+        assert!(secs < TIME_LIMIT_SECS, "{n} reworded items took {secs:.3}s");
         let s = d.structure;
         assert_eq!(s.items_before, 8000);
         assert!(s.items_modified > 7000, "{s:?}");
@@ -2526,7 +2692,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let ((d, _), secs) = timed(|| assess_text(&before, &after));
-        assert!(secs < 1.0, "4000 reworded sentences took {secs:.3}s");
+        assert!(
+            secs < TIME_LIMIT_SECS,
+            "4000 reworded sentences took {secs:.3}s"
+        );
         assert!(d.passages_modified > 3500, "{d:?}");
 
         // A tail edit of 10 000 items (exact matching is hashed).
@@ -2540,7 +2709,10 @@ mod tests {
         }
         let after = tail.join("\n");
         let ((d, _), secs) = timed(|| assess_text(&before, &after));
-        assert!(secs < 1.0, "tail edit of 10 000 items took {secs:.3}s");
+        assert!(
+            secs < TIME_LIMIT_SECS,
+            "tail edit of 10 000 items took {secs:.3}s"
+        );
         assert_eq!((d.structure.items_removed, d.structure.items_added), (1, 1));
     }
 
@@ -2643,7 +2815,7 @@ mod tests {
             })
             .collect();
         let (hits, secs) = timed(|| kids.iter().filter(|k| delta.overlap(k).max() > 0.0).count());
-        assert!(secs < 1.0, "50 000 overlaps took {secs:.3}s");
+        assert!(secs < TIME_LIMIT_SECS, "50 000 overlaps took {secs:.3}s");
         let changed: BTreeSet<String> = (0..2000)
             .flat_map(|i| [lex.term(&word(i)), lex.term(&word(i + 100_000))])
             .flatten()

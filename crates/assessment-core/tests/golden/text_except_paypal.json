@@ -1,0 +1,122 @@
+{
+  "score": 0.48539984412961357,
+  "level": "medium",
+  "recommendation": "review",
+  "confidence": 0.9,
+  "severity": 0.4590000000000001,
+  "breadth": 0.11756724401034563,
+  "effort_at_risk": 0.6941344880206913,
+  "effort_total": 2.0,
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.23513448802069126,
+      "local_score": 0.23513448802069126,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.27662880943610735,
+          "severity": 0.85,
+          "risk": 0.23513448802069123,
+          "breaking": false,
+          "additive": false,
+          "before": "Support all payment methods at checkout.",
+          "after": "Support all payment methods at checkout except PayPal.",
+          "metrics": {
+            "char_similarity": 0.7407407407407407,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.7233711905638927,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 0.0,
+            "passages_modified": 1.0,
+            "passages_removed": 0.0,
+            "shingle_similarity": 0.7142857142857143,
+            "tfidf_cosine": 0.7092972666062737,
+            "token_jaccard": 0.6666666666666666
+          },
+          "explanation": "description: change magnitude 0.28; added: except, paypal"
+        }
+      ],
+      "signals": [],
+      "bump": "minor",
+      "previous_version": "1.0.0",
+      "next_version": "1.1.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.28; added: except, paypal"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 1,
+      "score": 0.4590000000000001,
+      "level": "medium",
+      "action": "update_scope",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "review_suggested",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.4590000000000001,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.459,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.41)"
+        }
+      ],
+      "reasons": [
+        "something it was planned against gained compatible additions",
+        "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.41)"
+      ]
+    },
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 2,
+      "score": 0.23513448802069126,
+      "level": "low",
+      "action": "notify",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.23513448802069126,
+      "contributions": [],
+      "reasons": [
+        "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.28; added: except, paypal"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "medium impact (score 0.49, confidence 0.90); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: review",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

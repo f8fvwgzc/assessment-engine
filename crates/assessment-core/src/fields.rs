@@ -181,6 +181,8 @@ pub(crate) struct FieldContext<'a> {
     pub policy: &'a Policy,
     pub now: DateTime<Utc>,
     pub corpus: &'a Corpus,
+    /// The policy's word lexicon, built once per assessment.
+    pub lexicon: &'a text::Lexicon<'a>,
     /// The entity's embeddings before and after, when both exist.
     pub embeddings: Option<(&'a [f32], &'a [f32])>,
 }
@@ -368,9 +370,9 @@ impl Partial {
     }
 
     fn text(&mut self, a: &str, b: &str, ctx: &FieldContext<'_>) {
-        let pa: Analysis = text::analyze(a, &ctx.policy.text);
-        let mut pb: Analysis = text::analyze(b, &ctx.policy.text);
-        text::align_typos(&pa, &mut pb, &ctx.policy.text);
+        let pa: Analysis = text::analyze_with(a, ctx.lexicon);
+        let mut pb: Analysis = text::analyze_with(b, ctx.lexicon);
+        text::align_typos(&pa, &mut pb, ctx.lexicon);
         // The field's own magnitude (and so the version bump) is measured
         // against the two texts alone, exactly as `Engine::compare_text`
         // does: it must not depend on how much context the caller sent. The
@@ -878,7 +880,11 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn ctx<'a>(policy: &'a Policy, corpus: &'a Corpus) -> FieldContext<'a> {
+    fn ctx<'a>(
+        policy: &'a Policy,
+        corpus: &'a Corpus,
+        lexicon: &'a text::Lexicon<'a>,
+    ) -> FieldContext<'a> {
         FieldContext {
             policy,
             now: Utc
@@ -886,6 +892,7 @@ mod tests {
                 .single()
                 .expect("valid date"),
             corpus,
+            lexicon,
             embeddings: None,
         }
     }
@@ -893,7 +900,13 @@ mod tests {
     fn sc(name: &str, a: Option<FieldValue>, b: Option<FieldValue>) -> Option<Scored> {
         let policy = Policy::default();
         let corpus = Corpus::new();
-        score(name, a.as_ref(), b.as_ref(), &ctx(&policy, &corpus))
+        let lexicon = text::Lexicon::new(&policy.text);
+        score(
+            name,
+            a.as_ref(),
+            b.as_ref(),
+            &ctx(&policy, &corpus, &lexicon),
+        )
     }
 
     #[test]
@@ -1068,11 +1081,17 @@ mod tests {
                 "Customer password reset by SMS for customer accounts with a signed link",
             ),
         );
+        let lexicon = text::Lexicon::new(&policy.text);
         let m = |corpus: &Corpus| {
-            score("description", Some(&a), Some(&b), &ctx(&policy, corpus))
-                .expect("changed")
-                .assessment
-                .magnitude
+            score(
+                "description",
+                Some(&a),
+                Some(&b),
+                &ctx(&policy, corpus, &lexicon),
+            )
+            .expect("changed")
+            .assessment
+            .magnitude
         };
         assert_eq!(m(&empty), m(&crowded));
     }

@@ -52,7 +52,12 @@ character-level distance. Never aligned: `login`→`logout`,
 `import`→`export`, `enable`→`disable`; tokens containing a digit
 (`200ms`→`500ms`, `oauth1`→`oauth2`, `v2.0`→`v3.0` are real changes); a
 one-letter insertion or deletion on a word of ≤ 5 letters (`http`→`https`,
-`sync`→`async`); tokens longer than 40 characters. The distance is a banded
+`sync`→`async`); tokens longer than 40 characters; and, for words of 6+
+letters, a change of morpheme rather than a slip: another first letter
+(`increase`→`decrease`, `internal`→`external`), one run of two or more
+letters replaced (`maximize`→`minimize`, `interstate`→`intrastate`,
+`hyperthermia`→`hypothermia`), or `micro`→`macro`. Two swapped adjacent
+letters are still a typo anywhere in the word. The distance is a banded
 OSA with early exit and a global cell budget, so alignment stays linear-ish
 on huge inputs.
 
@@ -105,11 +110,22 @@ items of ≤ 3 terms — when they share a term and their texts are ≥ 0.6 simi
 character-wise; the rest are removed or added. Exact matching is hashed and
 fuzzy pairing is bounded (top-k candidates through an inverted index), and
 overlap queries use an inverted index too, so cost does not multiply with
-the number of changed passages. Passages are weighted with an IDF over **every text in the request's
-neighbourhood** (shared vocabulary weighs little). Relevance to another
-entity uses the **best single passage** (max-passage scoring), so a
-sub-issue about one changed sentence is not diluted by the rest of a long
-rewrite (§5).
+the number of changed passages. Passages are weighted with an IDF over the
+request's texts (shared vocabulary weighs little). `text.idf_scope` decides
+which texts:
+
+* `context` (the default) uses **every text in the request**, the changed
+  entities and the whole context;
+* `reach` uses only the changed entities and what propagation can reach
+  (§5): everything within `max_depth` hops along its channels, whether or not
+  this request's walk visits it. Text outside that reach is not analysed.
+  Context linked to the changes still counts toward breadth and violation
+  checks. Only context with no link to the changes cannot move a score.
+
+Either way, only the texts within that reach get document vectors, because
+no other text is ever read. Relevance to another entity uses the **best
+single passage** (max-passage scoring), so a sub-issue about one changed
+sentence is not diluted by the rest of a long rewrite (§5).
 
 ## 3. Activity (comments)
 

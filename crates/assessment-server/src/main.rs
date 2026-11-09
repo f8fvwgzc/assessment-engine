@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use assessment_core::Engine;
+use assessment_grpc::service::MAX_SLOTS;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
@@ -93,14 +94,42 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "ASSESSMENT_MAX_BATCH_SIZE", default_value_t = 1000)]
     pub max_batch_size: usize,
 
-    /// Most assessments one batch or stream runs at once (default: the
-    /// number of CPUs).
+    /// Most assessments one batch or stream has started at once; each waits
+    /// for its own slot (default: the number of CPUs).
     #[arg(long, env = "ASSESSMENT_MAX_IN_FLIGHT")]
     pub max_in_flight: Option<usize>,
+
+    /// Most stateless assessments (`Assess`, `CompareText`, batch and stream
+    /// items) the server runs at once, and separately most registry calls
+    /// (`PutEntity`, `DeleteEntity`, `RecordActivity`, `CompareVersions`);
+    /// at least 1 (default: the number of CPUs).
+    ///
+    /// More wait their turn. Unary and batch calls queue within the request
+    /// timeout and fail with CANCELLED if it passes while they wait. Stream
+    /// items queue with no server-side deadline. Work that has started runs
+    /// to completion and holds its slot even if the caller has gone, and
+    /// registry writes still commit.
+    #[arg(
+        long,
+        env = "ASSESSMENT_MAX_CONCURRENT_ASSESSMENTS",
+        value_name = "N",
+        value_parser = parse_slots
+    )]
+    pub max_concurrent_assessments: Option<usize>,
 
     /// Log format (the level comes from `RUST_LOG`, default `info`).
     #[arg(long, env = "ASSESSMENT_LOG_FORMAT", value_enum, default_value_t = LogFormat::Pretty)]
     pub log_format: LogFormat,
+}
+
+/// Parses a slot count: a whole number from 1 to [`MAX_SLOTS`].
+fn parse_slots(text: &str) -> Result<usize, String> {
+    match text.trim().parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(n) if n > MAX_SLOTS => Err(format!("must be at most {MAX_SLOTS}")),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("must be a whole number from 1 to {MAX_SLOTS}")),
+    }
 }
 
 /// How logs are written (to stderr).
@@ -253,6 +282,29 @@ mod tests {
         assert_eq!(cli.serve.max_message_bytes, 16 * 1024 * 1024);
         assert_eq!(cli.serve.request_timeout_secs, 30);
         assert_eq!(cli.serve.concurrency_limit, 256);
+    }
+
+    #[test]
+    fn max_concurrent_assessments_is_optional_and_ranged() {
+        const FLAG: &str = "--max-concurrent-assessments";
+        let cli = Cli::try_parse_from(["assessment-engine"]).expect("parses");
+        assert_eq!(cli.serve.max_concurrent_assessments, None);
+        let cli = Cli::try_parse_from(["assessment-engine", FLAG, "3"]).expect("parses");
+        assert_eq!(cli.serve.max_concurrent_assessments, Some(3));
+        let cli = Cli::try_parse_from(["assessment-engine", "serve", FLAG, "3"]).expect("parses");
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.max_concurrent_assessments, Some(3));
+
+        let too_many = usize::MAX.to_string();
+        for bad in ["0", too_many.as_str(), "many"] {
+            let err =
+                Cli::try_parse_from(["assessment-engine", FLAG, bad]).expect_err("out of range");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+        let err = Cli::try_parse_from(["assessment-engine", FLAG, "0"]).expect_err("zero");
+        assert!(err.to_string().contains("must be at least 1"), "{err}");
     }
 
     #[test]

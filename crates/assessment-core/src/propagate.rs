@@ -189,6 +189,10 @@ pub(crate) struct Propagator<'a> {
     policy: &'a Policy,
     docs: &'a [SparseVec],
     titles: &'a [SparseVec],
+    /// The nodes whose text was analysed (`engine::text_reach`): every node
+    /// the walk visits must be one of them, or its relevance would be read
+    /// from an empty vector. Checked in debug builds.
+    reach: &'a [bool],
     /// `(own estimate, Σ live children's estimates)` per node.
     efforts: Vec<(f64, f64)>,
 }
@@ -279,6 +283,34 @@ pub(crate) fn rollup_base(own: f64, kids_after: f64, moved: f64) -> f64 {
     after.max(before)
 }
 
+/// Adds the parents a change's first `up` hop goes to, without duplicates.
+/// A change of the `parent` field is a move: it touches the parent it left
+/// and the one it joined (`moved`, ids the graph does not know are skipped).
+/// Any other change goes to the current parent of `source`.
+///
+/// The walk and the engine's text reach both take their parents from here,
+/// so the reach covers every parent the walk can step to.
+pub(crate) fn first_parents(
+    g: &Graph,
+    source: usize,
+    moved: Option<[Option<&str>; 2]>,
+    out: &mut Vec<usize>,
+) {
+    let mut add = |p: usize| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    match moved {
+        Some(ids) => ids
+            .into_iter()
+            .flatten()
+            .filter_map(|id| g.get(id))
+            .for_each(&mut add),
+        None => g.parent[source].into_iter().for_each(&mut add),
+    }
+}
+
 fn enqueue(queue: &mut VecDeque<State>, used: usize, budget: usize, state: State) -> bool {
     if used.saturating_add(queue.len()) < budget {
         queue.push_back(state);
@@ -294,6 +326,7 @@ impl<'a> Propagator<'a> {
         policy: &'a Policy,
         docs: &'a [SparseVec],
         titles: &'a [SparseVec],
+        reach: &'a [bool],
     ) -> Self {
         let efforts = (0..graph.len())
             .map(|i| {
@@ -314,8 +347,14 @@ impl<'a> Propagator<'a> {
             policy,
             docs,
             titles,
+            reach,
             efforts,
         }
+    }
+
+    /// Whether `node`'s text was analysed (see [`Propagator::reach`]).
+    fn in_reach(&self, node: usize) -> bool {
+        self.reach.get(node).copied().unwrap_or(false)
     }
 
     /// `(own estimate, Σ live children's estimates)` of a node, after the changes.
@@ -358,20 +397,12 @@ impl<'a> Propagator<'a> {
         // The first hop: structural edges first, then siblings (those sharing
         // the assignee or cycle first). Nothing beyond the budget is queued.
         let mut parents: Vec<usize> = Vec::new();
-        if seed.field == field::PARENT {
-            // A move touches both the parent it left and the one it joined.
-            if let Detail::Reference { before, after } = seed.detail {
-                for id in [before, after].into_iter().flatten() {
-                    if let Some(p) = g.get(id)
-                        && !parents.contains(&p)
-                    {
-                        parents.push(p);
-                    }
-                }
-            }
-        } else if let Some(p) = g.parent[s] {
-            parents.push(p);
-        }
+        let moved = match seed.detail {
+            _ if seed.field != field::PARENT => None,
+            Detail::Reference { before, after } => Some([before.as_deref(), after.as_deref()]),
+            _ => Some([None, None]),
+        };
+        first_parents(g, s, moved, &mut parents);
         let source_entity = &g.nodes[s];
         let siblings: &[usize] = match g.parent[s] {
             Some(p) if Self::strength(seed, Channel::Sibling) > 0.0 => &g.children[p],
@@ -421,6 +452,11 @@ impl<'a> Propagator<'a> {
         let mut steps = 0usize;
         while let Some(st) = queue.pop_front() {
             steps += 1;
+            debug_assert!(
+                self.in_reach(st.node),
+                "the walk visited `{}`, outside the analysed text reach",
+                g.nodes[st.node].id
+            );
             if best
                 .get(&(st.node, st.channel))
                 .is_some_and(|b| *b >= st.transfer)
@@ -547,6 +583,11 @@ impl<'a> Propagator<'a> {
             .copied()
             .filter(|&c| !g.deleted[c])
             .collect();
+        debug_assert!(
+            kids.iter().all(|&c| self.in_reach(c)),
+            "a child of `{}` is outside the analysed text reach",
+            g.nodes[s].id
+        );
         let lists: [(&[SparseVec], u8); 3] = if comment {
             [(&delta.added, 2), (&[], 0), (&[], 1)]
         } else {

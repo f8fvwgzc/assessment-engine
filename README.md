@@ -97,8 +97,10 @@ Options (flags or env): `--journal <file>` / `ASSESSMENT_JOURNAL` (persist the
 registry as an append-only JSON-lines journal; in memory otherwise),
 `--fsync`, `--policy <patch.json>`, `--auth-token` / `ASSESSMENT_AUTH_TOKEN`
 (require `authorization: Bearer <token>`), `--max-message-bytes`,
-`--request-timeout-secs`, `--concurrency-limit`, `--log-format json`,
-`RUST_LOG`. Health (`grpc.health.v1`) and reflection are served, so
+`--request-timeout-secs`, `--concurrency-limit`,
+`--max-concurrent-assessments` (stateless assessments run at once, and
+separately registry calls run at once; at least 1, default the number of
+CPUs; more wait their turn), `--log-format json`, `RUST_LOG`. Health (`grpc.health.v1`) and reflection are served, so
 `grpcurl` works out of the box:
 
 ```bash

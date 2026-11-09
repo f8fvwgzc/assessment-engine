@@ -36,10 +36,15 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     };
 
     let mut limits = ServiceLimits::default().with_max_batch_size(args.max_batch_size);
+    if let Some(n) = args.max_concurrent_assessments {
+        limits = limits.with_max_concurrent_assessments(n);
+    }
     if let Some(n) = args.max_in_flight {
         limits = limits.with_max_in_flight(n);
     }
     let service = AssessmentService::new(engine, Arc::new(registry)).with_limits(limits);
+    // The values in force (the service brings them into range).
+    let limits = service.limits();
 
     let auth = BearerAuth::from_option(args.auth_token.as_deref());
     let timeout =
@@ -65,6 +70,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         concurrency_limit = args.concurrency_limit,
         max_batch_size = limits.max_batch_size,
         max_in_flight = limits.max_in_flight,
+        max_concurrent_assessments = limits.max_concurrent_assessments,
         engine_version = assessment_core::ENGINE_VERSION,
         "assessment engine listening (gRPC, health and reflection on)"
     );

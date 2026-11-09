@@ -318,6 +318,29 @@ pub struct TextPolicy {
     pub negation_terms: BTreeSet<String>,
     pub strong_modals: BTreeSet<String>,
     pub weak_modals: BTreeSet<String>,
+    /// Which texts make up the IDF corpus that weights passages and overlaps.
+    pub idf_scope: IdfScope,
+}
+
+/// Which texts of a request make up the IDF corpus (document frequencies)
+/// that weights changed passages and their overlap with other entities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdfScope {
+    /// Every entity in the request (the changed ones and the whole context).
+    /// Unreached context still dilutes shared vocabulary, so sending more
+    /// unrelated context nudges scores.
+    #[default]
+    Context,
+    /// Only the changed entities and what propagation can reach: everything
+    /// within `propagation.max_depth` hops along its channels. Text outside
+    /// that reach is not analysed and is not part of the IDF corpus, so
+    /// relevance to reached entities is higher where the vocabulary was
+    /// shared with unrelated work. Only text is left out. Context linked to
+    /// the changes still counts toward breadth and violation checks, even
+    /// when it is outside the reach. Context with no link to the changes
+    /// leaves the result unchanged.
+    Reach,
 }
 
 impl Default for TextPolicy {
@@ -367,6 +390,7 @@ impl Default for TextPolicy {
                 "nice",
                 "preferably",
             ]),
+            idf_scope: IdfScope::Context,
         }
     }
 }

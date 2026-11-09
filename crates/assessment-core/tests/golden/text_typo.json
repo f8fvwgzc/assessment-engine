@@ -1,0 +1,90 @@
+{
+  "score": 0.009714285714285675,
+  "level": "none",
+  "recommendation": "no_action",
+  "confidence": 0.9,
+  "severity": 0.009714285714285675,
+  "breadth": 0.0,
+  "effort_at_risk": 0.009714285714285675,
+  "effort_total": 2.0,
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.009714285714285675,
+      "local_score": 0.009714285714285675,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.011428571428571344,
+          "severity": 0.85,
+          "risk": 0.009714285714285642,
+          "breaking": false,
+          "additive": false,
+          "before": "Implment the login flow with email",
+          "after": "Implement the login flow with email",
+          "metrics": {
+            "char_similarity": 0.9714285714285714,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.9885714285714287,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 0.0,
+            "passages_modified": 0.0,
+            "passages_removed": 0.0,
+            "shingle_similarity": 1.0,
+            "tfidf_cosine": 1.0,
+            "token_jaccard": 1.0
+          },
+          "explanation": "description: change magnitude 0.01"
+        }
+      ],
+      "signals": [],
+      "bump": "patch",
+      "previous_version": "1.0.0",
+      "next_version": "1.0.1",
+      "propagation_truncated": false,
+      "explanation": "changed description (patch 1.0.0 → 1.0.1); content score 0.01, local score 0.01; strongest: description: change magnitude 0.01"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 1,
+      "score": 0.009714285714285675,
+      "level": "none",
+      "action": "none",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.009714285714285675,
+      "contributions": [],
+      "reasons": [
+        "changed description (patch 1.0.0 → 1.0.1); content score 0.01, local score 0.01; strongest: description: change magnitude 0.01"
+      ]
+    }
+  ],
+  "impacts_total": 1,
+  "violations": [],
+  "summary": "none impact (score 0.01, confidence 0.90); recommendation: no action",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}
