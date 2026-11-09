@@ -12,7 +12,10 @@ cargo run --release -p assessment-core --example bench -- --quick  # up to ~1k e
 Each row times `Engine::assess` on one request: median and minimum of 3–7 runs
 after one warm-up. The JSON parse of the same request is timed separately. The
 registry rows store a project tree put by put (timed once), then time puts that
-rewrite the changed issue against the stored graph.
+rewrite the changed issue against the stored graph, with and without the
+analysis cache. The import rows time one `Registry::import` of new entities
+(timed once), the first put after it (timed once) and later puts. All registry
+rows use an in-memory registry, so they hold no journal or disk time.
 
 ## Baseline: 0.1.0 (2026-11-10, Apple M2 Pro, 10 cores, release build)
 
@@ -120,9 +123,73 @@ returned `top_k` impacts. Changing `top_k` (0 / 100 / 5) and `explain` moved
 no timing beyond noise, even with 346 impacts, so the engine still builds them
 for every impact.
 
+## M3: ingest and analysis cache (2026-11-10, same machine and build, `context`)
+
+What changed:
+
+- **Import stores without assessing.** `Registry::import` (the `Import` RPC)
+  gives a new entity its first version, its pins and its history entry
+  without running the engine. Only an item that changes a stored entity, or
+  deletes one, is assessed.
+- **Duplicates are answered before the engine.** A put or an import item
+  that matches the stored entity is compared and skipped. So is one whose
+  `source_seq` is not above the stored sequence.
+- **Analysis cache.** The registry keeps the term counts of each stored
+  entity's title and description in memory. They are computed when an
+  assessment first reads the entity, and again only when that text changes.
+  They are dropped when the entity is deleted.
+  An import analyses nothing; the first put after it analyses the texts it
+  reads, once.
+- **Snapshots.** A compaction folds the journal into a snapshot, so a start
+  replays only what was written after it. This is not in the bench: the
+  registry rows run in memory.
+
+| scenario | entities | M1, `context` ms | M3 median ms | M3 min ms |
+|---|---:|---:|---:|---:|
+| registry cousins 250x3: bulk load (put by put) | 1006 | 6 492 | 2 757.7 | 2 757.7 |
+| registry cousins 250x3: put on the stored graph | 1006 | 14.1 | 7.9 | 6.9 |
+| registry cousins 250x3: put on the stored graph, analysis cache off | 1006 | — | 14.2 | 14.0 |
+| registry: import 1k new entities | 1006 | — | 1.0 | 1.0 |
+| registry: first put after the 1k import | 1006 | — | 17.7 | 17.7 |
+| registry: put after the 1k import | 1006 | — | 8.9 | 8.9 |
+| registry: import 10k new entities | 10006 | — | 12.8 | 12.8 |
+| registry: first put after the 10k import | 10006 | — | 190.1 | 190.1 |
+| registry: put after the 10k import | 10006 | — | 93.8 | 93.6 |
+
+The import rows load the `siblings` graph, where the put that follows
+reaches every entity. A dash means the row did not exist in M1.
+
+What the numbers show:
+
+- **Import is linear.** 1k new entities take 1.0 ms and 10k take 12.8 ms,
+  about 1 µs per entity. A put-by-put load of a 1k graph takes 2.8 s,
+  because every put is assessed.
+- **A put on a stored graph is about 2× faster.** 14.1 ms in M1 and 14.2 ms
+  with the cache off, 7.9 ms with it on.
+- **The first put after an import pays for the analysis once.** 17.7 ms on
+  1k entities and 190.1 ms on 10k; later puts take 8.9 ms and 93.8 ms.
+- **A put-by-put load is 2.4× faster than in M1,** but it is still not
+  linear. Use an import to load.
+
+What did not change:
+
+- **Assessment results.** Every golden output is byte-identical to M2. Only
+  term counts are kept; document frequencies and TF-IDF are computed per
+  request over the same corpus as before.
+- **Stateless `Engine::assess`.** The rows above the registry rows in the
+  bench table are within noise of M1 (for example 10k siblings: 178.2 ms in
+  M1, 174.9 ms now).
+- **The per-request work on a large reached graph.** A put on a fully
+  reached graph of 10k entities still takes about 94 ms. The analysis is
+  gone from it; what is left is document frequencies, TF-IDF vectors,
+  similarity and propagation over every reached node.
+- **`reach` scope** was not measured again for M3.
+
 ## Targets
 
-- **M3 (ingest).** Import stores without assessing, and analyses are cached
-  per entity version. Expected: bulk load is linear (~1k entities in well under
-  a second), and a put on the stored graph analyses only the changed entity's
-  text.
+- **M3 (ingest): measured.** The targets were a linear bulk load, with 1k
+  entities in well under a second, and a put that analyses only the changed
+  entity's text. An import of 1k entities takes 1.0 ms and one of 10k takes
+  12.8 ms. A put on the stored 1k graph went from 14.1 ms to 7.9 ms. A unit
+  test checks that such a put analyses the same few texts (at most 12) for
+  10 and for 300 stored children.

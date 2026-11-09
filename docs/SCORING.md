@@ -193,6 +193,40 @@ entity it made incompatible lifts the overall score to at least *medium*
 and asks for a review. A pin that was already stale is reported but
 neither raises the score nor lists the entity on its own.
 
+**Versions in the registry.** The stateless engine only proposes
+`next_version`. The registry (`PutEntity`, `Import`) applies it and keeps
+the history:
+
+* **First version.** A new id starts at 1.0.0, or at the version it
+  carries. Later the registry assigns versions itself and ignores a sent
+  version.
+* **A put that changes the entity** is assessed against the stored version
+  and its stored neighbourhood, and gets the bump above.
+* **A put that matches the stored entity** is not assessed. The version
+  stays, and the answer has `unchanged` set and an empty assessment. A dry
+  run and a put with activity events are still assessed.
+* **Ordering guard.** A put or delete may carry `source_seq`, the position
+  of the change in the source's own order for that entity. The registry
+  keeps the highest sequence it has applied per id, also after a deletion.
+  A change whose sequence is equal or lower is skipped as stale: nothing is
+  assessed, stored or versioned, and `skipped_stale` is set. The guard is
+  checked before `expected_version`, and on dry runs too. A change without
+  a sequence is always applied and leaves the stored sequence as it was.
+  A duplicate that carries a higher sequence moves the stored sequence and
+  nothing else. So does a deletion of an id that is not stored: a delete
+  call fails with "not found", an import counts it as unchanged, and both
+  keep the sequence (a dry run keeps nothing).
+* **Import.** A new entity gets its first version, its basis pins and the
+  pins other entities hold on it exactly as from a put, but **without an
+  assessment**: its history entry has bump `initial`, score 0, level
+  *none* and no changed fields. Unchanged items are skipped, changed items
+  are assessed and versioned like a put, and deletions are assessed like a
+  delete (a deletion of an id that is not stored keeps only its sequence). Items are
+  applied in input order, and any order of entities gives the same versions
+  and pins. Churn and anomaly read only the history of updates, never the
+  creation entry, so later changes are assessed the same after an import as
+  after puts.
+
 ## 5. Propagation
 
 Every scored field is a *seed* with risk `wᶠ·rᶠ` and a strength per channel:

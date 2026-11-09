@@ -65,6 +65,7 @@ pub mod semver;
 pub mod stats;
 pub mod text;
 
+mod analysis;
 mod constraints;
 mod fields;
 mod graph;

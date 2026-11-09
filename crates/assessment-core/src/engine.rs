@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use crate::analysis::{PreparedStats, StatsCell, TextStats};
 use crate::assessment::{
     Action, Assessment, BasisStatus, ChangeAssessment, ChangeType, Channel, Contribution,
     EntityImpact, FieldAssessment, FieldChangeKind, ImpactLevel, Modifier, Recommendation, Signal,
@@ -206,10 +207,36 @@ impl Engine {
     /// Assesses the request's changes together.
     pub fn assess(&self, request: &AssessmentRequest) -> Result<Assessment> {
         let now = request.now.unwrap_or_else(Utc::now);
-        self.assess_at(request, now)
+        self.assess_at(request, now, None)
     }
 
-    fn assess_at(&self, request: &AssessmentRequest, now: DateTime<Utc>) -> Result<Assessment> {
+    /// [`Engine::assess`] with the term counts a caller keeps between
+    /// requests (see [`crate::analysis`]). An entity with a cell is analysed
+    /// only if the cell is empty, and the cell is filled then; an entity
+    /// without one is analysed as in [`Engine::assess`]. The cells are
+    /// ignored, and left alone, when they are kept for a policy whose `text`
+    /// section differs from this engine's. The result is the same as
+    /// [`Engine::assess`] gives, bit for bit.
+    pub(crate) fn assess_prepared(
+        &self,
+        request: &AssessmentRequest,
+        prepared: &PreparedStats<'_>,
+    ) -> Result<Assessment> {
+        let now = request.now.unwrap_or_else(Utc::now);
+        self.assess_at(request, now, Some(prepared))
+    }
+
+    /// The policy, as the engine shares it.
+    pub(crate) fn shared_policy(&self) -> &Arc<Policy> {
+        &self.policy
+    }
+
+    fn assess_at(
+        &self,
+        request: &AssessmentRequest,
+        now: DateTime<Utc>,
+        prepared: Option<&PreparedStats<'_>>,
+    ) -> Result<Assessment> {
         let policy: &Policy = &self.policy;
         let pp = &policy.propagation;
         check_request(request)?;
@@ -266,28 +293,68 @@ impl Engine {
         let lexicon = text::Lexicon::new(&policy.text);
         let reach = text_reach(&graph, &resolved, pp.max_depth);
         let whole_corpus = policy.text.idf_scope == IdfScope::Context;
+        // Term counts kept by the caller stand in for an analysis. A node's
+        // cell is used only where the node is exactly the entity the cell
+        // was given for: a context entity, or a change's snapshot as sent
+        // (snapshots derived from field changes are analysed).
+        let prepared = prepared.filter(|p| p.usable_by(&self.policy));
+        let kept_stats = |cell: Option<&StatsCell>, entity: &Entity| {
+            let p = prepared?;
+            Some(cell?.stats(entity, p.policy(), &lexicon))
+        };
+        let node_stats = |node: &Entity| {
+            let p = prepared?;
+            let cell = match changed_ids.get(node.id.as_str()) {
+                None => p.context_cell(&node.id),
+                Some(&ci) if !request.changes[ci].field_changes.is_empty() => None,
+                Some(&ci) => match &resolved[ci].snapshots {
+                    Snapshots::Created { .. } | Snapshots::Updated { .. } => p.after_cell(ci),
+                    Snapshots::Deleted { .. } => p.before_cell(ci),
+                    Snapshots::Activity { .. } if resolved[ci].placeholder => None,
+                    Snapshots::Activity { .. } => p.context_cell(&node.id),
+                },
+            };
+            kept_stats(cell, node)
+        };
         let mut corpus = Corpus::new();
         let mut counts: Vec<Option<BTreeMap<String, u32>>> = Vec::with_capacity(graph.len());
+        let mut kept: Vec<Option<Arc<TextStats>>> = Vec::with_capacity(graph.len());
         for (node, reached) in graph.nodes.iter().zip(&reach) {
-            if *reached || whole_corpus {
+            if !(*reached || whole_corpus) {
+                counts.push(None);
+                kept.push(None);
+            } else if let Some(stats) = node_stats(node) {
+                corpus.add_terms(stats.document.keys());
+                counts.push(None);
+                kept.push(reached.then_some(stats));
+            } else {
                 let c = text::term_counts(&node.document(), &lexicon);
                 corpus.add_terms(c.keys());
                 counts.push(reached.then_some(c));
-            } else {
-                counts.push(None);
+                kept.push(None);
             }
         }
-        for r in &resolved {
+        for (ci, r) in resolved.iter().enumerate() {
             if let Snapshots::Updated { before, .. } = &r.snapshots {
-                let c = text::term_counts(&before.document(), &lexicon);
-                corpus.add_terms(c.keys());
+                let cell = prepared
+                    .filter(|_| request.changes[ci].field_changes.is_empty())
+                    .and_then(|p| p.before_cell(ci));
+                match kept_stats(cell, before) {
+                    Some(stats) => corpus.add_terms(stats.document.keys()),
+                    None => {
+                        let c = text::term_counts(&before.document(), &lexicon);
+                        corpus.add_terms(c.keys());
+                    }
+                }
             }
         }
         let docs: Vec<SparseVec> = counts
             .iter()
-            .map(|c| {
-                c.as_ref()
-                    .map_or_else(SparseVec::new, |c| text::tfidf(c, &corpus))
+            .zip(&kept)
+            .map(|(c, k)| match (k, c) {
+                (Some(stats), _) => text::tfidf(&stats.document, &corpus),
+                (None, Some(c)) => text::tfidf(c, &corpus),
+                (None, None) => SparseVec::new(),
             })
             .collect();
         drop(counts);
@@ -295,12 +362,15 @@ impl Engine {
             .nodes
             .iter()
             .zip(&reach)
-            .map(|(n, reached)| match n.title().trim() {
+            .zip(&kept)
+            .map(|((n, reached), k)| match (k, n.title().trim()) {
                 _ if !reached => SparseVec::new(),
-                "" => SparseVec::new(),
-                t => text::tfidf(&text::term_counts(t, &lexicon), &corpus),
+                (Some(stats), _) => text::tfidf(&stats.title, &corpus),
+                (None, "") => SparseVec::new(),
+                (None, t) => text::tfidf(&text::term_counts(t, &lexicon), &corpus),
             })
             .collect();
+        drop(kept);
 
         // ---- 2–3. score each change ---------------------------------------------
         let scorings: Vec<Scoring> = resolved
@@ -1808,7 +1878,9 @@ fn check_value(name: &str, value: &FieldValue, id: &str) -> Result<()> {
     err.map_or(Ok(()), Err)
 }
 
-fn validate_entity(e: &Entity) -> Result<()> {
+/// The limits every entity of a request must keep. The registry applies
+/// them to an entity it stores without an assessment.
+pub(crate) fn validate_entity(e: &Entity) -> Result<()> {
     if e.id.trim().is_empty() {
         return Err(Error::invalid("an entity has an empty id"));
     }

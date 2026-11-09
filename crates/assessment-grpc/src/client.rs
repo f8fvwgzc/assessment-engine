@@ -33,7 +33,10 @@ use std::task::{Context, Poll};
 
 use assessment_core::model::{ActivityEvent, AssessmentRequest, Entity};
 use assessment_core::policy::Policy;
-use assessment_core::registry::{PutOptions, PutOutcome, StaleEntry, VersionRecord};
+use assessment_core::registry::{
+    DeleteOptions, DeleteOutcome, ImportItem, ImportSummary, PutOptions, PutOutcome, StaleEntry,
+    VersionRecord,
+};
 use assessment_core::semver::SemVer;
 use assessment_core::text::TextDiff;
 use assessment_core::{Assessment, ErrorKind};
@@ -211,6 +214,17 @@ fn item_from_pb(call: &'static str, r: pb::AssessResponse) -> Result<ItemRespons
         request_id: r.request_id,
         result,
     })
+}
+
+/// What [`AssessmentClient::import`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportReport {
+    /// The counts, and the failed items the server listed (it lists at most
+    /// the first 1 000).
+    pub summary: ImportSummary,
+    /// How many items failed in all; larger than `summary.failed.len()`
+    /// when the server cut the list short.
+    pub failed_total: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +509,9 @@ impl AssessmentClient {
     }
 
     /// Creates or updates an entity in the server's registry.
+    ///
+    /// With [`PutOptions::source_seq`], a put that is not newer than what
+    /// the server holds is skipped; see [`PutOutcome::skipped_stale`].
     pub async fn put_entity(
         &mut self,
         entity: Entity,
@@ -525,12 +542,62 @@ impl AssessmentClient {
                 dry_run,
                 expected_version: expected_version.map(Into::into),
                 now: now.map(convert::timestamp_to_pb),
+                source_seq: None,
             })
             .await
             .map_err(|s| ClientError::from_status("delete_entity", s))?
             .into_inner();
         convert::assessment_field(response.assessment)
             .map_err(|e| ClientError::decode("delete_entity", e))
+    }
+
+    /// Like [`delete_entity`](Self::delete_entity), with every option
+    /// (among them [`DeleteOptions::source_seq`]) and the full outcome.
+    pub async fn delete_entity_with(
+        &mut self,
+        id: impl Into<String>,
+        options: DeleteOptions,
+    ) -> Result<DeleteOutcome, ClientError> {
+        let response = self
+            .inner
+            .delete_entity(convert::delete_request_to_pb(id, options))
+            .await
+            .map_err(|s| ClientError::from_status("delete_entity", s))?
+            .into_inner();
+        DeleteOutcome::try_from(response).map_err(|e| ClientError::decode("delete_entity", e))
+    }
+
+    /// Streams `items` to the server's registry, which applies them in
+    /// order: new entities are stored without an assessment, unchanged ones
+    /// are skipped, changed ones are assessed like a put, and deletions are
+    /// applied.
+    ///
+    /// An item that fails is reported in the summary and does not stop the
+    /// rest. If the call itself fails, the items the server applied before
+    /// that stay applied; sending the same items again is safe.
+    pub async fn import<S>(&mut self, items: S) -> Result<ImportReport, ClientError>
+    where
+        S: Stream<Item = ImportItem> + Send + 'static,
+    {
+        let response = self
+            .inner
+            .import(items.map(pb::ImportRequest::from))
+            .await
+            .map_err(|s| ClientError::from_status("import", s))?
+            .into_inner();
+        Ok(ImportReport {
+            failed_total: response.failed_total,
+            summary: response.into(),
+        })
+    }
+
+    /// [`import`](Self::import) for items that are already in memory.
+    pub async fn import_iter<I>(&mut self, items: I) -> Result<ImportReport, ClientError>
+    where
+        I: IntoIterator<Item = ImportItem>,
+        I::IntoIter: Send + 'static,
+    {
+        self.import(tokio_stream::iter(items)).await
     }
 
     /// Assesses activity (comments, …) on a stored entity.
