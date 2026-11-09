@@ -44,6 +44,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start(options: ServerOptions) -> Self {
+        Self::start_with(AssessmentService::in_memory(), options).await
+    }
+
+    async fn start_with(service: AssessmentService, options: ServerOptions) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("binds a free port");
@@ -51,7 +55,7 @@ impl TestServer {
         let incoming = TcpListenerStream::new(listener);
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(serve_with_incoming_shutdown(
-            AssessmentService::in_memory(),
+            service,
             options,
             incoming,
             async {
@@ -71,6 +75,17 @@ impl TestServer {
             .expect("connects")
     }
 
+    /// A client whose HTTP/2 stream window is the 64 KB minimum, so a
+    /// response stream it does not read soon stops the server's writer.
+    async fn small_window_client(&self) -> AssessmentClient {
+        let endpoint = tonic::transport::Endpoint::from_shared(self.url.clone())
+            .expect("a valid url")
+            .initial_stream_window_size(65_535);
+        AssessmentClient::connect_endpoint(endpoint)
+            .await
+            .expect("connects")
+    }
+
     async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -83,6 +98,27 @@ impl TestServer {
             result.expect("serves without error");
         }
     }
+}
+
+/// The longest an end-to-end test of the slot pools may take. A deadlock
+/// fails the test instead of hanging the run.
+const E2E_LIMIT: Duration = Duration::from_secs(120);
+
+/// Runs `body`, and fails if it takes longer than `limit`.
+async fn within<F: Future>(limit: Duration, body: F) -> F::Output {
+    tokio::time::timeout(limit, body)
+        .await
+        .expect("the test finishes in time (a longer wait means a deadlock)")
+}
+
+/// An in-memory service with `slots` assessment slots per pool and
+/// `in_flight` items per batch or stream.
+fn slot_service(slots: usize, in_flight: usize) -> AssessmentService {
+    AssessmentService::in_memory().with_limits(
+        assessment_grpc::service::ServiceLimits::default()
+            .with_max_concurrent_assessments(slots)
+            .with_max_in_flight(in_flight),
+    )
 }
 
 impl Drop for TestServer {
@@ -306,6 +342,148 @@ async fn assess_batch_size_is_limited() {
     assert_eq!(err.code(), Some(Code::InvalidArgument));
     let _ = stop.send(());
     let _ = task.await;
+}
+
+/// With a single assessment slot, concurrent unary calls, a batch and a
+/// stream all still complete, with correct results: per-call permits and the
+/// service-wide slot never wait on each other in a cycle.
+#[tokio::test]
+async fn one_assessment_slot_serves_concurrent_calls() {
+    within(
+        E2E_LIMIT,
+        one_assessment_slot_serves_concurrent_calls_body(),
+    )
+    .await;
+}
+
+async fn one_assessment_slot_serves_concurrent_calls_body() {
+    let server = TestServer::start_with(slot_service(1, 3), ServerOptions::default()).await;
+    let client = server.client().await;
+
+    let unary = (0..6).map(|i| {
+        let mut client = client.clone();
+        tokio::spawn(async move {
+            client
+                .assess(simple_request(&format!("U-{i}"), &format!("Export v{i}")))
+                .await
+        })
+    });
+    let batch = {
+        let mut client = client.clone();
+        tokio::spawn(async move {
+            let requests = (0..8)
+                .map(|i| simple_request(&format!("B-{i}"), &format!("Import v{i}")))
+                .collect();
+            client.assess_batch(requests).await
+        })
+    };
+    let stream = {
+        let mut client = client.clone();
+        tokio::spawn(async move {
+            let requests: Vec<(String, AssessmentRequest)> = (0..8)
+                .map(|i| (format!("s-{i}"), rewrite_request()))
+                .collect();
+            client
+                .assess_stream(tokio_stream::iter(requests))
+                .await
+                .expect("the stream opens")
+                .collect::<Result<Vec<_>, _>>()
+                .await
+        })
+    };
+
+    for (i, handle) in unary.enumerate() {
+        let a = handle
+            .await
+            .expect("the task runs")
+            .expect("the call succeeds");
+        assert_eq!(a.changes[0].entity_id, format!("U-{i}"));
+    }
+    let batch = batch
+        .await
+        .expect("the task runs")
+        .expect("the batch succeeds");
+    assert_eq!(batch.len(), 8);
+    assert!(batch.iter().all(|r| r.result.is_ok()));
+    let stream = stream
+        .await
+        .expect("the task runs")
+        .expect("every response arrives");
+    assert_eq!(stream.len(), 8);
+    for (i, r) in stream.iter().enumerate() {
+        assert_eq!(r.request_id, format!("s-{i}"));
+        let a = r.result.as_ref().expect("succeeds");
+        assert_eq!(a.changes[0].bump, VersionBump::Major);
+    }
+    server.shutdown().await;
+}
+
+/// A stream whose client sends many requests and reads nothing must not
+/// keep the only assessment slot: a unary call made meanwhile completes.
+/// The stream then still delivers every response, in order. A stream the
+/// client drops unread gives its queue places back too.
+#[tokio::test]
+async fn an_unread_stream_does_not_starve_unary_calls() {
+    within(
+        E2E_LIMIT,
+        an_unread_stream_does_not_starve_unary_calls_body(),
+    )
+    .await;
+}
+
+async fn an_unread_stream_does_not_starve_unary_calls_body() {
+    // About 830 KB of responses per stream: far more than the client's
+    // 64 KB stream window, so the server's writer really is held back.
+    const ITEMS: usize = 300;
+    // No request timeout: nothing but the service itself may free a slot.
+    let options = ServerOptions::default().with_request_timeout(None);
+    let server = TestServer::start_with(slot_service(1, 2), options).await;
+    let mut client = server.small_window_client().await;
+    let requests = |prefix: &'static str| -> Vec<(String, AssessmentRequest)> {
+        (0..ITEMS)
+            .map(|i| (format!("{prefix}-{i}"), rewrite_request()))
+            .collect()
+    };
+
+    // Opened, never read (until later).
+    let mut unread = client
+        .assess_stream(tokio_stream::iter(requests("s")))
+        .await
+        .expect("the stream opens");
+    // Opened, never read, then dropped.
+    let dropped = client
+        .assess_stream(tokio_stream::iter(requests("d")))
+        .await
+        .expect("the stream opens");
+
+    for i in 0..4 {
+        let a = client
+            .assess(simple_request(&format!("U-{i}"), "Export invoices as PDF"))
+            .await
+            .expect("the unary call completes while the streams are unread");
+        assert_eq!(a.changes[0].entity_id, format!("U-{i}"));
+    }
+    drop(dropped);
+    let batch = client
+        .assess_batch(vec![simple_request("B", "Export invoices as PDF"); 5])
+        .await
+        .expect("the batch completes after a stream was dropped");
+    assert_eq!(batch.len(), 5);
+
+    let mut seen = 0;
+    while let Some(response) = unread.next().await {
+        let response = response.expect("the response arrives");
+        assert_eq!(response.request_id, format!("s-{seen}"));
+        let a = response.result.as_ref().expect("succeeds");
+        assert_eq!(a.changes[0].bump, VersionBump::Major);
+        seen += 1;
+    }
+    assert_eq!(seen, ITEMS);
+    client
+        .assess(simple_request("U-last", "Export invoices as PDF"))
+        .await
+        .expect("the slot is free again");
+    server.shutdown().await;
 }
 
 #[tokio::test]

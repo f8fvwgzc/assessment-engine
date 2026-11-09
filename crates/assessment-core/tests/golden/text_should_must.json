@@ -1,0 +1,122 @@
+{
+  "score": 0.49181448459862587,
+  "level": "medium",
+  "recommendation": "review",
+  "confidence": 0.9,
+  "severity": 0.4590000000000001,
+  "breadth": 0.14481013924739283,
+  "effort_at_risk": 0.7486202784947857,
+  "effort_total": 2.0,
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.28962027849478567,
+      "local_score": 0.28962027849478567,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "decrease",
+          "magnitude": 0.3407297394056302,
+          "severity": 0.85,
+          "risk": 0.28962027849478567,
+          "breaking": false,
+          "additive": false,
+          "before": "The page should load in 2 seconds",
+          "after": "The page must load in 2 seconds",
+          "metrics": {
+            "char_similarity": 0.8484848484848485,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.7893939393939394,
+            "modal_shifts": 1.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 0.0,
+            "passages_modified": 1.0,
+            "passages_removed": 0.0,
+            "shingle_similarity": 0.5,
+            "tfidf_cosine": 1.0,
+            "token_jaccard": 1.0
+          },
+          "explanation": "description: change magnitude 0.34; 1 requirement-strength change(s)"
+        }
+      ],
+      "signals": [],
+      "bump": "minor",
+      "previous_version": "1.0.0",
+      "next_version": "1.1.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.29, local score 0.29; strongest: description: change magnitude 0.34; 1 requirement-strength change(s)"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 1,
+      "score": 0.4590000000000001,
+      "level": "medium",
+      "action": "update_scope",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "review_suggested",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.4590000000000001,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.459,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.64)"
+        }
+      ],
+      "reasons": [
+        "something it was planned against gained compatible additions",
+        "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.64)"
+      ]
+    },
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 2,
+      "score": 0.28962027849478567,
+      "level": "medium",
+      "action": "review",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.28962027849478567,
+      "contributions": [],
+      "reasons": [
+        "changed description (minor 1.0.0 → 1.1.0); content score 0.29, local score 0.29; strongest: description: change magnitude 0.34; 1 requirement-strength change(s)"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "medium impact (score 0.49, confidence 0.90); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: review",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

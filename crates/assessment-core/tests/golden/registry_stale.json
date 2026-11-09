@@ -1,0 +1,30 @@
+[
+  {
+    "entity_id": "X-1",
+    "basis_entity_id": "X",
+    "pinned": "1.2.0",
+    "current": "2.0.0",
+    "status": "incompatible"
+  },
+  {
+    "entity_id": "X-2",
+    "basis_entity_id": "X",
+    "pinned": "1.2.0",
+    "current": "2.0.0",
+    "status": "incompatible"
+  },
+  {
+    "entity_id": "X-3",
+    "basis_entity_id": "X",
+    "pinned": "1.2.0",
+    "current": "2.0.0",
+    "status": "incompatible"
+  },
+  {
+    "entity_id": "X-4",
+    "basis_entity_id": "X",
+    "pinned": "1.2.0",
+    "current": "2.0.0",
+    "status": "incompatible"
+  }
+]

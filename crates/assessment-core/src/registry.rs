@@ -20,10 +20,13 @@
 //! [`Registry::open_with_history_limit`], which applies the limit while
 //! replaying). The journal itself is not compacted.
 //!
-//! **Concurrency.** A put or delete is assessed under a shared lock, so reads
-//! and dry runs proceed meanwhile; it then commits under the exclusive lock
-//! if the entity has not changed in between, or is assessed again under that
-//! lock if it has. Neighbours that change meanwhile do not cause a retry: the
+//! **Concurrency.** A put or delete gathers its inputs under the shared lock
+//! and is assessed with no lock held, so reads, dry runs and other writes
+//! proceed meanwhile. It then commits under the exclusive lock if the entity
+//! has not changed, or is gathered and assessed again under that lock if it
+//! has (reads and writes wait for that second assessment). Activity and
+//! version comparisons are assessed with no lock held too.
+//! Neighbours that change meanwhile do not cause a retry: the
 //! assessment, and the versions auto-pinned for the entity, are those of the
 //! neighbourhood it was assessed against (so a pin can only be older than
 //! the neighbour, which [`Registry::stale`] then reports).
@@ -657,6 +660,9 @@ pub struct Registry {
     engine: Engine,
     state: RwLock<State>,
     journal: Option<Mutex<Journal>>,
+    /// Test-only: holds the next assessment of this registry (see [`gate`]).
+    #[cfg(test)]
+    gate: gate::Gate,
 }
 
 impl Registry {
@@ -666,6 +672,8 @@ impl Registry {
             engine,
             state: RwLock::new(State::default()),
             journal: None,
+            #[cfg(test)]
+            gate: gate::Gate::default(),
         }
     }
 
@@ -700,6 +708,8 @@ impl Registry {
             engine,
             state: RwLock::new(state),
             journal: Some(Mutex::new(journal)),
+            #[cfg(test)]
+            gate: gate::Gate::default(),
         })
     }
 
@@ -751,6 +761,14 @@ impl Registry {
         }
     }
 
+    /// Runs the engine. Every assessment of the registry goes through here,
+    /// so the tests can hold one mid-way and check that no lock is held.
+    fn assess(&self, request: &AssessmentRequest) -> Result<Assessment> {
+        #[cfg(test)]
+        self.gate.pass();
+        self.engine.assess(request)
+    }
+
     fn depth(&self) -> u32 {
         self.engine.policy().propagation.max_depth.max(1) + 1
     }
@@ -773,25 +791,29 @@ impl Registry {
         }
         let now = opts.now.unwrap_or_else(Utc::now);
         if opts.dry_run {
-            let state = self.read();
-            let p = self.prepare_put(&state, entity, &opts, now)?;
-            return Ok(p.into_outcome(false));
+            let input = self.gather_put(&self.read(), entity, &opts, now)?;
+            return Ok(self.evaluate_put(input)?.into_outcome(false));
         }
         let assessed = self.assess_put(entity.clone(), &opts, now)?;
         self.commit_put(entity, &opts, now, assessed)
     }
 
-    /// The expensive half of a put, under the shared lock: the assessment,
-    /// and the entity's revision it was made against.
+    /// The expensive half of a put: its inputs are gathered under the shared
+    /// lock, the assessment runs without any lock (so a long assessment never
+    /// holds up other readers, or a writer they would queue behind), and the
+    /// entity's revision it was made against is returned for the commit.
     fn assess_put(
         &self,
         entity: Entity,
         opts: &PutOptions,
         now: DateTime<Utc>,
     ) -> Result<(Prepared, Option<u64>)> {
-        let state = self.read();
-        let revision = state.revision(&entity.id);
-        Ok((self.prepare_put(&state, entity, opts, now)?, revision))
+        let (input, revision) = {
+            let state = self.read();
+            let revision = state.revision(&entity.id);
+            (self.gather_put(&state, entity, opts, now)?, revision)
+        };
+        Ok((self.evaluate_put(input)?, revision))
     }
 
     /// The write half of a put, under the exclusive lock. If the entity
@@ -827,6 +849,8 @@ impl Registry {
         Ok(p.into_outcome(true))
     }
 
+    /// A whole put under one lock (the commit's fallback when the entity
+    /// changed after it was assessed).
     fn prepare_put(
         &self,
         state: &State,
@@ -834,6 +858,19 @@ impl Registry {
         opts: &PutOptions,
         now: DateTime<Utc>,
     ) -> Result<Prepared> {
+        self.evaluate_put(self.gather_put(state, entity, opts, now)?)
+    }
+
+    /// The part of a put that reads the registry: the entity as it will be
+    /// stored (basis, pins, version to assess against) and the request for
+    /// the engine (its neighbourhood and history).
+    fn gather_put(
+        &self,
+        state: &State,
+        entity: Entity,
+        opts: &PutOptions,
+        now: DateTime<Utc>,
+    ) -> Result<PutInput> {
         let existing = state.records.get(&entity.id);
         let live = existing.filter(|r| !r.deleted);
         check_expected(&entity.id, live, opts.expected_version)?;
@@ -899,7 +936,28 @@ impl Registry {
             now: Some(now),
             options: opts.assess.clone(),
         };
-        let assessment = self.engine.assess(&request)?;
+        Ok(PutInput {
+            after,
+            created,
+            previous_version,
+            current: live.map(|r| r.current.clone()),
+            request,
+            now,
+        })
+    }
+
+    /// The part of a put that needs no lock: the assessment, the version it
+    /// leads to, and whether the put changes anything at all.
+    fn evaluate_put(&self, input: PutInput) -> Result<Prepared> {
+        let PutInput {
+            mut after,
+            created,
+            previous_version,
+            current,
+            request,
+            now,
+        } = input;
+        let assessment = self.assess(&request)?;
         let ca = first_change(&assessment)?;
         let bump = if created {
             VersionBump::Initial
@@ -941,9 +999,9 @@ impl Registry {
         });
         let noop = !created
             && bump == VersionBump::None
-            && live.is_some_and(|r| same_content(&r.current, &after));
-        if noop && let Some(rec) = live {
-            after = rec.current.clone();
+            && current.as_ref().is_some_and(|c| same_content(c, &after));
+        if noop && let Some(c) = current {
+            after = c;
         }
         Ok(Prepared {
             entity: after,
@@ -966,20 +1024,22 @@ impl Registry {
     ) -> Result<Assessment> {
         let now = now.unwrap_or_else(Utc::now);
         if dry_run {
-            let state = self.read();
+            let (before, request) = self.gather_delete(&self.read(), id, expected_version, now)?;
             return self
-                .prepare_delete(&state, id, expected_version, now)
+                .evaluate_delete(id, before, &request, now)
                 .map(|(a, _)| a);
         }
-        // Assess under the shared lock; commit under the exclusive one, or
-        // assess again under it if the entity changed meanwhile.
-        let (assessed, revision) = {
+        // Gather under the shared lock and assess without a lock; commit
+        // under the exclusive one, or assess again under it if the entity
+        // changed meanwhile.
+        let (gathered, revision) = {
             let state = self.read();
             (
-                self.prepare_delete(&state, id, expected_version, now)?,
+                self.gather_delete(&state, id, expected_version, now)?,
                 state.revision(id),
             )
         };
+        let assessed = self.evaluate_delete(id, gathered.0, &gathered.1, now)?;
         let mut state = self.write();
         let (assessment, op) = if state.revision(id) == revision {
             assessed
@@ -991,6 +1051,7 @@ impl Registry {
         Ok(assessment)
     }
 
+    /// A whole deletion under one lock (the commit's fallback).
     fn prepare_delete(
         &self,
         state: &State,
@@ -998,6 +1059,19 @@ impl Registry {
         expected_version: Option<SemVer>,
         now: DateTime<Utc>,
     ) -> Result<(Assessment, JournalOp)> {
+        let (before, request) = self.gather_delete(state, id, expected_version, now)?;
+        self.evaluate_delete(id, before, &request, now)
+    }
+
+    /// The part of a deletion that reads the registry: the entity and the
+    /// request assessing its removal.
+    fn gather_delete(
+        &self,
+        state: &State,
+        id: &str,
+        expected_version: Option<SemVer>,
+        now: DateTime<Utc>,
+    ) -> Result<(Entity, AssessmentRequest)> {
         let rec = state
             .records
             .get(id)
@@ -1009,13 +1083,26 @@ impl Registry {
         seeds.extend(before.parent_id.as_deref());
         let seeds: Vec<&str> = seeds.into_iter().collect();
         let context = state.context(&seeds, id, self.depth());
-        let assessment = self.engine.assess(&AssessmentRequest {
+        let request = AssessmentRequest {
             changes: vec![ChangeSet::delete(before.clone())],
             context,
             history: state.history_points(id),
             now: Some(now),
             options: AssessOptions::default(),
-        })?;
+        };
+        Ok((before, request))
+    }
+
+    /// The part of a deletion that needs no lock: the assessment and the
+    /// tombstone's journal entry.
+    fn evaluate_delete(
+        &self,
+        id: &str,
+        before: Entity,
+        request: &AssessmentRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(Assessment, JournalOp)> {
+        let assessment = self.assess(request)?;
         let current = before.version.unwrap_or(SemVer::INITIAL);
         let version = current.checked_bump(VersionBump::Major).ok_or_else(|| {
             Error::invalid(format!(
@@ -1049,25 +1136,29 @@ impl Registry {
         if events.is_empty() {
             return Err(Error::invalid("no activity to record"));
         }
-        let state = self.read();
-        let current = state
-            .live(id)
-            .ok_or_else(|| Error::not_found(format!("entity `{id}` does not exist")))?;
-        let mut seeds: Vec<&str> = vec![id];
-        if let Some(p) = &current.parent_id {
-            seeds.push(p);
-        }
-        let mut context = state.context(&seeds, "", self.depth());
-        if !context.iter().any(|e| e.id == id) {
-            context.push(current.clone());
-        }
-        self.engine.assess(&AssessmentRequest {
-            changes: vec![ChangeSet::activity(id, events)],
-            context,
-            history: state.history_points(id),
-            now,
-            options: AssessOptions::default(),
-        })
+        let request = {
+            let state = self.read();
+            let current = state
+                .live(id)
+                .ok_or_else(|| Error::not_found(format!("entity `{id}` does not exist")))?;
+            let mut seeds: Vec<&str> = vec![id];
+            if let Some(p) = &current.parent_id {
+                seeds.push(p);
+            }
+            let mut context = state.context(&seeds, "", self.depth());
+            if !context.iter().any(|e| e.id == id) {
+                context.push(current.clone());
+            }
+            AssessmentRequest {
+                changes: vec![ChangeSet::activity(id, events)],
+                context,
+                history: state.history_points(id),
+                now,
+                options: AssessOptions::default(),
+            }
+        };
+        // No lock is held here: the guard was dropped with the block above.
+        self.assess(&request)
     }
 
     /// The live entity, or the snapshot at `version`.
@@ -1125,13 +1216,14 @@ impl Registry {
     ) -> Result<Assessment> {
         let before = self.get(id, Some(from))?;
         let after = self.get(id, Some(to))?;
-        let state = self.read();
         let mut seeds: Vec<&str> = vec![id];
         if let Some(p) = &after.parent_id {
             seeds.push(p);
         }
-        let context = state.context(&seeds, id, self.depth());
-        self.engine.assess(&AssessmentRequest {
+        // The guard is dropped at the end of this statement: no lock is held
+        // while the comparison is assessed.
+        let context = self.read().context(&seeds, id, self.depth());
+        self.assess(&AssessmentRequest {
             changes: vec![ChangeSet::update(before, after)],
             context,
             history: Vec::new(),
@@ -1249,6 +1341,18 @@ impl Registry {
     }
 }
 
+/// What a put gathered from the registry, ready to assess without a lock.
+struct PutInput {
+    /// The entity as it will be stored, at the version it is assessed at.
+    after: Entity,
+    created: bool,
+    previous_version: Option<SemVer>,
+    /// The live stored entity, if any.
+    current: Option<Entity>,
+    request: AssessmentRequest,
+    now: DateTime<Utc>,
+}
+
 struct Prepared {
     entity: Entity,
     created: bool,
@@ -1318,11 +1422,265 @@ fn check_expected(id: &str, live: Option<&Record>, expected: Option<SemVer>) -> 
     }
 }
 
+/// Test-only: holds the next assessment of one registry just before the
+/// engine runs, so a test can check what else can run meanwhile. The gate
+/// belongs to the registry under test, so tests running in parallel on other
+/// registries never meet it.
+#[cfg(test)]
+mod gate {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// The longest a test waits for the other side. A test that would
+    /// deadlock fails after this long instead of hanging.
+    pub(super) const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The longest an assessment stays held. Longer than [`TIMEOUT`], so a
+    /// test that waits on something the held assessment blocks times out
+    /// (and fails) before the assessment lets go by itself.
+    const HOLD: Duration = Duration::from_secs(30);
+
+    /// What an armed gate holds: where to report that the assessment was
+    /// reached, and where to wait for the go-ahead.
+    type Armed = (Sender<()>, Receiver<()>);
+
+    #[derive(Debug, Default)]
+    pub(super) struct Gate(Mutex<Option<Armed>>);
+
+    /// The test's side of an armed gate. Dropping it disarms the gate and
+    /// releases a held assessment, so a failing test leaves nothing blocked.
+    #[derive(Debug)]
+    pub(super) struct Held<'a> {
+        gate: &'a Gate,
+        entered: Receiver<()>,
+        resume: Sender<()>,
+    }
+
+    impl Gate {
+        /// Arms the gate for the next assessment of this registry.
+        pub(super) fn arm(&self) -> Held<'_> {
+            let (entered_tx, entered) = channel();
+            let (resume, resume_rx) = channel();
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((entered_tx, resume_rx));
+            Held {
+                gate: self,
+                entered,
+                resume,
+            }
+        }
+
+        /// Called before every assessment. If the gate is armed, disarms it,
+        /// reports in, and waits for the go-ahead (or for the test to give
+        /// up: a dropped [`Held`] or the timeout both let it go on).
+        pub(super) fn pass(&self) {
+            let taken = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some((entered, resume)) = taken {
+                // The test may be gone already; then there is nobody to tell.
+                entered.send(()).ok();
+                resume.recv_timeout(HOLD).ok();
+            }
+        }
+    }
+
+    impl Held<'_> {
+        /// Waits until an assessment is held at the gate.
+        pub(super) fn wait_entered(&self) {
+            self.entered
+                .recv_timeout(TIMEOUT)
+                .expect("the operation reaches its assessment in time");
+        }
+
+        /// Lets the held assessment go on.
+        pub(super) fn resume(self) {
+            self.resume.send(()).ok();
+        }
+    }
+
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            *self.gate.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::StatusCategory;
     use chrono::TimeZone;
+
+    /// Runs `op` on a worker thread and holds it just before its assessment.
+    /// While it is held, checks that a read and a put of an unrelated entity
+    /// (whose commit needs the exclusive lock) finish, then runs `meanwhile`,
+    /// lets `op` go on and returns its result.
+    ///
+    /// If `op` held a lock during its assessment, the unrelated put would
+    /// wait for it: the check then fails after a timeout instead of hanging.
+    fn hold_mid_assessment<R: Send>(
+        reg: &Registry,
+        op: impl FnOnce() -> R + Send,
+        meanwhile: impl FnOnce(),
+    ) -> R {
+        std::thread::scope(|s| {
+            // Declared in the scope: if a check below panics, the gate is
+            // released before the scope joins the worker.
+            let held = reg.gate.arm();
+            let worker = s.spawn(op);
+            held.wait_entered();
+            let (done, others) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let got = reg.get("ENG-1", None).map(|e| e.id);
+                let put = reg
+                    .put(
+                        Entity::new("ENG-9", "issue").with_title("Invoices"),
+                        opts(2),
+                    )
+                    .map(|o| o.stored);
+                done.send((got, put)).ok();
+            });
+            let (got, put) = others
+                .recv_timeout(gate::TIMEOUT)
+                .expect("a get and an unrelated put finish while the assessment is held");
+            assert_eq!(got.expect("the get succeeds"), "ENG-1");
+            assert!(put.expect("the unrelated put succeeds"));
+            meanwhile();
+            held.resume();
+            worker.join().expect("the worker does not panic")
+        })
+    }
+
+    /// A put assesses without holding the registry's lock: while one is in
+    /// the middle of its assessment, reads and other puts go ahead.
+    #[test]
+    fn reads_and_other_puts_proceed_while_a_put_is_assessing() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        let outcome = hold_mid_assessment(
+            &reg,
+            || {
+                reg.put(
+                    parent().with_description("- [ ] Card payments only"),
+                    opts(2),
+                )
+            },
+            || {},
+        )
+        .expect("the held put commits");
+        assert!(outcome.stored);
+        assert_eq!(outcome.bump, VersionBump::Major);
+        assert_eq!(reg.len(), 2);
+    }
+
+    /// Dry runs assess without a lock as well: a preview never blocks a
+    /// commit.
+    #[test]
+    fn reads_and_puts_proceed_while_a_dry_run_is_assessing() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        let preview = hold_mid_assessment(
+            &reg,
+            || {
+                reg.put(
+                    parent().with_description("- [ ] Card payments only"),
+                    PutOptions {
+                        dry_run: true,
+                        ..opts(2)
+                    },
+                )
+            },
+            || {},
+        )
+        .expect("the dry-run put assesses");
+        assert!(!preview.stored);
+    }
+
+    #[test]
+    fn reads_and_puts_proceed_while_a_dry_run_delete_is_assessing() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        hold_mid_assessment(&reg, || reg.delete("ENG-1", true, None, Some(t(3))), || {})
+            .expect("the dry-run delete assesses");
+        assert!(reg.get("ENG-1", None).is_ok());
+    }
+
+    /// A deletion assesses without a lock too. If the entity changes during
+    /// that assessment, the commit gathers and assesses again under the
+    /// exclusive lock, so the tombstone follows the newer version.
+    #[test]
+    fn a_delete_held_mid_assessment_blocks_nobody_and_follows_a_newer_version() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        let assessment = hold_mid_assessment(
+            &reg,
+            || reg.delete("ENG-1", false, None, Some(t(3))),
+            || {
+                let theirs = reg
+                    .put(parent().with_description("- [ ] Card payments"), opts(2))
+                    .expect("a put of the same entity commits meanwhile");
+                assert_eq!(theirs.entity.version, Some(SemVer::new(2, 0, 0)));
+            },
+        )
+        .expect("the held delete commits");
+        assert_eq!(
+            assessment.changes[0].previous_version,
+            Some(SemVer::new(2, 0, 0)),
+            "assessed again against the newer version"
+        );
+        assert!(reg.get("ENG-1", None).is_err());
+        let history = reg.history("ENG-1", 0).expect("history");
+        let versions: Vec<SemVer> = history.iter().map(|h| h.version).collect();
+        let tombstone = history.last().expect("a tombstone");
+        assert_eq!(tombstone.change_type, ChangeType::Deleted);
+        assert!(tombstone.version > SemVer::new(2, 0, 0), "{versions:?}");
+        assert!(versions.windows(2).all(|w| w[0] < w[1]), "{versions:?}");
+    }
+
+    /// Activity is assessed without a lock.
+    #[test]
+    fn reads_and_puts_proceed_while_activity_is_assessing() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        let assessment = hold_mid_assessment(
+            &reg,
+            || {
+                reg.record_activity(
+                    "ENG-1",
+                    vec![ActivityEvent::comment(
+                        "ENG-1",
+                        "blocked by the PSP sandbox",
+                    )],
+                    Some(t(2)),
+                )
+            },
+            || {},
+        )
+        .expect("the held activity is assessed");
+        assert_eq!(assessment.changes.len(), 1);
+    }
+
+    /// A version comparison is assessed without a lock.
+    #[test]
+    fn reads_and_puts_proceed_while_a_comparison_is_assessing() {
+        let reg = Registry::new(Engine::default());
+        reg.put(parent(), opts(1)).expect("the parent stores");
+        reg.put(parent().with_description("- [ ] Card payments"), opts(2))
+            .expect("the breaking change stores");
+        let assessment = hold_mid_assessment(
+            &reg,
+            || {
+                reg.compare(
+                    "ENG-1",
+                    SemVer::new(1, 0, 0),
+                    SemVer::new(2, 0, 0),
+                    Some(t(3)),
+                )
+            },
+            || {},
+        )
+        .expect("the held comparison is assessed");
+        assert_eq!(assessment.changes[0].bump, VersionBump::Major);
+    }
 
     fn t(day: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, day, 9, 0, 0)
@@ -1739,6 +2097,7 @@ mod tests {
                 len: 0,
                 failed: false,
             })),
+            gate: gate::Gate::default(),
         };
         let err = reg.put(parent(), opts(1)).expect_err("cannot write");
         assert_eq!(err.kind(), ErrorKind::Storage);
@@ -1869,9 +2228,9 @@ mod tests {
         );
     }
 
-    /// Finding 34: the assessment runs under the shared lock; a commit that
-    /// finds the entity changed meanwhile assesses again instead of
-    /// overwriting the newer version.
+    /// Finding 34: the assessment runs with no lock held, so the entity can
+    /// change meanwhile. A commit that finds it changed gathers and assesses
+    /// again under the exclusive lock instead of overwriting the newer version.
     #[test]
     fn a_put_assessed_against_an_older_state_is_assessed_again() {
         let reg = Registry::new(Engine::default());

@@ -34,8 +34,8 @@ use crate::model::{
     ActivityEvent, AssessmentRequest, ChangeSet, Entity, EntityId, FieldValue, HistoryPoint,
     StatusCategory, field,
 };
-use crate::policy::Policy;
-use crate::propagate::{self, Hit, Propagator, Seed};
+use crate::policy::{IdfScope, Policy};
+use crate::propagate::{self, Hit, Propagator, Seed, first_parents};
 use crate::semver::{Compatibility, SemVer, VersionBump};
 use crate::signals;
 use crate::stats::{amplify, clamp01, decayed_sum, escalate, noisy_or, saturate, z_score};
@@ -258,29 +258,47 @@ impl Engine {
         let changed_nodes: Vec<usize> = resolved.iter().filter_map(|r| graph.get(&r.id)).collect();
 
         // ---- corpus & document vectors --------------------------------------
+        // Only the text of entities propagation can reach is ever read, so
+        // only those get document vectors (from term counts; the full
+        // analysis is for changed texts). The IDF corpus covers either the
+        // whole request or only that reach (`text.idf_scope`); with `reach`,
+        // unreached context is never analysed at all.
+        let lexicon = text::Lexicon::new(&policy.text);
+        let reach = text_reach(&graph, &resolved, pp.max_depth);
+        let whole_corpus = policy.text.idf_scope == IdfScope::Context;
         let mut corpus = Corpus::new();
-        let mut analyses = Vec::with_capacity(graph.len());
-        for node in &graph.nodes {
-            let a = text::analyze(&node.document(), &policy.text);
-            corpus.add_terms(a.counts.keys());
-            analyses.push(a);
+        let mut counts: Vec<Option<BTreeMap<String, u32>>> = Vec::with_capacity(graph.len());
+        for (node, reached) in graph.nodes.iter().zip(&reach) {
+            if *reached || whole_corpus {
+                let c = text::term_counts(&node.document(), &lexicon);
+                corpus.add_terms(c.keys());
+                counts.push(reached.then_some(c));
+            } else {
+                counts.push(None);
+            }
         }
         for r in &resolved {
             if let Snapshots::Updated { before, .. } = &r.snapshots {
-                let a = text::analyze(&before.document(), &policy.text);
-                corpus.add_terms(a.counts.keys());
+                let c = text::term_counts(&before.document(), &lexicon);
+                corpus.add_terms(c.keys());
             }
         }
-        let docs: Vec<SparseVec> = analyses
+        let docs: Vec<SparseVec> = counts
             .iter()
-            .map(|a| text::tfidf(&a.counts, &corpus))
+            .map(|c| {
+                c.as_ref()
+                    .map_or_else(SparseVec::new, |c| text::tfidf(c, &corpus))
+            })
             .collect();
+        drop(counts);
         let titles: Vec<SparseVec> = graph
             .nodes
             .iter()
-            .map(|n| match n.title().trim() {
+            .zip(&reach)
+            .map(|(n, reached)| match n.title().trim() {
+                _ if !reached => SparseVec::new(),
                 "" => SparseVec::new(),
-                t => text::tfidf(&text::analyze(t, &policy.text).counts, &corpus),
+                t => text::tfidf(&text::term_counts(t, &lexicon), &corpus),
             })
             .collect();
 
@@ -289,7 +307,7 @@ impl Engine {
             .iter()
             .map(|r| {
                 let points = history.get(r.id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-                self.score_change(r, &corpus, points, now)
+                self.score_change(r, &corpus, &lexicon, points, now)
             })
             .collect();
 
@@ -297,7 +315,7 @@ impl Engine {
         // Every seed walks within its own budget, a share of `max_steps` in
         // proportion to its risk: deterministic, and independent of the
         // order of the changes in the request.
-        let propagator = Propagator::new(&graph, policy, &docs, &titles);
+        let propagator = Propagator::new(&graph, policy, &docs, &titles, &reach);
         let mut seeds: Vec<(usize, usize, usize, f64)> = Vec::new();
         for (ci, (r, s)) in resolved.iter().zip(&scorings).enumerate() {
             let Some(source) = graph.get(&r.id) else {
@@ -909,6 +927,7 @@ impl Engine {
         &self,
         r: &Resolved,
         corpus: &Corpus,
+        lexicon: &text::Lexicon<'_>,
         history: &[&HistoryPoint],
         now: DateTime<Utc>,
     ) -> Scoring {
@@ -932,6 +951,7 @@ impl Engine {
                     policy,
                     now,
                     corpus,
+                    lexicon,
                     embeddings,
                 };
                 let names: BTreeSet<&String> =
@@ -1010,7 +1030,7 @@ impl Engine {
                 activity_text.push_str(&ev.body);
                 activity_text.push('\n');
             }
-            let a = text::analyze(&activity_text, &policy.text);
+            let a = text::analyze_with(&activity_text, lexicon);
             let delta = TextDelta::addition(&a.counts, corpus);
             let categories: BTreeSet<&str> = sigs.iter().map(|s| s.category.as_str()).collect();
             fields.push(Scored {
@@ -1204,6 +1224,144 @@ fn build_graphs(
     after.sort_by(|x, y| x.0.id.cmp(&y.0.id));
     before.sort_by(|x, y| x.0.id.cmp(&y.0.id));
     (Graph::build(after), Graph::build(before))
+}
+
+/// The nodes whose text an assessment can read: the changed entities and
+/// everything within `max_depth` hops of them along the channels
+/// [`Propagator::run`] follows. The first hop goes to children, parents,
+/// blocked entities, blockers, related entities and siblings. Later hops go
+/// down to descendants, up to ancestors, through blocked entities and their
+/// children, and up through blockers.
+///
+/// The set is structural, so it is a superset of what the walk visits: the
+/// walk's budget and impact floor only stop it earlier. It also holds the
+/// children of every parent a move names, though the walk only visits the
+/// siblings under the current parent. Only nodes in the set get document and
+/// title vectors. Under `idf_scope = reach` the IDF corpus is this set too.
+///
+/// Each channel is one breadth-first pass from the first hops of all the
+/// changes together. Every walk starts at depth 1 and expands the same way,
+/// so this marks the same nodes as one pass per change would.
+fn text_reach(graph: &Graph, resolved: &[Resolved], max_depth: u32) -> Vec<bool> {
+    let n = graph.len();
+    let mut reach = vec![false; n];
+    let sources: Vec<(usize, &Resolved)> = resolved
+        .iter()
+        .filter_map(|r| graph.get(&r.id).map(|s| (s, r)))
+        .collect();
+    for &(s, _) in &sources {
+        reach[s] = true;
+    }
+    if max_depth == 0 {
+        return reach;
+    }
+
+    let mut down: Vec<usize> = Vec::new();
+    let mut up: Vec<usize> = Vec::new();
+    let mut dependency: Vec<usize> = Vec::new();
+    let mut upstream: Vec<usize> = Vec::new();
+    let mut is_parent = vec![false; n];
+    let mut parents: Vec<usize> = Vec::new();
+    for &(s, r) in &sources {
+        parents.clear();
+        change_parents(graph, s, r, &mut parents);
+        for &p in &parents {
+            if !is_parent[p] {
+                is_parent[p] = true;
+                up.push(p);
+            }
+        }
+        down.extend_from_slice(&graph.children[s]);
+        dependency.extend_from_slice(&graph.blocks[s]);
+        upstream.extend_from_slice(&graph.blocked_by[s]);
+        // One hop only: related entities.
+        for &x in &graph.related[s] {
+            reach[x] = true;
+        }
+    }
+    // One hop only: siblings, once per distinct parent.
+    for &p in &up {
+        for &x in &graph.children[p] {
+            reach[x] = true;
+        }
+    }
+
+    mark_within(&mut reach, down, max_depth, |x, next| {
+        next.extend_from_slice(&graph.children[x]);
+    });
+    mark_within(&mut reach, up, max_depth, |x, next| {
+        next.extend(graph.parent[x]);
+    });
+    mark_within(&mut reach, dependency, max_depth, |x, next| {
+        next.extend_from_slice(&graph.blocks[x]);
+        next.extend_from_slice(&graph.children[x]);
+    });
+    mark_within(&mut reach, upstream, max_depth, |x, next| {
+        next.extend_from_slice(&graph.blocked_by[x]);
+    });
+    reach
+}
+
+/// Every parent a seed of this change can take its first `up` hop to. The
+/// current parent serves the seeds that are not moves. A `parent` seed comes
+/// either from the snapshots' `parent_id` (a re-parenting) or from a user
+/// field named `parent` of type reference, so both pairs of ids count.
+fn change_parents(graph: &Graph, source: usize, r: &Resolved, out: &mut Vec<usize>) {
+    let (before, current) = (r.before(), r.current());
+    first_parents(graph, source, None, out);
+    let parent_ids = [
+        before.and_then(|b| b.parent_id.as_deref()),
+        current.parent_id.as_deref(),
+    ];
+    first_parents(graph, source, Some(parent_ids), out);
+    // An unchanged `parent` field yields no seed, so it must not widen the
+    // reach: its target's family would then weigh vocabulary under `reach`.
+    let Some(before) = before else { return };
+    let moved = match (
+        before.fields.get(field::PARENT),
+        current.fields.get(field::PARENT),
+    ) {
+        (Some(a), Some(b)) => !fields::same_value(a, b),
+        (None, None) => false,
+        _ => true,
+    };
+    if moved {
+        let field_ids = [
+            before.reference(field::PARENT),
+            current.reference(field::PARENT),
+        ];
+        first_parents(graph, source, Some(field_ids), out);
+    }
+}
+
+/// Marks every node within `max_depth` hops of the `first` nodes, which are
+/// at depth 1. `expand` pushes the nodes one hop beyond a node. A node is
+/// expanded once, at the smallest depth it is found at.
+fn mark_within(
+    reach: &mut [bool],
+    first: Vec<usize>,
+    max_depth: u32,
+    expand: impl Fn(usize, &mut Vec<usize>),
+) {
+    let mut seen = vec![false; reach.len()];
+    let mut frontier = first;
+    let mut following: Vec<usize> = Vec::new();
+    for depth in 1..=max_depth {
+        for &x in &frontier {
+            if std::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            reach[x] = true;
+            if depth < max_depth {
+                expand(x, &mut following);
+            }
+        }
+        if following.is_empty() {
+            break;
+        }
+        std::mem::swap(&mut frontier, &mut following);
+        following.clear();
+    }
 }
 
 /// Fields of one change that carry the same evidence count once:

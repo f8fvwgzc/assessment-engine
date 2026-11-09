@@ -1,0 +1,123 @@
+{
+  "score": 0.6603631410162238,
+  "level": "high",
+  "recommendation": "partial_replan",
+  "confidence": 0.7,
+  "severity": 0.6120000000000001,
+  "breadth": 0.28310141114571974,
+  "effort_at_risk": 1.1782028222914396,
+  "effort_total": 2.0,
+  "replan_root": "P",
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.5662028222914395,
+      "local_score": 0.5662028222914395,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "decrease",
+          "magnitude": 0.6661209674016935,
+          "severity": 0.85,
+          "risk": 0.5662028222914395,
+          "breaking": true,
+          "additive": false,
+          "before": "- [ ] Login - [ ] Logout - [ ] Reset password",
+          "after": "- [ ] Login - [ ] Logout",
+          "metrics": {
+            "char_similarity": 0.5333333333333333,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 1.0,
+            "lexical_similarity": 0.487254934794633,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 0.0,
+            "passages_modified": 0.0,
+            "passages_removed": 1.0,
+            "shingle_similarity": 0.3333333333333333,
+            "tfidf_cosine": 0.5797386715376657,
+            "token_jaccard": 0.5
+          },
+          "explanation": "description: change magnitude 0.67; list items +0 −1 ~0; dropped: password, reset"
+        }
+      ],
+      "signals": [],
+      "bump": "major",
+      "previous_version": "1.0.0",
+      "next_version": "2.0.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (major 1.0.0 → 2.0.0); content score 0.57, local score 0.57; strongest: description: change magnitude 0.67; list items +0 −1 ~0; dropped: password, reset"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 1,
+      "score": 0.6120000000000001,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.6120000000000001,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.6120000000000001,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was removed (overlap 0.55)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Parent issue\" description changed; it is the closest match for text that was removed (overlap 0.55)"
+      ]
+    },
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 2,
+      "score": 0.5662028222914395,
+      "level": "high",
+      "action": "replan",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.5662028222914395,
+      "contributions": [],
+      "reasons": [
+        "changed description (major 1.0.0 → 2.0.0); content score 0.57, local score 0.57; strongest: description: change magnitude 0.67; list items +0 −1 ~0; dropped: password, reset"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "high impact (score 0.66, confidence 0.70); breaking change to \"Parent issue\"; 1 other item(s) affected, most: \"Child task\" (high, obsolete_candidate); recommendation: re-plan the work under \"Parent issue\"",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}
