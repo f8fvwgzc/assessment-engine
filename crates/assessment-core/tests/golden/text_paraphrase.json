@@ -2,7 +2,7 @@
   "score": 0.7252802913117422,
   "level": "high",
   "recommendation": "partial_replan",
-  "confidence": 0.9,
+  "confidence": 0.765,
   "severity": 0.6819023610214444,
   "breadth": 0.30685606245964997,
   "effort_at_risk": 1.2956144859407444,
@@ -51,7 +51,15 @@
             "tfidf_cosine": 0.10163066979112657,
             "token_jaccard": 0.1
           },
-          "explanation": "description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+          "explanation": "description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign; meaning not verified: a possible paraphrase",
+          "judgment": {
+            "status": "requested",
+            "reasons": [
+              "paraphrase_suspected"
+            ],
+            "fingerprint": "a5092b8fdb1115a48435979471ef040eb3f920811cb6bfdca108c7393e2d56b5",
+            "lexical_magnitude": 0.8022380717899347
+          }
         }
       ],
       "signals": [],
@@ -59,7 +67,7 @@
       "previous_version": "1.0.0",
       "next_version": "2.0.0",
       "propagation_truncated": false,
-      "explanation": "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+      "explanation": "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign; meaning not verified: a possible paraphrase"
     }
   ],
   "impacts": [
@@ -79,7 +87,7 @@
       "effort_at_risk": 0.6819023610214444,
       "contributions": [],
       "reasons": [
-        "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+        "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign; meaning not verified: a possible paraphrase"
       ]
     },
     {
@@ -117,7 +125,19 @@
   ],
   "impacts_total": 2,
   "violations": [],
-  "summary": "high impact (score 0.73, confidence 0.90); breaking change to \"Parent issue\"; 1 other item(s) affected, most: \"Child task\" (high, obsolete_candidate); recommendation: re-plan the work under \"Parent issue\"",
+  "summary": "high impact (score 0.73, confidence 0.77); breaking change to \"Parent issue\"; 1 other item(s) affected, most: \"Child task\" (high, obsolete_candidate); meaning of 1 text change(s) not verified; recommendation: re-plan the work under \"Parent issue\"",
   "engine_version": "",
-  "assessed_at": "2026-11-09T09:00:00Z"
+  "assessed_at": "2026-11-09T09:00:00Z",
+  "judgment_requests": [
+    {
+      "change_index": 0,
+      "entity_id": "P",
+      "field": "description",
+      "fingerprint": "a5092b8fdb1115a48435979471ef040eb3f920811cb6bfdca108c7393e2d56b5",
+      "reasons": [
+        "paraphrase_suspected"
+      ],
+      "lexical_magnitude": 0.8022380717899347
+    }
+  ]
 }

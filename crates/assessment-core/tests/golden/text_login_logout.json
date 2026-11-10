@@ -2,7 +2,7 @@
   "score": 0.5021247290898493,
   "level": "high",
   "recommendation": "partial_replan",
-  "confidence": 0.7,
+  "confidence": 0.595,
   "severity": 0.4590000000000001,
   "breadth": 0.18752832996054902,
   "effort_at_risk": 0.8340566599210981,
@@ -51,7 +51,16 @@
             "tfidf_cosine": 0.5031026124151314,
             "token_jaccard": 0.5
           },
-          "explanation": "description: change magnitude 0.44; dropped: login; added: logout"
+          "explanation": "description: change magnitude 0.44; dropped: login; added: logout; meaning not verified: terms were substituted, close to the breaking threshold",
+          "judgment": {
+            "status": "requested",
+            "reasons": [
+              "term_substitution",
+              "near_threshold"
+            ],
+            "fingerprint": "2086096a222bb499be60b77fa3ca64d94bf16c2135817a0c5d141cc73e81c86f",
+            "lexical_magnitude": 0.44124312931893894
+          }
         }
       ],
       "signals": [],
@@ -59,7 +68,7 @@
       "previous_version": "1.0.0",
       "next_version": "1.1.0",
       "propagation_truncated": false,
-      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.38, local score 0.38; strongest: description: change magnitude 0.44; dropped: login; added: logout"
+      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.38, local score 0.38; strongest: description: change magnitude 0.44; dropped: login; added: logout; meaning not verified: terms were substituted, close to the breaking threshold"
     }
   ],
   "impacts": [
@@ -111,13 +120,26 @@
       "effort_at_risk": 0.37505665992109805,
       "contributions": [],
       "reasons": [
-        "changed description (minor 1.0.0 → 1.1.0); content score 0.38, local score 0.38; strongest: description: change magnitude 0.44; dropped: login; added: logout"
+        "changed description (minor 1.0.0 → 1.1.0); content score 0.38, local score 0.38; strongest: description: change magnitude 0.44; dropped: login; added: logout; meaning not verified: terms were substituted, close to the breaking threshold"
       ]
     }
   ],
   "impacts_total": 2,
   "violations": [],
-  "summary": "high impact (score 0.50, confidence 0.70); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: re-plan the work under \"Parent issue\"",
+  "summary": "high impact (score 0.50, confidence 0.59); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); meaning of 1 text change(s) not verified; recommendation: re-plan the work under \"Parent issue\"",
   "engine_version": "",
-  "assessed_at": "2026-11-09T09:00:00Z"
+  "assessed_at": "2026-11-09T09:00:00Z",
+  "judgment_requests": [
+    {
+      "change_index": 0,
+      "entity_id": "P",
+      "field": "description",
+      "fingerprint": "2086096a222bb499be60b77fa3ca64d94bf16c2135817a0c5d141cc73e81c86f",
+      "reasons": [
+        "term_substitution",
+        "near_threshold"
+      ],
+      "lexical_magnitude": 0.44124312931893894
+    }
+  ]
 }

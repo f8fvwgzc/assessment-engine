@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{EntityId, EntityKind};
+use crate::model::{EntityId, EntityKind, TextRelation};
 use crate::semver::{SemVer, VersionBump};
 
 /// How much attention a change needs, by score band.
@@ -287,6 +287,138 @@ pub struct FieldAssessment {
     /// The measures behind the magnitude (similarities, ratios, shifts).
     pub metrics: BTreeMap<String, f64>,
     pub explanation: String,
+    /// Whether the meaning of this text change needs, or got, a judgment.
+    /// Absent for a field that is neither flagged nor judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment: Option<FieldJudgment>,
+}
+
+/// Why the engine doubts its lexical reading of a text change. The order is
+/// the priority: the first reasons are judged first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentReason {
+    /// A negation came or went without a clear flip of one term.
+    NegationChanged,
+    /// A scope word such as `except` or `only` came or went.
+    ScopeQualifier,
+    /// A few terms of one sentence were swapped for others.
+    TermSubstitution,
+    /// Sentences went and others came: maybe the same thing in other words.
+    ParaphraseSuspected,
+    /// The magnitude is close to the breaking threshold.
+    NearThreshold,
+}
+
+impl JudgmentReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JudgmentReason::NegationChanged => "negation_changed",
+            JudgmentReason::ScopeQualifier => "scope_qualifier",
+            JudgmentReason::TermSubstitution => "term_substitution",
+            JudgmentReason::ParaphraseSuspected => "paraphrase_suspected",
+            JudgmentReason::NearThreshold => "near_threshold",
+        }
+    }
+
+    /// The reason in plain words, for explanations.
+    pub fn label(self) -> &'static str {
+        match self {
+            JudgmentReason::NegationChanged => "a negation changed",
+            JudgmentReason::ScopeQualifier => "a scope qualifier changed",
+            JudgmentReason::TermSubstitution => "terms were substituted",
+            JudgmentReason::ParaphraseSuspected => "a possible paraphrase",
+            JudgmentReason::NearThreshold => "close to the breaking threshold",
+        }
+    }
+}
+
+/// What happened to the judgment of one text field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgmentStatus {
+    /// The field is flagged and has no usable judgment: one is asked for in
+    /// [`Assessment::judgment_requests`].
+    Requested,
+    /// Flagged, but beyond `judge.max_requests`: not asked for.
+    OverBudget,
+    /// The supplied judgment was used.
+    Applied,
+    /// The supplied judgment is about other texts (its fingerprint differs).
+    Stale,
+    /// The supplied judgment is `undetermined` or not confident enough.
+    Inconclusive,
+    /// A judgment was supplied for a field the engine did not flag.
+    NotFlagged,
+    /// A server asked its judge and got no answer. The engine never sets this.
+    Unavailable,
+}
+
+impl JudgmentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JudgmentStatus::Requested => "requested",
+            JudgmentStatus::OverBudget => "over_budget",
+            JudgmentStatus::Applied => "applied",
+            JudgmentStatus::Stale => "stale",
+            JudgmentStatus::Inconclusive => "inconclusive",
+            JudgmentStatus::NotFlagged => "not_flagged",
+            JudgmentStatus::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// The judgment state of one text field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldJudgment {
+    pub status: JudgmentStatus,
+    /// Why the field is flagged (empty when it is not).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<JudgmentReason>,
+    /// [`crate::text::fingerprint`] of the field's two texts.
+    pub fingerprint: String,
+    /// The magnitude before any judgment.
+    pub lexical_magnitude: f64,
+    /// The supplied relation, when a judgment was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<TextRelation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// How much of the judgment was applied, `[0, 1]` (only when applied).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// A note on the status, such as why a judge was unavailable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A text change the engine would like judged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JudgmentRequest {
+    /// The index of the change set in the request.
+    pub change_index: usize,
+    pub entity_id: EntityId,
+    pub field: String,
+    /// What the judgment must carry to be used.
+    pub fingerprint: String,
+    pub reasons: Vec<JudgmentReason>,
+    pub lexical_magnitude: f64,
+    /// The two texts, with [`crate::model::AssessOptions::judgment_texts`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// A supplied judgment the engine found no use for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct JudgmentKey {
+    pub entity_id: EntityId,
+    pub field: String,
 }
 
 /// One changed entity: what changed, how much, and its new version.
@@ -403,4 +535,11 @@ pub struct Assessment {
     pub summary: String,
     pub engine_version: String,
     pub assessed_at: DateTime<Utc>,
+    /// The flagged text changes without a usable judgment, most important
+    /// first; at most `judge.max_requests` of the flagged fields are asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judgment_requests: Vec<JudgmentRequest>,
+    /// Supplied judgments whose field is not a modified text field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmatched_judgments: Vec<JudgmentKey>,
 }

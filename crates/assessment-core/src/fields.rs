@@ -6,8 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 
-use crate::assessment::{Direction, FieldAssessment, FieldChangeKind};
-use crate::model::{FieldValue, Ordinal, Status, StatusCategory, field};
+use crate::assessment::{
+    Direction, FieldAssessment, FieldChangeKind, FieldJudgment, JudgmentReason, JudgmentStatus,
+};
+use crate::model::{
+    FieldValue, Ordinal, Status, StatusCategory, TextJudgment, TextRelation, field,
+};
 use crate::policy::{FieldPolicy, Policy};
 use crate::semver::VersionBump;
 use crate::stats::{clamp01, saturate};
@@ -185,7 +189,13 @@ pub(crate) struct FieldContext<'a> {
     pub lexicon: &'a text::Lexicon<'a>,
     /// The entity's embeddings before and after, when both exist.
     pub embeddings: Option<(&'a [f32], &'a [f32])>,
+    /// The supplied judgments of this change, by field.
+    pub judgments: &'a BTreeMap<&'a str, &'a TextJudgment>,
 }
+
+/// No judgments, for a change that carries none.
+#[cfg(test)]
+pub(crate) static NO_JUDGMENTS: BTreeMap<&str, &TextJudgment> = BTreeMap::new();
 
 fn numbers_equal(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
@@ -216,9 +226,9 @@ pub(crate) fn score(
     };
     let mut out = Partial::new(change);
     match (before, after) {
-        (Some(FieldValue::Text(a)), Some(FieldValue::Text(b))) => out.text(a, b, ctx),
-        (None, Some(FieldValue::Text(b))) => out.text("", b, ctx),
-        (Some(FieldValue::Text(a)), None) => out.text(a, "", ctx),
+        (Some(FieldValue::Text(a)), Some(FieldValue::Text(b))) => out.text(name, a, b, ctx),
+        (None, Some(FieldValue::Text(b))) => out.text(name, "", b, ctx),
+        (Some(FieldValue::Text(a)), None) => out.text(name, a, "", ctx),
         (Some(FieldValue::Number(a)), Some(FieldValue::Number(b))) => {
             out.number(*a, *b, ctx.policy)
         }
@@ -319,6 +329,7 @@ pub(crate) fn score(
             after: after.map(FieldValue::display),
             metrics: out.metrics,
             explanation,
+            judgment: out.judgment,
         },
         channels,
         detail: out.detail,
@@ -343,6 +354,7 @@ struct Partial {
     confidence: f64,
     max_bump: VersionBump,
     changed_terms: BTreeSet<String>,
+    judgment: Option<FieldJudgment>,
 }
 
 impl Partial {
@@ -360,6 +372,7 @@ impl Partial {
             confidence: 1.0,
             max_bump: VersionBump::Major,
             changed_terms: BTreeSet::new(),
+            judgment: None,
         }
     }
 
@@ -369,7 +382,7 @@ impl Partial {
         }
     }
 
-    fn text(&mut self, a: &str, b: &str, ctx: &FieldContext<'_>) {
+    fn text(&mut self, name: &str, a: &str, b: &str, ctx: &FieldContext<'_>) {
         let pa: Analysis = text::analyze_with(a, ctx.lexicon);
         let mut pb: Analysis = text::analyze_with(b, ctx.lexicon);
         text::align_typos(&pa, &mut pb, ctx.lexicon);
@@ -380,7 +393,8 @@ impl Partial {
         let mut own = Corpus::new();
         own.add_terms(pa.counts.keys());
         own.add_terms(pb.counts.keys());
-        let diff = text::compare_analyses(&pa, &pb, &ctx.policy.text, &own, ctx.embeddings);
+        let (diff, mut tparts) =
+            text::compare_parts(&pa, &pb, &ctx.policy.text, &own, ctx.embeddings);
         for (t, c) in &pa.counts {
             if pb.counts.get(t) != Some(c) {
                 self.changed_terms.insert(t.clone());
@@ -414,12 +428,7 @@ impl Partial {
         // Nothing planned against the old text went away (no passage or list
         // item removed or reworded, no negation or requirement-strength
         // change): however large, the change can only add compatibly.
-        let nothing_lost = diff.passages_removed == 0
-            && diff.passages_modified == 0
-            && s.items_removed == 0
-            && s.items_modified == 0
-            && diff.negation_flips == 0
-            && diff.modal_shifts == 0;
+        let nothing_lost = diff.nothing_lost();
         if nothing_lost {
             self.max_bump = VersionBump::Minor;
         }
@@ -447,6 +456,93 @@ impl Partial {
             FieldChangeKind::Modified => {
                 parts.push(format!("change magnitude {:.2}", diff.magnitude));
             }
+        }
+        // A judgment of the meaning, when the field is flagged or one came.
+        let mut delta = text::text_delta(&pa, &pb, ctx.corpus, ctx.embeddings);
+        let judge = &ctx.policy.judge;
+        let eligible = judge.enabled
+            && self.change == FieldChangeKind::Modified
+            && judge.fields.contains(name);
+        let reasons = if eligible {
+            let bm = ctx.policy.field(name).breaking_magnitude;
+            text::gray_zone(&pa, &pb, &diff, &mut tparts, judge, bm)
+        } else {
+            Vec::new()
+        };
+        let supplied = if eligible {
+            ctx.judgments.get(name).copied()
+        } else {
+            None
+        };
+        let mut unverified: Option<String> = None;
+        if !reasons.is_empty() || supplied.is_some() {
+            let flagged = !reasons.is_empty();
+            let lexical = diff.magnitude;
+            let fingerprint = text::fingerprint(a, b);
+            let mut status = JudgmentStatus::Requested;
+            let mut weight = None;
+            if let Some(j) = supplied {
+                let c0 = judge.threshold(j.relation);
+                let w = if j.relation == TextRelation::Undetermined {
+                    0.0
+                } else {
+                    clamp01((j.confidence - c0) / (1.0 - c0))
+                };
+                status = if j.fingerprint != fingerprint {
+                    JudgmentStatus::Stale
+                } else if !flagged && !judge.apply_unflagged {
+                    JudgmentStatus::NotFlagged
+                } else if w > 0.0 {
+                    JudgmentStatus::Applied
+                } else {
+                    JudgmentStatus::Inconclusive
+                };
+                if status == JudgmentStatus::Applied {
+                    weight = Some(w);
+                    let shares = self.apply_judgment(j.relation, w, &diff, &tparts, ctx);
+                    delta.set_shares(shares);
+                    if j.relation.is_raising() && w >= 0.5 {
+                        delta.add_modified(text::scope_passages(&pa, &pb, &tparts, ctx.corpus));
+                    }
+                    self.metric("lexical_magnitude", lexical);
+                    self.metric("judgment_weight", w);
+                    parts[0] = format!(
+                        "change magnitude {:.2} (lexically {lexical:.2}; judged {}, confidence {:.2})",
+                        self.magnitude,
+                        j.relation.as_str(),
+                        j.confidence
+                    );
+                    let floor = if flagged {
+                        judge.unjudged_confidence * self.confidence
+                    } else {
+                        self.confidence
+                    };
+                    self.confidence = floor + w * (j.confidence - floor).max(0.0);
+                }
+            }
+            if flagged && status != JudgmentStatus::Applied {
+                self.confidence *= judge.unjudged_confidence;
+                unverified = Some(format!(
+                    "meaning not verified: {}",
+                    reasons
+                        .iter()
+                        .map(|r| JudgmentReason::label(*r))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            self.judgment = Some(FieldJudgment {
+                status,
+                reasons,
+                fingerprint,
+                lexical_magnitude: lexical,
+                relation: supplied.map(|j| j.relation),
+                confidence: supplied.map(|j| j.confidence),
+                weight,
+                rationale: supplied.map(|j| j.rationale.clone()).unwrap_or_default(),
+                source: supplied.map(|j| j.source.clone()).unwrap_or_default(),
+                detail: String::new(),
+            });
         }
         if s.items_added + s.items_removed + s.items_modified > 0 {
             parts.push(format!(
@@ -488,8 +584,75 @@ impl Partial {
                     .join(", ")
             ));
         }
+        parts.extend(unverified);
         self.explanation = parts.join("; ");
-        self.detail = Detail::Text(text::text_delta(&pa, &pb, ctx.corpus, ctx.embeddings));
+        self.detail = Detail::Text(delta);
+    }
+
+    /// Applies a judgment of weight `w > 0` to a scored text change: the
+    /// magnitude, the bump cap and the breaking and additive marks. Returns
+    /// the `(removed, changed)` shares it leaves of the owner floors.
+    fn apply_judgment(
+        &mut self,
+        relation: TextRelation,
+        w: f64,
+        diff: &text::TextDiff,
+        tparts: &text::Parts,
+        ctx: &FieldContext<'_>,
+    ) -> (f64, f64) {
+        let judge = &ctx.policy.judge;
+        let s = diff.structure;
+        let decisive = w >= 0.5;
+        // Evidence a reader cannot argue away.
+        let block = s.items_removed > 0
+            || diff.negation_flips > 0
+            || diff.modal_shifts > 0
+            || diff.numbers_changed > 0;
+        let soft = s.items_added > 0
+            || s.items_modified > 0
+            || s.headings_added > 0
+            || s.headings_removed > 0;
+        let base = tparts.base();
+        let left = (1.0 - (2.0 * w).min(1.0)).max(judge.min_owner_share);
+        // Such evidence blocks every lowering: the magnitude, the bump cap
+        // and the shares all stay as the engine scored them.
+        if block && !relation.is_raising() {
+            return (1.0, 1.0);
+        }
+        match relation {
+            TextRelation::Undetermined => (1.0, 1.0),
+            TextRelation::Equivalent => {
+                let lowered = base - w * (base - judge.equivalent_target).max(0.0);
+                self.magnitude = text::rejudge(tparts, lowered, &ctx.policy.text);
+                if decisive {
+                    // What the engine saw added stays at least Minor.
+                    self.max_bump = self.max_bump.min(if soft || self.additive {
+                        VersionBump::Minor
+                    } else {
+                        VersionBump::Patch
+                    });
+                }
+                (left, left)
+            }
+            TextRelation::Extended => {
+                let moved = base + w * (judge.extended_target - base);
+                self.magnitude = text::rejudge(tparts, moved, &ctx.policy.text);
+                if decisive {
+                    self.max_bump = self.max_bump.min(VersionBump::Minor);
+                    self.additive = true;
+                }
+                (left, 1.0)
+            }
+            TextRelation::Narrowed | TextRelation::Replaced | TextRelation::Reversed => {
+                let e = judge.evidence(relation);
+                self.magnitude = 1.0 - (1.0 - self.magnitude) * (1.0 - w * e);
+                if decisive {
+                    self.breaking = true;
+                    self.max_bump = VersionBump::Major;
+                }
+                (1.0, 1.0)
+            }
+        }
     }
 
     fn number(&mut self, a: f64, b: f64, policy: &Policy) {
@@ -808,6 +971,7 @@ pub(crate) fn reparent(
             after: after.map(str::to_owned),
             metrics: BTreeMap::new(),
             explanation,
+            judgment: None,
         },
         channels: Channels::from_policy(p),
         detail: Detail::Reference {
@@ -858,6 +1022,7 @@ pub(crate) fn lifecycle(created: bool, estimate: Option<f64>, policy: &Policy) -
             } else {
                 "lifecycle: deleted".to_owned()
             },
+            judgment: None,
         },
         channels: Channels::from_policy(p),
         detail: Detail::Lifecycle {
@@ -894,6 +1059,7 @@ mod tests {
             corpus,
             lexicon,
             embeddings: None,
+            judgments: &NO_JUDGMENTS,
         }
     }
 

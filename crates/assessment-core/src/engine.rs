@@ -24,8 +24,9 @@ use chrono::{DateTime, Utc};
 use crate::analysis::{PreparedStats, StatsCell, TextStats};
 use crate::assessment::{
     Action, Assessment, BasisStatus, ChangeAssessment, ChangeType, Channel, Contribution,
-    EntityImpact, FieldAssessment, FieldChangeKind, ImpactLevel, Modifier, Recommendation, Signal,
-    SignalCategory, Violation, ViolationKind,
+    EntityImpact, FieldAssessment, FieldChangeKind, ImpactLevel, JudgmentKey, JudgmentReason,
+    JudgmentRequest, JudgmentStatus, Modifier, Recommendation, Signal, SignalCategory, Violation,
+    ViolationKind,
 };
 use crate::constraints;
 use crate::error::{Error, Result};
@@ -33,7 +34,7 @@ use crate::fields::{self, Channels, Detail, FieldContext, LifecycleKind, Scored,
 use crate::graph::Graph;
 use crate::model::{
     ActivityEvent, AssessmentRequest, ChangeSet, Entity, EntityId, FieldValue, HistoryPoint,
-    StatusCategory, field,
+    StatusCategory, TextJudgment, field,
 };
 use crate::policy::{IdfScope, Policy};
 use crate::propagate::{self, Hit, Propagator, Seed, first_parents};
@@ -195,11 +196,33 @@ impl Engine {
             check_embedding("the `before` embedding", a)?;
             check_embedding("the `after` embedding", b)?;
         }
-        Ok(text::compare(
+        self.compare_text_as(field::DESCRIPTION, before, after, embeddings)
+    }
+
+    /// [`Engine::compare_text`] for the text of `field`. The result's
+    /// `gray_zone` says why the change would be flagged for a judgment in
+    /// that field, when it would be. No judgment is applied here.
+    pub fn compare_text_as(
+        &self,
+        field: &str,
+        before: &str,
+        after: &str,
+        embeddings: Option<(&[f32], &[f32])>,
+    ) -> Result<TextDiff> {
+        check_text("the `before` text", before)?;
+        check_text("the `after` text", after)?;
+        if let Some((a, b)) = embeddings {
+            check_embedding("the `before` embedding", a)?;
+            check_embedding("the `after` embedding", b)?;
+        }
+        let judge = &self.policy.judge;
+        let flags = (judge.enabled && judge.fields.contains(field))
+            .then(|| (judge, self.policy.field(field).breaking_magnitude));
+        Ok(text::compare_flagged(
             before,
             after,
             &self.policy.text,
-            None,
+            flags,
             embeddings,
         ))
     }
@@ -240,6 +263,10 @@ impl Engine {
         let policy: &Policy = &self.policy;
         let pp = &policy.propagation;
         check_request(request)?;
+        let judging = policy.judge.enabled;
+        if judging {
+            check_judgments(request)?;
+        }
 
         // ---- 1. resolve -------------------------------------------------
         let mut context: BTreeMap<EntityId, &Entity> = BTreeMap::new();
@@ -373,13 +400,26 @@ impl Engine {
         drop(kept);
 
         // ---- 2–3. score each change ---------------------------------------------
-        let scorings: Vec<Scoring> = resolved
+        let mut scorings: Vec<Scoring> = resolved
             .iter()
-            .map(|r| {
+            .zip(&request.changes)
+            .map(|(r, cs)| {
                 let points = history.get(r.id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-                self.score_change(r, &corpus, &lexicon, points, now)
+                let judgments: &[TextJudgment] = if judging { &cs.judgments } else { &[] };
+                self.score_change(r, judgments, &corpus, &lexicon, points, now)
             })
             .collect();
+        let judgment_requests = judgment_budget(
+            &resolved,
+            &mut scorings,
+            policy.judge.max_requests,
+            request.options.judgment_texts,
+        );
+        let unmatched_judgments = if judging {
+            unmatched_judgments(request, &resolved, &scorings)
+        } else {
+            Vec::new()
+        };
 
         // ---- 4. propagate ---------------------------------------------------------
         // Every seed walks within its own budget, a share of `max_steps` in
@@ -915,6 +955,8 @@ impl Engine {
             summary,
             engine_version: crate::ENGINE_VERSION.to_owned(),
             assessed_at: now,
+            judgment_requests,
+            unmatched_judgments,
         };
         ensure_finite(&mut assessment)?;
         Ok(assessment)
@@ -996,6 +1038,7 @@ impl Engine {
     fn score_change(
         &self,
         r: &Resolved,
+        judgments: &[TextJudgment],
         corpus: &Corpus,
         lexicon: &text::Lexicon<'_>,
         history: &[&HistoryPoint],
@@ -1017,12 +1060,15 @@ impl Engine {
                     }
                     _ => None,
                 };
+                let judged: BTreeMap<&str, &TextJudgment> =
+                    judgments.iter().map(|j| (j.field.as_str(), j)).collect();
                 let ctx = FieldContext {
                     policy,
                     now,
                     corpus,
                     lexicon,
                     embeddings,
+                    judgments: &judged,
                 };
                 let names: BTreeSet<&String> =
                     before.fields.keys().chain(after.fields.keys()).collect();
@@ -1121,6 +1167,7 @@ impl Engine {
                         sigs.len(),
                         categories.into_iter().collect::<Vec<_>>().join(", ")
                     ),
+                    judgment: None,
                 },
                 channels: Channels::from_policy(&fp),
                 detail: Detail::Activity {
@@ -1825,6 +1872,156 @@ fn check_request(request: &AssessmentRequest) -> Result<()> {
     Ok(())
 }
 
+/// The most judgments one change set may carry.
+pub const MAX_JUDGMENTS: usize = 64;
+/// The longest rationale of a judgment, in bytes.
+pub const MAX_RATIONALE_BYTES: usize = 2048;
+/// The longest source of a judgment, in bytes.
+pub const MAX_JUDGMENT_SOURCE_BYTES: usize = 256;
+
+/// Rejects malformed judgments. Only called while the judge is enabled.
+fn check_judgments(request: &AssessmentRequest) -> Result<()> {
+    for (i, cs) in request.changes.iter().enumerate() {
+        if cs.judgments.len() > MAX_JUDGMENTS {
+            return Err(Error::invalid(format!(
+                "changes[{i}]: {} judgments, more than the {MAX_JUDGMENTS} allowed",
+                cs.judgments.len()
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for j in &cs.judgments {
+            if j.field.trim().is_empty() {
+                return Err(Error::invalid(format!(
+                    "changes[{i}]: a judgment names no field"
+                )));
+            }
+            let fail = |what: &str| {
+                Err(Error::invalid(format!(
+                    "changes[{i}]: the judgment of `{}` {what}",
+                    j.field
+                )))
+            };
+            if !seen.insert(j.field.as_str()) {
+                return fail("is given twice");
+            }
+            let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+            if j.fingerprint.len() != 64 || !j.fingerprint.bytes().all(hex) {
+                return fail("has a fingerprint that is not 64 lowercase hex digits");
+            }
+            if !(j.confidence.is_finite() && (0.0..=1.0).contains(&j.confidence)) {
+                return fail("has a confidence outside [0, 1]");
+            }
+            if j.rationale.len() > MAX_RATIONALE_BYTES {
+                return fail(&format!(
+                    "has a rationale longer than {MAX_RATIONALE_BYTES} bytes"
+                ));
+            }
+            if j.source.len() > MAX_JUDGMENT_SOURCE_BYTES {
+                return fail(&format!(
+                    "has a source longer than {MAX_JUDGMENT_SOURCE_BYTES} bytes"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Chooses which flagged fields to ask a judgment for: the first
+/// `max_requests` by (strongest reason, risk, entity, field). The order of
+/// the changes in the request and the supplied judgments play no part.
+/// Flagged fields past the budget that still wait become `over_budget`.
+fn judgment_budget(
+    resolved: &[Resolved],
+    scorings: &mut [Scoring],
+    max_requests: usize,
+    texts: bool,
+) -> Vec<JudgmentRequest> {
+    // (reason, risk, change, field index)
+    let mut flagged: Vec<(JudgmentReason, f64, usize, usize)> = Vec::new();
+    for (ci, s) in scorings.iter().enumerate() {
+        for (fi, f) in s.fields.iter().enumerate() {
+            if let Some(j) = &f.assessment.judgment
+                && let Some(first) = j.reasons.first()
+            {
+                let risk = f.assessment.severity * j.lexical_magnitude;
+                flagged.push((*first, risk, ci, fi));
+            }
+        }
+    }
+    flagged.sort_by(|x, y| {
+        let name = |k: &(JudgmentReason, f64, usize, usize)| {
+            (
+                resolved[k.2].id.as_str(),
+                scorings[k.2].fields[k.3].assessment.field.as_str(),
+            )
+        };
+        x.0.cmp(&y.0)
+            .then(y.1.total_cmp(&x.1))
+            .then_with(|| name(x).cmp(&name(y)))
+    });
+    let mut requests = Vec::new();
+    for (rank, &(_, _, ci, fi)) in flagged.iter().enumerate() {
+        let f = &mut scorings[ci].fields[fi].assessment;
+        let Some(j) = f.judgment.as_mut() else {
+            continue;
+        };
+        let waiting = matches!(j.status, JudgmentStatus::Requested | JudgmentStatus::Stale);
+        if rank >= max_requests {
+            if j.status == JudgmentStatus::Requested {
+                j.status = JudgmentStatus::OverBudget;
+            }
+            continue;
+        }
+        if !waiting {
+            continue;
+        }
+        let r = &resolved[ci];
+        let (before, after) = match (&r.snapshots, texts) {
+            (Snapshots::Updated { before, after }, true) => (
+                before.text(&f.field).map(str::to_owned),
+                after.text(&f.field).map(str::to_owned),
+            ),
+            _ => (None, None),
+        };
+        requests.push(JudgmentRequest {
+            change_index: ci,
+            entity_id: r.id.clone(),
+            field: f.field.clone(),
+            fingerprint: j.fingerprint.clone(),
+            reasons: j.reasons.clone(),
+            lexical_magnitude: j.lexical_magnitude,
+            before,
+            after,
+        });
+    }
+    requests
+}
+
+/// The supplied judgments that no modified, judged text field took.
+fn unmatched_judgments(
+    request: &AssessmentRequest,
+    resolved: &[Resolved],
+    scorings: &[Scoring],
+) -> Vec<JudgmentKey> {
+    let mut out = Vec::new();
+    for ((cs, r), s) in request.changes.iter().zip(resolved).zip(scorings) {
+        for j in &cs.judgments {
+            let taken = s
+                .fields
+                .iter()
+                .any(|f| f.assessment.field == j.field && f.assessment.judgment.is_some());
+            if !taken {
+                out.push(JudgmentKey {
+                    entity_id: r.id.clone(),
+                    field: j.field.clone(),
+                });
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn check_text(what: &str, text: &str) -> Result<()> {
     if text.len() > MAX_TEXT_BYTES {
         return Err(Error::invalid(format!(
@@ -2078,8 +2275,16 @@ fn ensure_finite(a: &mut Assessment) -> Result<()> {
                 && c.fields.iter().all(|f| {
                     [f.magnitude, f.severity, f.risk].iter().all(finite)
                         && f.metrics.values().all(finite)
+                        && f.judgment.as_ref().is_none_or(|j| {
+                            j.lexical_magnitude.is_finite()
+                                && j.confidence.is_none_or(f64::is_finite)
+                                && j.weight.is_none_or(f64::is_finite)
+                        })
                 })
         })
+        && a.judgment_requests
+            .iter()
+            .all(|r| r.lexical_magnitude.is_finite())
         && a.impacts.iter().all(|i| {
             [i.score, i.effort, i.effort_at_risk].iter().all(finite)
                 && i.contributions.iter().all(|c| c.value.is_finite())
@@ -2233,6 +2438,26 @@ fn summarize(
     let introduced = violations.iter().filter(|v| v.introduced).count();
     if introduced > 0 {
         parts.push(format!("{introduced} plan conflict(s) introduced"));
+    }
+    let judgments = || {
+        changes
+            .iter()
+            .flat_map(|c| &c.fields)
+            .filter_map(|f| f.judgment.as_ref())
+    };
+    let judged = judgments()
+        .filter(|j| j.status == JudgmentStatus::Applied)
+        .count();
+    if judged > 0 {
+        parts.push(format!("meaning of {judged} text change(s) judged"));
+    }
+    let unverified = judgments()
+        .filter(|j| j.status != JudgmentStatus::Applied && !j.reasons.is_empty())
+        .count();
+    if unverified > 0 {
+        parts.push(format!(
+            "meaning of {unverified} text change(s) not verified"
+        ));
     }
     let rec = match (recommendation, replan_root) {
         (Recommendation::PartialReplan, Some(root)) => {

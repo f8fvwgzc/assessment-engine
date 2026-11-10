@@ -91,6 +91,11 @@ impl fmt::Debug for BearerAuth {
 impl Interceptor for BearerAuth {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         self.check(&request)?;
+        // The handler counts its deadline from here.
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(crate::service::RequestStart(tokio::time::Instant::now()));
         Ok(request)
     }
 }

@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use assessment_core::assessment::{
     Action, Assessment, BasisStatus, ChangeAssessment, ChangeType, Channel, Contribution,
-    Direction, EntityImpact, FieldAssessment, FieldChangeKind, ImpactLevel, Modifier,
-    Recommendation, Signal, SignalCategory, Violation, ViolationKind,
+    Direction, EntityImpact, FieldAssessment, FieldChangeKind, FieldJudgment, ImpactLevel,
+    JudgmentKey, JudgmentReason, JudgmentRequest, JudgmentStatus, Modifier, Recommendation, Signal,
+    SignalCategory, Violation, ViolationKind,
 };
+use assessment_core::model::field::DESCRIPTION;
 use assessment_core::model::{
     ActivityEvent, ActivityKind, AssessOptions, AssessmentRequest, BasisPin, ChangeSet, Entity,
     EntityKind, FieldChange, FieldValue, HistoryPoint, Relation, RelationKind, StatusCategory,
+    TextJudgment, TextRelation,
 };
 use assessment_core::policy::Policy;
 use assessment_core::registry::{
@@ -19,7 +22,7 @@ use assessment_core::registry::{
     StaleEntry, VersionRecord,
 };
 use assessment_core::semver::{SemVer, VersionBump};
-use assessment_core::text::{StructureDiff, TextDiff};
+use assessment_core::text::{GrayZone, StructureDiff, TextDiff, fingerprint};
 use assessment_core::{Engine, ErrorKind};
 use assessment_grpc::auth::BearerAuth;
 use assessment_grpc::client::{AssessmentClient, ClientErrorKind, ItemResponse};
@@ -712,6 +715,8 @@ async fn invalid_input_is_invalid_argument() {
             from: None,
             to: Some(SemVer::new(1, 0, 0).into()),
             now: None,
+            options: None,
+            judgments: Vec::new(),
         })
         .await
         .expect_err("no from");
@@ -1549,6 +1554,689 @@ async fn a_put_or_delete_with_an_older_source_seq_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
+// Judgments
+// ---------------------------------------------------------------------------
+
+const PARAPHRASE: (&str, &str) = (
+    "Users can log in with their email address and password.",
+    "People are able to sign in using e-mail and a password.",
+);
+const POSTGRES: (&str, &str) = (
+    "Store user sessions in PostgreSQL with a 30 day expiry.",
+    "Store user sessions in MongoDB with a 30 day expiry.",
+);
+
+fn judged_parent(description: &str) -> Entity {
+    Entity::new("P", "issue")
+        .with_title("Parent issue")
+        .with_description(description)
+        .with_status(StatusCategory::Started, "In Progress")
+}
+
+fn judged_child(description: &str) -> Entity {
+    Entity::new("C", "sub_issue")
+        .with_parent("P")
+        .with_title("Child task")
+        .with_description(description)
+        .with_status(StatusCategory::Started, "In Progress")
+}
+
+fn judgment(pair: (&str, &str), relation: TextRelation) -> TextJudgment {
+    TextJudgment {
+        field: DESCRIPTION.to_owned(),
+        fingerprint: fingerprint(pair.0, pair.1),
+        relation,
+        confidence: 0.9,
+        rationale: "read by a person".to_owned(),
+        source: "test".to_owned(),
+    }
+}
+
+/// The parent's description goes from `pair.0` to `pair.1`; one sub-issue
+/// was planned against the old text.
+fn judged_request(pair: (&str, &str), judgments: Vec<TextJudgment>) -> AssessmentRequest {
+    let v1 = SemVer::new(1, 0, 0);
+    let mut change = ChangeSet::update(
+        judged_parent(pair.0).with_version(v1),
+        judged_parent(pair.1).with_version(v1),
+    );
+    change.judgments = judgments;
+    AssessmentRequest {
+        changes: vec![change],
+        context: vec![judged_child(pair.0).with_basis("P", v1)],
+        now: Some(at(9, 9)),
+        ..Default::default()
+    }
+}
+
+fn description_judgment(assessment: &Assessment) -> &FieldJudgment {
+    assessment.changes[0]
+        .fields
+        .iter()
+        .find(|f| f.field == DESCRIPTION)
+        .expect("the description changed")
+        .judgment
+        .as_ref()
+        .expect("the description has a judgment")
+}
+
+/// A registry with the parent at `text` (1.0.0) and one sub-issue.
+async fn judged_registry(client: &mut AssessmentClient, text: &str) {
+    let options = || PutOptions {
+        now: Some(at(9, 9)),
+        ..PutOptions::default()
+    };
+    client
+        .put_entity(judged_parent(text), options())
+        .await
+        .expect("stores the parent");
+    client
+        .put_entity(judged_child(text), options())
+        .await
+        .expect("stores the child");
+}
+
+#[tokio::test]
+async fn a_flagged_change_returns_a_judgment_request() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+
+    let request = judged_request(PARAPHRASE, Vec::new());
+    let assessment = client.assess(request.clone()).await.expect("assesses");
+    assert_eq!(
+        assessment,
+        Engine::default().assess(&request).expect("assesses")
+    );
+    assert_eq!(assessment.changes[0].bump, VersionBump::Major);
+    let flagged = description_judgment(&assessment);
+    assert_eq!(flagged.status, JudgmentStatus::Requested);
+    assert_eq!(flagged.reasons, vec![JudgmentReason::ParaphraseSuspected]);
+    assert_eq!(flagged.relation, None);
+    assert_eq!(flagged.fingerprint, fingerprint(PARAPHRASE.0, PARAPHRASE.1));
+
+    // The request names the change and the field, without the texts.
+    assert_eq!(assessment.judgment_requests.len(), 1);
+    let asked = &assessment.judgment_requests[0];
+    assert_eq!(asked.change_index, 0);
+    assert_eq!(asked.entity_id, "P");
+    assert_eq!(asked.field, DESCRIPTION);
+    assert_eq!(asked.fingerprint, flagged.fingerprint);
+    assert_eq!(asked.reasons, flagged.reasons);
+    assert_eq!(
+        (asked.before.as_deref(), asked.after.as_deref()),
+        (None, None)
+    );
+
+    // The texts come only when they are asked for.
+    let mut with_texts = request.clone();
+    with_texts.options.judgment_texts = true;
+    let assessment = client.assess(with_texts).await.expect("assesses");
+    let asked = &assessment.judgment_requests[0];
+    assert_eq!(
+        (asked.before.as_deref(), asked.after.as_deref()),
+        (Some(PARAPHRASE.0), Some(PARAPHRASE.1))
+    );
+
+    // No judge is wired: asking for one changes no number. The field says
+    // that no judge answered.
+    let mut judged = request.clone();
+    judged.options.judge = Some(true);
+    let with_judge = client.assess(judged).await.expect("assesses");
+    let unanswered = description_judgment(&with_judge);
+    assert_eq!(unanswered.status, JudgmentStatus::Unavailable);
+    assert_eq!(unanswered.detail, "this server has no judge");
+    let mut same = with_judge.changes.clone();
+    same[0]
+        .fields
+        .iter_mut()
+        .find(|f| f.field == DESCRIPTION)
+        .expect("the description changed")
+        .judgment = Some(flagged.clone());
+    assert_eq!(same, assessment.changes);
+    assert_eq!(with_judge.score, assessment.score);
+    assert_eq!(client.judge_info().await.expect("answers"), None);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_supplied_judgment_is_applied_end_to_end() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+
+    let lexical = client
+        .assess(judged_request(PARAPHRASE, Vec::new()))
+        .await
+        .expect("assesses");
+
+    let supplied = judgment(PARAPHRASE, TextRelation::Equivalent);
+    let request = judged_request(PARAPHRASE, vec![supplied.clone()]);
+    let assessment = client.assess(request.clone()).await.expect("assesses");
+    assert_eq!(
+        assessment,
+        Engine::default().assess(&request).expect("assesses")
+    );
+    assert_eq!(assessment.changes[0].bump, VersionBump::Patch);
+    assert_eq!(
+        assessment.changes[0].next_version,
+        Some(SemVer::new(1, 0, 1))
+    );
+    assert!(assessment.score < lexical.score);
+    assert!(assessment.judgment_requests.is_empty());
+    assert!(assessment.unmatched_judgments.is_empty());
+    let applied = description_judgment(&assessment);
+    assert_eq!(applied.status, JudgmentStatus::Applied);
+    assert_eq!(applied.relation, Some(TextRelation::Equivalent));
+    assert_eq!(applied.confidence, Some(0.9));
+    assert_eq!(applied.rationale, supplied.rationale);
+    assert_eq!(applied.source, supplied.source);
+    assert_eq!(
+        applied.lexical_magnitude,
+        description_judgment(&lexical).lexical_magnitude
+    );
+
+    // A judgment the other way makes the change breaking.
+    let replaced = client
+        .assess(judged_request(
+            POSTGRES,
+            vec![judgment(POSTGRES, TextRelation::Replaced)],
+        ))
+        .await
+        .expect("assesses");
+    assert_eq!(replaced.changes[0].bump, VersionBump::Major);
+
+    // In a batch and on a stream too.
+    let batch = client
+        .assess_batch(vec![request.clone()])
+        .await
+        .expect("answers");
+    assert_eq!(batch[0].result.as_ref().expect("assesses"), &assessment);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_judgment_of_another_text_is_stale_and_changes_nothing() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+
+    let lexical = client
+        .assess(judged_request(PARAPHRASE, Vec::new()))
+        .await
+        .expect("assesses");
+    let request = judged_request(
+        PARAPHRASE,
+        vec![
+            // Made for another pair of texts.
+            judgment(POSTGRES, TextRelation::Equivalent),
+            // For a field that did not change.
+            TextJudgment {
+                field: "notes".to_owned(),
+                ..judgment(PARAPHRASE, TextRelation::Equivalent)
+            },
+        ],
+    );
+    let assessment = client.assess(request.clone()).await.expect("assesses");
+    assert_eq!(
+        assessment,
+        Engine::default().assess(&request).expect("assesses")
+    );
+    assert_eq!(
+        description_judgment(&assessment).status,
+        JudgmentStatus::Stale
+    );
+    assert_eq!(assessment.score, lexical.score);
+    assert_eq!(assessment.level, lexical.level);
+    assert_eq!(assessment.changes[0].bump, lexical.changes[0].bump);
+    assert_eq!(assessment.impacts, lexical.impacts);
+    assert_eq!(
+        assessment.unmatched_judgments,
+        vec![JudgmentKey {
+            entity_id: "P".to_owned(),
+            field: "notes".to_owned(),
+        }]
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invalid_judgment_is_rejected_with_its_path() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+    let good = pb::TextJudgment::from(judgment(PARAPHRASE, TextRelation::Equivalent));
+    let request = |bad: pb::TextJudgment| {
+        let mut request = pb::AssessRequest::from(judged_request(PARAPHRASE, Vec::new()));
+        request.changes[0].judgments = vec![bad];
+        request
+    };
+
+    let status = client
+        .raw()
+        .assess(request(pb::TextJudgment {
+            relation: pb::TextRelation::Unspecified.into(),
+            ..good.clone()
+        }))
+        .await
+        .expect_err("an unspecified relation");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("changes[0].judgments[0].relation: text relation is unspecified"),
+        "{}",
+        status.message()
+    );
+
+    for confidence in [1.5, -0.1, f64::NAN] {
+        let status = client
+            .raw()
+            .assess(request(pb::TextJudgment {
+                confidence: Some(confidence),
+                ..good.clone()
+            }))
+            .await
+            .expect_err("a confidence outside [0, 1]");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("changes[0].judgments[0].confidence"),
+            "{}",
+            status.message()
+        );
+    }
+
+    // In a batch the item fails and the rest goes on.
+    let batch = client
+        .raw()
+        .assess_batch(pb::AssessBatchRequest {
+            requests: vec![
+                request(pb::TextJudgment {
+                    relation: 0,
+                    ..good.clone()
+                }),
+                request(good.clone()),
+            ],
+        })
+        .await
+        .expect("answers")
+        .into_inner();
+    let error = batch.responses[0].error.as_ref().expect("the item fails");
+    assert!(
+        error.message.contains("changes[0].judgments[0].relation"),
+        "{}",
+        error.message
+    );
+    assert!(batch.responses[1].assessment.is_some());
+
+    // The registry calls check their judgments the same way.
+    let mut put = convert::put_request_to_pb(judged_parent(PARAPHRASE.0), PutOptions::default());
+    put.judgments = vec![pb::TextJudgment {
+        relation: 0,
+        ..good.clone()
+    }];
+    let status = client.raw().put_entity(put).await.expect_err("is rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("judgments[0].relation"),
+        "{}",
+        status.message()
+    );
+    let status = client
+        .raw()
+        .compare_versions(pb::CompareVersionsRequest {
+            id: "P".to_owned(),
+            from: Some(SemVer::new(1, 0, 0).into()),
+            to: Some(SemVer::new(1, 0, 1).into()),
+            now: None,
+            options: None,
+            judgments: vec![pb::TextJudgment {
+                relation: 0,
+                ..good
+            }],
+        })
+        .await
+        .expect_err("is rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("judgments[0].relation: text relation is unspecified"),
+        "{}",
+        status.message()
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn put_entity_holds_a_flagged_change_until_it_is_judged() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+    judged_registry(&mut client, POSTGRES.0).await;
+    let hold = || PutOptions {
+        hold_if_flagged: true,
+        now: Some(at(9, 10)),
+        assess: AssessOptions {
+            judgment_texts: true,
+            ..AssessOptions::default()
+        },
+        ..PutOptions::default()
+    };
+
+    let held = client
+        .put_entity(judged_parent(POSTGRES.1), hold())
+        .await
+        .expect("answers");
+    assert!(!held.stored && !held.unchanged && !held.created);
+    assert_eq!(held.assessment.judgment_requests.len(), 1);
+    let asked = &held.assessment.judgment_requests[0];
+    assert_eq!(asked.reasons, vec![JudgmentReason::TermSubstitution]);
+    assert_eq!(
+        (asked.before.as_deref(), asked.after.as_deref()),
+        (Some(POSTGRES.0), Some(POSTGRES.1))
+    );
+    assert_eq!(client.history("P", 0).await.expect("history").len(), 1);
+    let stored = client.get_entity("P", None).await.expect("is stored");
+    assert_eq!(stored.text(DESCRIPTION), Some(POSTGRES.0));
+
+    // The second put brings the judgment and is stored.
+    let supplied = TextJudgment {
+        fingerprint: asked.fingerprint.clone(),
+        ..judgment(POSTGRES, TextRelation::Replaced)
+    };
+    let out = client
+        .put_entity(
+            judged_parent(POSTGRES.1),
+            PutOptions {
+                judgments: vec![supplied.clone()],
+                ..hold()
+            },
+        )
+        .await
+        .expect("stores");
+    assert!(out.stored);
+    assert_eq!(out.bump, VersionBump::Major);
+    assert_eq!(out.entity.version, Some(SemVer::new(2, 0, 0)));
+    assert_eq!(
+        description_judgment(&out.assessment).status,
+        JudgmentStatus::Applied
+    );
+    let history = client.history("P", 0).await.expect("history");
+    assert_eq!(history.len(), 2);
+    assert!(history[0].judgments.is_empty());
+    assert_eq!(
+        history.last().expect("a record").judgments,
+        vec![supplied.clone()]
+    );
+
+    // A judgment of a text that moved on is stale. The field is asked for
+    // again, so a held put stores nothing.
+    let later = "Store user sessions in Redis with a 30 day expiry.";
+    let out = client
+        .put_entity(
+            judged_parent(later),
+            PutOptions {
+                judgments: vec![supplied.clone()],
+                ..hold()
+            },
+        )
+        .await
+        .expect("answers");
+    assert!(!out.stored);
+    assert_eq!(out.assessment.judgment_requests.len(), 1);
+    assert_eq!(
+        description_judgment(&out.assessment).status,
+        JudgmentStatus::Stale
+    );
+    // Without the hold the lexical bump is stored and the judgment is not
+    // kept.
+    let out = client
+        .put_entity(
+            judged_parent(later),
+            PutOptions {
+                judgments: vec![supplied],
+                hold_if_flagged: false,
+                ..hold()
+            },
+        )
+        .await
+        .expect("stores");
+    assert!(out.stored);
+    assert_eq!(
+        description_judgment(&out.assessment).status,
+        JudgmentStatus::Stale
+    );
+    let history = client.history("P", 0).await.expect("history");
+    assert_eq!(history.len(), 3);
+    assert!(history.last().expect("a record").judgments.is_empty());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn compare_versions_takes_options_and_judgments() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+    judged_registry(&mut client, PARAPHRASE.0).await;
+    let supplied = judgment(PARAPHRASE, TextRelation::Equivalent);
+    let out = client
+        .put_entity(
+            judged_parent(PARAPHRASE.1),
+            PutOptions {
+                judgments: vec![supplied],
+                now: Some(at(9, 10)),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .expect("stores");
+    assert_eq!(out.bump, VersionBump::Patch);
+    let (from, to) = (SemVer::new(1, 0, 0), SemVer::new(1, 0, 1));
+    assert_eq!(out.entity.version, Some(to));
+    let now = Some(at(9, 11));
+
+    // The stored judgment is used again.
+    let stored = client
+        .compare_versions("P", from, to, now)
+        .await
+        .expect("compares");
+    assert_eq!(stored.changes[0].bump, VersionBump::Patch);
+    assert_eq!(
+        description_judgment(&stored).status,
+        JudgmentStatus::Applied
+    );
+    assert_eq!(
+        client
+            .compare_versions_with("P", from, to, now, AssessOptions::default(), Vec::new())
+            .await
+            .expect("compares"),
+        stored
+    );
+
+    // A given judgment of the field goes before the stored one.
+    let replaced = client
+        .compare_versions_with(
+            "P",
+            from,
+            to,
+            now,
+            AssessOptions::default(),
+            vec![judgment(PARAPHRASE, TextRelation::Replaced)],
+        )
+        .await
+        .expect("compares");
+    assert_eq!(replaced.changes[0].bump, VersionBump::Major);
+    assert_eq!(
+        description_judgment(&replaced).relation,
+        Some(TextRelation::Replaced)
+    );
+
+    // The options reach the engine.
+    let short = client
+        .compare_versions_with(
+            "P",
+            from,
+            to,
+            now,
+            AssessOptions {
+                top_k: 1,
+                explain: false,
+                ..AssessOptions::default()
+            },
+            Vec::new(),
+        )
+        .await
+        .expect("compares");
+    assert!(short.impacts.len() <= 1);
+    assert_eq!(short.changes[0].bump, VersionBump::Patch);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn compare_text_reports_the_gray_zone() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await;
+    let engine = Engine::default();
+
+    let diff = client
+        .compare_text(POSTGRES.0, POSTGRES.1, None)
+        .await
+        .expect("compares");
+    assert_eq!(
+        diff,
+        engine
+            .compare_text(POSTGRES.0, POSTGRES.1, None)
+            .expect("valid texts")
+    );
+    let zone = diff.gray_zone.expect("the change is flagged");
+    assert_eq!(zone.reasons, vec![JudgmentReason::TermSubstitution]);
+    assert_eq!(zone.fingerprint, fingerprint(POSTGRES.0, POSTGRES.1));
+
+    // The field decides how the text is read.
+    for field in [DESCRIPTION, "title", "notes"] {
+        let diff = client
+            .compare_text_as(field, PARAPHRASE.0, PARAPHRASE.1, None)
+            .await
+            .expect("compares");
+        assert_eq!(
+            diff,
+            engine
+                .compare_text_as(field, PARAPHRASE.0, PARAPHRASE.1, None)
+                .expect("valid texts"),
+            "{field}"
+        );
+    }
+
+    // An unflagged change has no gray zone.
+    let same = client
+        .compare_text("Add a footer.", "Add a footer.", None)
+        .await
+        .expect("compares");
+    assert_eq!(same.gray_zone, None);
+
+    let err = client
+        .compare_text_as("f".repeat(257), "a", "b", None)
+        .await
+        .expect_err("the field name is too long");
+    assert_eq!(err.code(), Some(Code::InvalidArgument));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn with_timeout_sends_grpc_timeout() {
+    use assessment_grpc::pb::assessment_engine_server::AssessmentEngineServer;
+    use std::sync::{Arc, Mutex};
+
+    // A plain server that records the `grpc-timeout` of every call.
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let service = AssessmentEngineServer::with_interceptor(
+        AssessmentService::in_memory(),
+        move |request: tonic::Request<()>| {
+            let timeout = request
+                .metadata()
+                .get("grpc-timeout")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            record.lock().expect("not poisoned").push(timeout);
+            Ok(request)
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds a free port");
+    let url = format!("http://{}", listener.local_addr().expect("has an address"));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            }),
+    );
+
+    let mut plain = AssessmentClient::connect(url.clone())
+        .await
+        .expect("connects");
+    plain.compare_text("a", "b", None).await.expect("compares");
+    let mut timed = AssessmentClient::connect(url)
+        .await
+        .expect("connects")
+        .with_timeout(Duration::from_secs(7))
+        .with_max_message_bytes(1 << 20);
+    timed.compare_text("a", "b", None).await.expect("compares");
+    timed.judge_info().await.expect("answers");
+    timed
+        .assess(simple_request("A", "A new title"))
+        .await
+        .expect("assesses");
+
+    let seen = seen.lock().expect("not poisoned").clone();
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[0], None);
+    for timeout in &seen[1..] {
+        // tonic writes the deadline in the largest unit that fits.
+        let timeout = timeout.as_deref().expect("a grpc-timeout header");
+        let (digits, unit) = timeout.split_at(timeout.len() - 1);
+        let value: u64 = digits.parse().expect("a number");
+        let seconds = match unit {
+            "H" => value * 3600,
+            "M" => value * 60,
+            "S" => value,
+            "m" => value / 1_000,
+            "u" => value / 1_000_000,
+            "n" => value / 1_000_000_000,
+            other => panic!("an unknown unit {other}"),
+        };
+        assert_eq!(seconds, 7, "{timeout}");
+    }
+
+    let _ = stop.send(());
+    task.await
+        .expect("the server task does not panic")
+        .expect("serves without error");
+}
+
+#[tokio::test]
+async fn a_call_past_its_timeout_fails() {
+    let server = TestServer::start(ServerOptions::default()).await;
+    let mut client = server.client().await.with_timeout(Duration::from_nanos(1));
+    let err = client
+        .compare_text("a", "b", None)
+        .await
+        .expect_err("the deadline has passed");
+    assert!(
+        matches!(err.code(), Some(Code::DeadlineExceeded | Code::Cancelled)),
+        "{err}"
+    );
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Auth, health, reflection
 // ---------------------------------------------------------------------------
 
@@ -1735,11 +2423,102 @@ fn rich_request() -> AssessmentRequest {
         ],
         now: Some(t),
         options: AssessOptions {
+            judge: None,
+            judgment_texts: false,
             top_k: 0,
             explain: false,
             max_contributions: 17,
         },
     }
+}
+
+/// One judgment per relation, with every field set.
+fn rich_judgments() -> Vec<TextJudgment> {
+    RELATIONS
+        .iter()
+        .enumerate()
+        .map(|(i, relation)| TextJudgment {
+            field: format!("field_{i}"),
+            fingerprint: fingerprint("before", &format!("after {i}")),
+            relation: *relation,
+            confidence: 0.125 * i as f64,
+            rationale: format!("because {i}"),
+            source: "reviewer".to_owned(),
+        })
+        .collect()
+}
+
+const RELATIONS: [TextRelation; 6] = [
+    TextRelation::Equivalent,
+    TextRelation::Extended,
+    TextRelation::Narrowed,
+    TextRelation::Replaced,
+    TextRelation::Reversed,
+    TextRelation::Undetermined,
+];
+
+const STATUSES: [JudgmentStatus; 7] = [
+    JudgmentStatus::Requested,
+    JudgmentStatus::OverBudget,
+    JudgmentStatus::Applied,
+    JudgmentStatus::Stale,
+    JudgmentStatus::Inconclusive,
+    JudgmentStatus::NotFlagged,
+    JudgmentStatus::Unavailable,
+];
+
+const REASONS: [JudgmentReason; 5] = [
+    JudgmentReason::NegationChanged,
+    JudgmentReason::ScopeQualifier,
+    JudgmentReason::TermSubstitution,
+    JudgmentReason::ParaphraseSuspected,
+    JudgmentReason::NearThreshold,
+];
+
+/// The judgment of the `i`-th field: none for the first, then every status
+/// and relation in turn, with and without the optional parts.
+fn rich_field_judgment(i: usize) -> Option<FieldJudgment> {
+    if i == 0 {
+        return None;
+    }
+    let judged = i.is_multiple_of(2);
+    Some(FieldJudgment {
+        status: STATUSES[i % STATUSES.len()],
+        reasons: REASONS[..i % (REASONS.len() + 1)].to_vec(),
+        fingerprint: fingerprint("a", &format!("b {i}")),
+        lexical_magnitude: 0.05 * i as f64,
+        relation: judged.then(|| RELATIONS[i % RELATIONS.len()]),
+        confidence: judged.then_some(0.9),
+        weight: judged.then_some(0.75),
+        rationale: if judged { "same meaning" } else { "" }.to_owned(),
+        source: if judged { "caller" } else { "" }.to_owned(),
+        detail: if i.is_multiple_of(3) { "a detail" } else { "" }.to_owned(),
+    })
+}
+
+fn rich_judgment_requests() -> Vec<JudgmentRequest> {
+    vec![
+        JudgmentRequest {
+            change_index: 0,
+            entity_id: "ENG-1".to_owned(),
+            field: DESCRIPTION.to_owned(),
+            fingerprint: fingerprint("a", "b"),
+            reasons: REASONS.to_vec(),
+            lexical_magnitude: 0.8,
+            before: Some("a".to_owned()),
+            after: Some(String::new()),
+        },
+        JudgmentRequest {
+            change_index: 3,
+            entity_id: "ENG-9".to_owned(),
+            field: "notes".to_owned(),
+            fingerprint: fingerprint("c", "d"),
+            reasons: vec![JudgmentReason::NearThreshold],
+            lexical_magnitude: 0.25,
+            before: None,
+            after: None,
+        },
+    ]
 }
 
 /// Every output field and every enum variant.
@@ -1832,6 +2611,7 @@ fn rich_assessments() -> Vec<Assessment> {
         .flat_map(|k| directions.iter().map(move |d| (*k, *d)))
         .enumerate()
         .map(|(i, (change, direction))| FieldAssessment {
+            judgment: rich_field_judgment(i),
             field: format!("field_{i}"),
             change,
             direction,
@@ -1944,6 +2724,17 @@ fn rich_assessments() -> Vec<Assessment> {
         .iter()
         .enumerate()
         .map(|(i, recommendation)| Assessment {
+            judgment_requests: rich_judgment_requests(),
+            unmatched_judgments: vec![
+                JudgmentKey {
+                    entity_id: "ENG-1".to_owned(),
+                    field: DESCRIPTION.to_owned(),
+                },
+                JudgmentKey {
+                    entity_id: String::new(),
+                    field: "notes".to_owned(),
+                },
+            ],
             score: 0.71,
             level: levels[i],
             recommendation: *recommendation,
@@ -1966,8 +2757,13 @@ fn rich_assessments() -> Vec<Assessment> {
 
 #[test]
 fn rich_request_round_trips() {
-    let request = rich_request();
-    assert_eq!(round_trip_request(&request), request);
+    let mut request = rich_request();
+    request.changes[0].judgments = rich_judgments();
+    request.options.judgment_texts = true;
+    for judge in [None, Some(false), Some(true)] {
+        request.options.judge = judge;
+        assert_eq!(round_trip_request(&request), request);
+    }
 
     let input = AssessInput {
         request_id: "id-7".to_owned(),
@@ -2024,6 +2820,7 @@ fn registry_and_text_types_round_trip() {
         (None, ChangeType::Deleted),
     ] {
         let record = VersionRecord {
+            judgments: rich_judgments(),
             version: SemVer::new(2, 1, 0),
             bump: VersionBump::Minor,
             at: precise_time(),
@@ -2051,12 +2848,16 @@ fn registry_and_text_types_round_trip() {
     }
 
     let options = PutOptions {
+        judgments: rich_judgments(),
+        hold_if_flagged: true,
         dry_run: true,
         expected_version: Some(SemVer::new(1, 2, 3)),
         events: vec![ActivityEvent::comment("ENG-1", "hi")],
         now: Some(precise_time()),
         auto_pin: false,
         assess: AssessOptions {
+            judge: Some(true),
+            judgment_texts: true,
             top_k: 3,
             explain: false,
             max_contributions: 1,
@@ -2070,6 +2871,10 @@ fn registry_and_text_types_round_trip() {
     assert_eq!((e, o), (entity, options));
 
     let diff = TextDiff {
+        gray_zone: Some(GrayZone {
+            reasons: REASONS.to_vec(),
+            fingerprint: fingerprint("a", "b"),
+        }),
         magnitude: 0.5,
         lexical_similarity: 0.4,
         char_similarity: Some(0.3),
@@ -2103,6 +2908,121 @@ fn registry_and_text_types_round_trip() {
     };
     let back = TextDiff::try_from(pb::CompareTextResponse::from(diff.clone())).expect("decodes");
     assert_eq!(back, diff);
+    let plain = TextDiff {
+        gray_zone: None,
+        ..diff
+    };
+    let back = TextDiff::try_from(pb::CompareTextResponse::from(plain.clone())).expect("decodes");
+    assert_eq!(back, plain);
+}
+
+#[test]
+fn judgment_responses_decode_leniently() {
+    let judged = rich_field_judgment(2).expect("a judgment");
+
+    // A status this client does not know reads as unavailable, with a note.
+    for (status, detail, expected) in [
+        (42, "", "unknown judgment status 42"),
+        (42, "busy", "unknown judgment status 42: busy"),
+        (0, "", "unknown judgment status 0"),
+    ] {
+        let message = pb::FieldJudgment {
+            status,
+            detail: detail.to_owned(),
+            ..pb::FieldJudgment::from(judged.clone())
+        };
+        let decoded = FieldJudgment::from(message);
+        assert_eq!(decoded.status, JudgmentStatus::Unavailable);
+        assert_eq!(decoded.detail, expected);
+        assert_eq!(decoded.fingerprint, judged.fingerprint);
+    }
+
+    // An unknown or unset relation is no relation.
+    for relation in [0, 42] {
+        let message = pb::FieldJudgment {
+            relation,
+            ..pb::FieldJudgment::from(judged.clone())
+        };
+        assert_eq!(FieldJudgment::from(message).relation, None);
+    }
+
+    // Reasons this client does not know are dropped.
+    let message = pb::FieldJudgment {
+        reasons: vec![
+            "term_substitution".to_owned(),
+            "a_new_reason".to_owned(),
+            "near_threshold".to_owned(),
+        ],
+        ..pb::FieldJudgment::from(judged)
+    };
+    assert_eq!(
+        FieldJudgment::from(message).reasons,
+        vec![
+            JudgmentReason::TermSubstitution,
+            JudgmentReason::NearThreshold
+        ]
+    );
+    let zone = pb::GrayZone {
+        reasons: vec!["a_new_reason".to_owned(), "scope_qualifier".to_owned()],
+        fingerprint: "f".to_owned(),
+    };
+    assert_eq!(
+        GrayZone::from(zone).reasons,
+        vec![JudgmentReason::ScopeQualifier]
+    );
+
+    // A stored judgment with an unknown relation is undetermined.
+    let mut record = pb::VersionRecord::from(VersionRecord {
+        judgments: rich_judgments(),
+        version: SemVer::new(1, 0, 1),
+        bump: VersionBump::Patch,
+        at: precise_time(),
+        change_type: ChangeType::Updated,
+        raw_score: 0.1,
+        level: ImpactLevel::Low,
+        changed_fields: vec![DESCRIPTION.to_owned()],
+        snapshot: None,
+    });
+    record.judgments[0].relation = 42;
+    let decoded = VersionRecord::try_from(record).expect("decodes");
+    assert_eq!(decoded.judgments[0].relation, TextRelation::Undetermined);
+    assert_eq!(decoded.judgments[1].relation, TextRelation::Extended);
+}
+
+#[test]
+fn request_judgments_decode_strictly() {
+    let good = pb::TextJudgment::from(rich_judgments().remove(0));
+    let decode = |judgment: pb::TextJudgment| {
+        let mut request = pb::AssessRequest::from(simple_request("A", "t"));
+        request.changes[0].judgments = vec![good.clone(), judgment];
+        AssessmentRequest::try_from(request)
+            .expect_err("is rejected")
+            .to_string()
+    };
+    assert_eq!(
+        decode(pb::TextJudgment {
+            relation: 0,
+            ..good.clone()
+        }),
+        "changes[0].judgments[1].relation: text relation is unspecified"
+    );
+    assert!(
+        decode(pb::TextJudgment {
+            relation: 42,
+            ..good.clone()
+        })
+        .starts_with("changes[0].judgments[1].relation: ")
+    );
+    for confidence in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+        let message = decode(pb::TextJudgment {
+            confidence: Some(confidence),
+            ..good.clone()
+        });
+        assert!(
+            message.starts_with("changes[0].judgments[1].confidence: "),
+            "{message}"
+        );
+    }
 }
 
 #[test]
@@ -2116,6 +3036,19 @@ fn proto_defaults_apply() {
     };
     let decoded = AssessmentRequest::try_from(request).expect("decodes");
     assert_eq!(decoded.options, AssessOptions::default());
+    assert_eq!(decoded.options.judge, None);
+    assert!(decoded.changes[0].judgments.is_empty());
+
+    // A judgment without a confidence is fully trusted.
+    let judgment = pb::TextJudgment {
+        field: DESCRIPTION.to_owned(),
+        fingerprint: fingerprint("a", "b"),
+        relation: pb::TextRelation::Equivalent.into(),
+        ..Default::default()
+    };
+    let decoded = TextJudgment::try_from(judgment).expect("decodes");
+    assert_eq!(decoded.confidence, 1.0);
+    assert_eq!(decoded.relation, TextRelation::Equivalent);
 
     // A FieldValue without a kind is null: the field is omitted.
     let mut entity = pb::Entity::from(Entity::new("A", "issue").with_title("t"));
@@ -2366,6 +3299,27 @@ fn arb_event() -> impl Strategy<Value = ActivityEvent> {
         })
 }
 
+fn arb_judgment() -> impl Strategy<Value = TextJudgment> {
+    (
+        "[a-z_]{1,8}",
+        "[0-9a-f]{0,16}",
+        prop::sample::select(RELATIONS.to_vec()),
+        0.0_f64..=1.0,
+        ".{0,12}",
+        "[a-z]{0,6}",
+    )
+        .prop_map(
+            |(field, fingerprint, relation, confidence, rationale, source)| TextJudgment {
+                field,
+                fingerprint,
+                relation,
+                confidence,
+                rationale,
+                source,
+            },
+        )
+}
+
 fn arb_change() -> impl Strategy<Value = ChangeSet> {
     (
         "[A-Z]{0,3}",
@@ -2385,9 +3339,11 @@ fn arb_change() -> impl Strategy<Value = ChangeSet> {
             0..3,
         ),
         prop::collection::vec(arb_event(), 0..3),
+        prop::collection::vec(arb_judgment(), 0..3),
     )
         .prop_map(
-            |(entity_id, before, after, field_changes, events)| ChangeSet {
+            |(entity_id, before, after, field_changes, events, judgments)| ChangeSet {
+                judgments,
                 entity_id,
                 before,
                 after,
@@ -2412,16 +3368,30 @@ fn arb_request() -> impl Strategy<Value = AssessmentRequest> {
             0..3,
         ),
         prop::option::of(arb_time()),
-        (any::<u32>(), any::<bool>(), any::<u32>()),
+        (
+            any::<u32>(),
+            any::<bool>(),
+            any::<u32>(),
+            prop::option::of(any::<bool>()),
+            any::<bool>(),
+        ),
     )
         .prop_map(
-            |(changes, context, history, now, (top_k, explain, max_contributions))| {
+            |(
+                changes,
+                context,
+                history,
+                now,
+                (top_k, explain, max_contributions, judge, judgment_texts),
+            )| {
                 AssessmentRequest {
                     changes,
                     context,
                     history,
                     now,
                     options: AssessOptions {
+                        judge,
+                        judgment_texts,
                         top_k: top_k as usize,
                         explain,
                         max_contributions: max_contributions as usize,

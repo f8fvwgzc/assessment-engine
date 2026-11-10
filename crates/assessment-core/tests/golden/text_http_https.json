@@ -2,7 +2,7 @@
   "score": 0.4863759218232051,
   "level": "medium",
   "recommendation": "review",
-  "confidence": 0.7,
+  "confidence": 0.595,
   "severity": 0.4590000000000001,
   "breadth": 0.1217457212648968,
   "effort_at_risk": 0.7024914425297937,
@@ -50,7 +50,15 @@
             "tfidf_cosine": 0.5031026124151314,
             "token_jaccard": 0.5
           },
-          "explanation": "description: change magnitude 0.29; dropped: http; added: https"
+          "explanation": "description: change magnitude 0.29; dropped: http; added: https; meaning not verified: terms were substituted",
+          "judgment": {
+            "status": "requested",
+            "reasons": [
+              "term_substitution"
+            ],
+            "fingerprint": "3a1f9bebfacee579fc36322a5fd80c70f51aee09009ec5c50b4ac5e1e64ec2ed",
+            "lexical_magnitude": 0.28646052062328664
+          }
         }
       ],
       "signals": [],
@@ -58,7 +66,7 @@
       "previous_version": "1.0.0",
       "next_version": "1.1.0",
       "propagation_truncated": false,
-      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.29; dropped: http; added: https"
+      "explanation": "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.29; dropped: http; added: https; meaning not verified: terms were substituted"
     }
   ],
   "impacts": [
@@ -110,13 +118,25 @@
       "effort_at_risk": 0.2434914425297936,
       "contributions": [],
       "reasons": [
-        "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.29; dropped: http; added: https"
+        "changed description (minor 1.0.0 → 1.1.0); content score 0.24, local score 0.24; strongest: description: change magnitude 0.29; dropped: http; added: https; meaning not verified: terms were substituted"
       ]
     }
   ],
   "impacts_total": 2,
   "violations": [],
-  "summary": "medium impact (score 0.49, confidence 0.70); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: review",
+  "summary": "medium impact (score 0.49, confidence 0.59); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); meaning of 1 text change(s) not verified; recommendation: review",
   "engine_version": "",
-  "assessed_at": "2026-11-09T09:00:00Z"
+  "assessed_at": "2026-11-09T09:00:00Z",
+  "judgment_requests": [
+    {
+      "change_index": 0,
+      "entity_id": "P",
+      "field": "description",
+      "fingerprint": "3a1f9bebfacee579fc36322a5fd80c70f51aee09009ec5c50b4ac5e1e64ec2ed",
+      "reasons": [
+        "term_substitution"
+      ],
+      "lexical_magnitude": 0.28646052062328664
+    }
+  ]
 }

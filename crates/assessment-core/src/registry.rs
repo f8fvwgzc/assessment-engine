@@ -145,13 +145,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{PreparedStats, StatsCell, same_text};
 use crate::assessment::{
-    Assessment, BasisStatus, ChangeAssessment, ChangeType, ImpactLevel, Recommendation,
+    Assessment, BasisStatus, ChangeAssessment, ChangeType, ImpactLevel, JudgmentStatus,
+    Recommendation,
 };
 use crate::engine::Engine;
 use crate::error::{Error, ErrorKind, Result};
 use crate::model::{
     ActivityEvent, AssessOptions, AssessmentRequest, BasisPin, ChangeSet, Entity, EntityId,
-    EntityKind, HistoryPoint, RelationKind,
+    EntityKind, HistoryPoint, RelationKind, TextJudgment,
 };
 use crate::semver::{Compatibility, SemVer, VersionBump};
 
@@ -174,6 +175,10 @@ pub struct VersionRecord {
     /// older than the registry's [history limit](Registry::with_history_limit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Entity>,
+    /// The text judgments that were applied to the change that produced this
+    /// version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judgments: Vec<TextJudgment>,
 }
 
 /// How to put an entity.
@@ -202,6 +207,16 @@ pub struct PutOptions {
     /// as stale: nothing is assessed and nothing is stored. Without a
     /// sequence the put is always applied, and the stored sequence stays.
     pub source_seq: Option<u64>,
+    /// Judgments of the text changes of this put (see
+    /// [`ChangeSet::judgments`]). The applied ones are kept with the version.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub judgments: Vec<TextJudgment>,
+    /// Store nothing if the assessment asks for a judgment of a field (none
+    /// was supplied, or the supplied one is stale): the
+    /// outcome then has `stored` false and the requests in its assessment.
+    /// Put again with the judgments to store the change.
+    #[serde(skip_serializing_if = "is_false")]
+    pub hold_if_flagged: bool,
 }
 
 impl Default for PutOptions {
@@ -214,6 +229,8 @@ impl Default for PutOptions {
             auto_pin: true,
             assess: AssessOptions::default(),
             source_seq: None,
+            judgments: Vec::new(),
+            hold_if_flagged: false,
         }
     }
 }
@@ -534,6 +551,7 @@ impl State {
                         level: last.level,
                         changed_fields: last.changed_fields.clone(),
                         snapshot: None,
+                        judgments: last.judgments.clone(),
                     })),
                 ),
                 _ => (rec.history.as_slice(), None),
@@ -2027,6 +2045,8 @@ impl Registry {
             summary: summary.to_owned(),
             engine_version: crate::ENGINE_VERSION.to_owned(),
             assessed_at: now,
+            judgment_requests: Vec::new(),
+            unmatched_judgments: Vec::new(),
         }
     }
 
@@ -2131,6 +2151,11 @@ impl Registry {
         } else {
             self.prepare_put(&state, entity, opts, now)?
         };
+        if p.held {
+            // A judgment is asked for first: nothing is stored, and no
+            // sequence is remembered, so the second put is not stale.
+            return Ok(p.into_outcome(false));
+        }
         if p.noop {
             // Nothing to store, but a newer sequence is remembered, so an
             // older change that arrives late is still recognised.
@@ -2190,6 +2215,7 @@ impl Registry {
             assessment: self.not_assessed(summary, now),
             record: None,
             noop: true,
+            held: false,
             unchanged: !stale,
             skipped_stale: stale,
             stats: None,
@@ -2262,7 +2288,8 @@ impl Registry {
             Some(rec) => ChangeSet::update(rec.current.clone(), after.clone()),
             None => ChangeSet::create(after.clone()),
         }
-        .with_events(opts.events.clone());
+        .with_events(opts.events.clone())
+        .with_judgments(opts.judgments.clone());
         let request = AssessmentRequest {
             changes: vec![change],
             context,
@@ -2278,6 +2305,7 @@ impl Registry {
             request,
             cells,
             now,
+            hold_if_flagged: opts.hold_if_flagged,
         }))
     }
 
@@ -2296,6 +2324,7 @@ impl Registry {
             request,
             cells,
             now,
+            hold_if_flagged,
         } = input;
         let assessment = self.assess(&request, &cells)?;
         let ca = first_change(&assessment)?;
@@ -2336,7 +2365,10 @@ impl Registry {
             changed_fields,
             // Filled from the entity when applied; not repeated in the journal.
             snapshot: None,
+            judgments: applied_judgments(&request, ca),
         });
+        // A stale judgment is asked for again, so it holds the put too.
+        let held = hold_if_flagged && !assessment.judgment_requests.is_empty();
         let noop = !created
             && bump == VersionBump::None
             && current.as_ref().is_some_and(|c| same_content(c, &after));
@@ -2350,6 +2382,7 @@ impl Registry {
             assessment,
             record,
             noop,
+            held,
             unchanged: false,
             skipped_stale: false,
             stats: cells.after,
@@ -2635,6 +2668,7 @@ impl Registry {
                 level: ImpactLevel::None,
                 changed_fields: Vec::new(),
                 snapshot: None,
+                judgments: Vec::new(),
             }),
             entity: after,
             source_seq: item.source_seq,
@@ -2773,6 +2807,7 @@ impl Registry {
                 level: assessment.level,
                 changed_fields: vec![crate::model::field::LIFECYCLE.to_owned()],
                 snapshot: None,
+                judgments: Vec::new(),
             },
             source_seq: seq,
         };
@@ -2869,12 +2904,30 @@ impl Registry {
 
     /// Assesses the difference between two stored versions of an entity,
     /// against its current neighbourhood.
+    ///
+    /// The judgments that were applied when `to` was stored are used again.
+    /// They fit only the change from the version just before it, so the
+    /// comparison of two consecutive versions agrees with the history.
     pub fn compare(
         &self,
         id: &str,
         from: SemVer,
         to: SemVer,
         now: Option<DateTime<Utc>>,
+    ) -> Result<Assessment> {
+        self.compare_with(id, from, to, now, &AssessOptions::default(), &[])
+    }
+
+    /// [`Registry::compare`] with assessment options and more judgments.
+    /// A given judgment of a field goes before the stored one.
+    pub fn compare_with(
+        &self,
+        id: &str,
+        from: SemVer,
+        to: SemVer,
+        now: Option<DateTime<Utc>>,
+        options: &AssessOptions,
+        judgments: &[TextJudgment],
     ) -> Result<Assessment> {
         let before = self.get(id, Some(from))?;
         let after = self.get(id, Some(to))?;
@@ -2891,12 +2944,25 @@ impl Registry {
             context: context_cells,
             ..Cells::default()
         };
+        let mut all = judgments.to_vec();
+        let stored = self.read().records.get(id).and_then(|rec| {
+            rec.history
+                .iter()
+                .rev()
+                .find(|r| r.version == to)
+                .map(|r| r.judgments.clone())
+        });
+        for j in stored.unwrap_or_default() {
+            if !all.iter().any(|g| g.field == j.field) {
+                all.push(j);
+            }
+        }
         let request = AssessmentRequest {
-            changes: vec![ChangeSet::update(before, after)],
+            changes: vec![ChangeSet::update(before, after).with_judgments(all)],
             context,
             history: Vec::new(),
             now,
-            options: AssessOptions::default(),
+            options: options.clone(),
         };
         self.assess(&request, &cells)
     }
@@ -3040,6 +3106,7 @@ struct PutInput {
     request: AssessmentRequest,
     cells: Cells,
     now: DateTime<Utc>,
+    hold_if_flagged: bool,
 }
 
 /// The analysis cells that go with a request the registry built: one per
@@ -3059,6 +3126,8 @@ struct Prepared {
     assessment: Assessment,
     record: Option<VersionRecord>,
     noop: bool,
+    /// Held back by [`PutOptions::hold_if_flagged`]: nothing is stored.
+    held: bool,
     /// Settled before the engine ran: the entity matches what is stored.
     unchanged: bool,
     /// Settled before the engine ran: the source sequence is stale.
@@ -3149,6 +3218,23 @@ impl Prepared {
             skipped_stale: self.skipped_stale,
         }
     }
+}
+
+/// The supplied judgments the assessment applied, in field order.
+fn applied_judgments(request: &AssessmentRequest, ca: &ChangeAssessment) -> Vec<TextJudgment> {
+    let Some(change) = request.changes.first() else {
+        return Vec::new();
+    };
+    ca.fields
+        .iter()
+        .filter(|f| {
+            f.judgment
+                .as_ref()
+                .is_some_and(|j| j.status == JudgmentStatus::Applied)
+        })
+        .filter_map(|f| change.judgments.iter().find(|j| j.field == f.field))
+        .cloned()
+        .collect()
 }
 
 /// The assessment of the one change a registry request carries.
@@ -4406,6 +4492,7 @@ mod tests {
                 level: ImpactLevel::Low,
                 changed_fields: vec![],
                 snapshot: Some(entity.clone()),
+                judgments: Vec::new(),
             }),
             source_seq: None,
         };

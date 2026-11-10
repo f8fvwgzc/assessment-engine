@@ -127,6 +127,177 @@ no other text is ever read. Relevance to another entity uses the **best
 single passage** (max-passage scoring), so a sub-issue about one changed
 sentence is not diluted by the rest of a long rewrite (§5).
 
+## 2a. Gray zone and judgments
+
+Word counts cannot tell a paraphrase from a new requirement, or a database
+swap from a typo fix. The engine marks such a change as being in the
+**gray zone** and can use a **judgment** of it: a statement of how the two
+texts relate. The engine never asks anyone. A judgment is data in the
+request (`ChangeSet.judgments`). A caller can supply it, or a server with a
+judge can (see [JUDGE.md](JUDGE.md)).
+
+All thresholds are in `Policy.judge`. `judge.enabled = false` turns the
+whole section off: nothing is flagged and supplied judgments are ignored.
+The rules read English words. The texts may be in any language, but the
+scope words and the negation words are English.
+
+### Which changes are flagged
+
+Only the fields in `judge.fields` (`title` and `description`) are looked at.
+`bm` is the field's `breaking_magnitude` and `m` its magnitude from §2. The
+reasons are checked in this order, and a field can have several:
+
+| Reason | When |
+| --- | --- |
+| `negation_changed` | A negation word was added or dropped, the engine did not find a clear flip, and `m < bm`. |
+| `scope_qualifier` | A scope word was added or dropped (`except`, `only`, `unless`, `at most`, `instead of`, `no longer`, …, the list is `judge.scope_qualifiers`), and `m < bm`. |
+| `term_substitution` | Words were dropped and others added, at most `max_substituted_terms` (3) on each side, and `m < bm`. One word that became a near twin of itself (`increase` → `decrease`) does not count: §2 already handles it. |
+| `paraphrase_suspected` | At least one passage was removed and at least one added, so the text may only be reworded. |
+| `near_threshold` | `m` is in `[bm − 0.2, bm + 0.1)`, with no list or heading edit, no requirement-word shift and no changed number. |
+
+The last three also need words to be lost: a change that only adds words is
+never one of them.
+
+Never flagged: a pure reorder, a text that is empty on one side, a text
+longer than `judge.max_text_chars` (20 000 characters), a removed list item
+and a clear negation flip (`must support` → `must not support`). The engine
+is sure about the last two, and they are breaking already.
+
+### Fingerprint
+
+A judgment names the two texts it is about by a fingerprint, so an answer
+for an older edit is never used for a newer one. The fingerprint is the
+lowercase hex SHA-256 of
+
+    {byte length of before}:{before},{byte length of after}:{after},
+
+with the lengths in decimal and the texts as UTF-8, exactly as sent. Test
+vectors:
+
+| before | after | fingerprint |
+| --- | --- | --- |
+| (empty) | (empty) | `78f3ba77faa1ffc62bd2dd7cc8de66fb1c9112793b99729582731a64ee7ae8e4` |
+| (empty) | `a` | `d476ca72caa7bbdc5b23666b11d6762fa47034529ba497ac557d123407fa8aae` |
+| `a` | (empty) | `9388b92a75a2bd819468478a7f33321b47c40cf2837424349f3bea772a70c1ea` |
+| `Build the login button` | `Build the logout button` | `2086096a222bb499be60b77fa3ca64d94bf16c2135817a0c5d141cc73e81c86f` |
+| `Users can log in with their email address and password.` | `People are able to sign in using e-mail and a password.` | `a5092b8fdb1115a48435979471ef040eb3f920811cb6bfdca108c7393e2d56b5` |
+
+The first input is the 6 bytes `0:,0:,`. The engine prints the fingerprint
+of every flagged field, so a caller does not have to compute it.
+
+### Relations and weight
+
+| Relation | Meaning | Direction | Threshold `c0` |
+| --- | --- | --- | --- |
+| `equivalent` | Same requirement, other words. | lowers | 0.6 |
+| `extended` | Everything before still holds, and more is asked. | lowers | 0.6 |
+| `narrowed` | Something asked before is no longer asked, or is limited. | raises | 0.5 |
+| `replaced` | One thing was swapped for another. | raises | 0.5 |
+| `reversed` | The text now asks the opposite. | raises | 0.5 |
+| `undetermined` | The judge could not tell. | none | — |
+
+A judgment has a confidence `c ∈ [0,1]` (1 when not given). Its weight is
+
+    w = clamp((c − c0) / (1 − c0))
+
+and 0 for `undetermined`. Lowering needs more confidence than raising,
+because a wrong "equivalent" hides a real change. A judgment is
+**decisive** when `w ≥ 0.5`, that is `c ≥ 0.8` for a lowering relation and
+`c ≥ 0.75` for a raising one.
+
+### Status
+
+Every flagged field, and every field a judgment names, gets one status:
+
+| Status | Meaning |
+| --- | --- |
+| `requested` | Flagged, no judgment given. It is listed in `judgment_requests`. |
+| `over_budget` | Flagged, but ranked past the first `judge.max_requests` (16) flagged fields of this request. Supplying judgments does not free a place: send the fields in a smaller request to have them judged. |
+| `applied` | A judgment with `w > 0` was used. |
+| `inconclusive` | A judgment was given, but `w = 0`. |
+| `stale` | The fingerprint does not match the two texts. The judgment is ignored. A server with a judge asks about the field instead, so there the status becomes `applied`, `inconclusive` or `unavailable`. |
+| `not_flagged` | A judgment for a field the engine did not flag. It is ignored unless `judge.apply_unflagged` is set. |
+| `unavailable` | Set by a server only: its judge did not answer. `detail` says why. |
+
+Requests are listed in a fixed order: by first reason (the order of the
+table above), then by `severity × m` from high to low, then by entity id
+and field. With `options.judgment_texts` each request carries the two
+texts. A judgment of a field that did not change is listed in
+`unmatched_judgments`.
+
+### What an applied judgment changes
+
+`base` is the text-similarity part of §2, before the structure evidence
+(lists, negations, requirement words, numbers) is added. A change is
+**blocked** when it removed a list item, flipped a negation, shifted a
+requirement word or changed a number. It has **soft** evidence when it
+added or modified a list item, or added or removed a heading.
+
+A blocked change is never lowered: `equivalent` and `extended` leave its
+`m`, its bump and its propagation as they are. The judgment is still
+reported as `applied`. Raising relations are not blocked.
+
+* **`equivalent`**, not blocked: `base' = base − w · max(base − 0.05, 0)`,
+  and `m` is put together again with the same structure evidence. When
+  decisive, the field is not breaking and its bump is at most Patch. It is
+  at most Minor with soft evidence, and when the field is additive on its
+  own (nothing was lost and a sentence was added), so it stays additive.
+* **`extended`**, not blocked: `base' = base + w · (0.25 − base)`. When
+  decisive, the field is additive and its bump is at most Minor.
+* **`narrowed`, `replaced`, `reversed`**: `m' = 1 − (1 − m)(1 − w · e)`
+  with `e` = 0.315, 0.275 and 0.403. When decisive, the field is breaking
+  and the bump is Major.
+
+A judgment that is applied but not decisive moves `m` and nothing else: the
+field stays breaking or not by the usual rule (`m ≥ bm`).
+
+The paraphrase from the last test vector has `m = 0.802` and is Major on
+its own. With `equivalent`:
+
+| `c` | `w` | `m` | Bump |
+| --- | --- | --- | --- |
+| 0.55 | 0 | 0.802 | Major (`inconclusive`) |
+| 0.75 | 0.375 | 0.520 | Major |
+| 0.80 | 0.5 | 0.426 | Patch |
+| 0.90 | 0.75 | 0.238 | Patch |
+
+`Build the login button` → `Build the logout button` has `m = 0.441` and is
+Minor on its own. With `replaced` at `c = 0.9` it has `m = 0.564` and is
+Major.
+
+The field reports `metrics.lexical_magnitude` (the `m` before the judgment)
+and `metrics.judgment_weight`, and `FieldAssessment.judgment` carries the
+relation, confidence, weight, rationale and source.
+
+### Shares in propagation
+
+§5 lets the child that *owns* a removed or reworded passage take the change
+at `m_eff ≥ 0.8` or `≥ 0.6`, however small the edit. A judgment scales
+these floors, because a passage that only got new words was not removed.
+With `left = max(1 − min(2w, 1), 0.25)`:
+
+| Relation | Removed floor × | Reworded floor × |
+| --- | --- | --- |
+| `equivalent` | `left` | `left` |
+| `extended` | `left` | 1 |
+| raising | 1 | 1 |
+
+So a decisive `equivalent` leaves a quarter of both floors (0.2 and 0.15).
+Relevance is not scaled. A decisive raising judgment also treats a kept
+passage whose scope words changed as a reworded one, so the child that is
+about it is reached.
+
+### Confidence
+
+A flagged field that has no applied judgment has its confidence (§8)
+multiplied by 0.85, and its explanation says `meaning not verified`. With
+an applied judgment the field's confidence is
+
+    floor + w · max(c − floor, 0)
+
+where `floor` is that lowered value for a flagged field, and the field's
+own confidence for one that was not flagged.
+
 ## 3. Activity (comments)
 
 Lexicon matching on stemmed tokens, sentence by sentence (split at
@@ -398,6 +569,8 @@ overall score is floored at the same `0.9 × severity`.
 request did not include × the mean field confidence (text: 1.0 with
 embeddings, 0.9 lexical, 0.7 when a side has fewer than 4 terms) × 0.8 if
 any change's propagation ran out of its step budget; clamped to `[0.3, 1]`.
+A text field in the gray zone counts with a lower confidence until a
+judgment is applied (§2a).
 
 ## Request limits
 
@@ -410,12 +583,20 @@ per entity; embeddings of at most 16 384 finite components; numbers within
 validated after they are applied, like snapshots. An assessment never
 carries a non-finite number.
 
+Up to 64 judgments per change set, each with a rationale of at most 2048
+bytes and a source of at most 256 bytes. The `field` of `CompareText` is at
+most 256 bytes.
+
 ## Known limits
 
 * Lexical measures do not understand synonyms; send embeddings for semantic
   comparison (the engine is model-agnostic — any sentence-embedding model).
 * Passage overlap is bag-of-words (no phrase matching: "credit card" is two
   words); titles are matched separately to make up for long descriptions.
+* The gray-zone rules (§2a) read English scope and negation words. A
+  change in another language is still flagged as a suspected paraphrase, a
+  term substitution or a near-threshold change, and a judge reads any
+  language.
 * A date's compression window does not know the entity's planned duration.
 * The stemmer and stop-words are English; other scripts are tokenized and
   compared exactly (typo alignment and lexicons still apply).

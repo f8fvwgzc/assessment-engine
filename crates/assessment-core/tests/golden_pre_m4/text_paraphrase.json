@@ -1,0 +1,123 @@
+{
+  "score": 0.7252802913117422,
+  "level": "high",
+  "recommendation": "partial_replan",
+  "confidence": 0.9,
+  "severity": 0.6819023610214444,
+  "breadth": 0.30685606245964997,
+  "effort_at_risk": 1.2956144859407444,
+  "effort_total": 2.0,
+  "replan_root": "P",
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.6819023610214444,
+      "local_score": 0.6819023610214444,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "none",
+          "magnitude": 0.8022380717899347,
+          "severity": 0.85,
+          "risk": 0.6819023610214444,
+          "breaking": true,
+          "additive": false,
+          "before": "Users can log in with their email address and password.",
+          "after": "People are able to sign in using e-mail and a password.",
+          "metrics": {
+            "char_similarity": 0.4181818181818182,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.19776192821006527,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 1.0,
+            "passages_modified": 0.0,
+            "passages_removed": 1.0,
+            "shingle_similarity": 0.0,
+            "tfidf_cosine": 0.10163066979112657,
+            "token_jaccard": 0.1
+          },
+          "explanation": "description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+        }
+      ],
+      "signals": [],
+      "bump": "major",
+      "previous_version": "1.0.0",
+      "next_version": "2.0.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 1,
+      "score": 0.6819023610214444,
+      "level": "high",
+      "action": "replan",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.6819023610214444,
+      "contributions": [],
+      "reasons": [
+        "changed description (major 1.0.0 → 2.0.0); content score 0.68, local score 0.68; strongest: description: change magnitude 0.80; dropped: address, email, log, user; added: able, mail, people, sign"
+      ]
+    },
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 2,
+      "score": 0.6137121249192999,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.6137121249192999,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.6137121249192999,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was removed (overlap 0.76)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Parent issue\" description changed; it is the closest match for text that was removed (overlap 0.76)"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "high impact (score 0.73, confidence 0.90); breaking change to \"Parent issue\"; 1 other item(s) affected, most: \"Child task\" (high, obsolete_candidate); recommendation: re-plan the work under \"Parent issue\"",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

@@ -30,6 +30,54 @@ jobs:
       - run: cargo clippy --locked --all --workspace --all-targets -- -D warnings
       - run: cargo test --locked --all --workspace
 
+  features:
+    name: Feature matrix and dependency guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: assessment-grpc without features
+        run: cargo clippy --locked -p assessment-grpc --no-default-features -- -D warnings
+      - name: assessment-grpc, client only
+        run: cargo clippy --locked -p assessment-grpc --no-default-features --features client -- -D warnings
+      - name: assessment-grpc, server only
+        run: cargo clippy --locked -p assessment-grpc --no-default-features --features server -- -D warnings
+      - name: assessment-judge without the Anthropic client
+        run: cargo clippy --locked -p assessment-judge --no-default-features -- -D warnings
+      - name: assessment-server without the judge
+        run: cargo clippy --locked -p assessment-server --no-default-features --all-targets -- -D warnings
+      - name: assessment-core depends on four crates only
+        run: |
+          got=$(cargo tree --locked -p assessment-core -e normal --depth 1 --prefix none --target all \
+            | awk '{print $1}' | sort -u | tr '\n' ' ')
+          want="assessment-core chrono serde serde_json thiserror "
+          if [ "$got" != "$want" ]; then
+            echo "assessment-core dependencies changed: $got"
+            exit 1
+          fi
+      - name: A client-only build has no judge, HTTP client or TLS crate
+        run: |
+          found=$(cargo tree --locked -p assessment-grpc --no-default-features --features client \
+            -e normal --prefix none --target all \
+            | grep -E '^(assessment-judge|reqwest|hyper-rustls|tokio-rustls|rustls[a-z-]*|aws-lc-[a-z]+|ring|openssl[a-z-]*|native-tls) ' || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            exit 1
+          fi
+      - name: A server built without the judge has no HTTP client or TLS crate
+        run: |
+          found=$(cargo tree --locked -p assessment-server --no-default-features \
+            -e normal --prefix none --target all \
+            | grep -E '^(reqwest|hyper-rustls|tokio-rustls|rustls[a-z-]*|aws-lc-[a-z]+|ring|openssl[a-z-]*|native-tls) ' || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            exit 1
+          fi
+
   msrv:
     name: Rust 1.88 (MSRV)
     runs-on: ubuntu-24.04
@@ -65,3 +113,18 @@ jobs:
           done
           docker logs engine
           exit 1
+      - name: The image has a CA bundle
+        run: docker run --rm --entrypoint test assessment-engine:ci -s /etc/ssl/certs/ca-certificates.crt
+      # No network and a dummy key: the judge cannot be reached, and the
+      # result must still be the engine's own.
+      - name: The judge fails open without a network
+        run: |
+          jq '.options.judge = true' examples/requests/paraphrase.core.json \
+            | docker run --rm -i --network none -e ANTHROPIC_API_KEY=dummy \
+                assessment-engine:ci assess --judge - > judged.json
+          jq -e '
+            .changes[0].bump == "major"
+            and ([.changes[0].fields[] | select(.field == "description")][0].judgment
+                 | .status == "unavailable"
+                   and ((.detail // "") | test("certificat"; "i") | not))
+          ' judged.json

@@ -3,12 +3,14 @@
 //! * `assessment-engine [serve] [--addr …]` serves `assessment.v1` with
 //!   health and reflection (the default when no subcommand is given).
 //! * `assessment-engine assess <file|->`, `policy` and `compare-text` run the
-//!   core engine directly, without a network, and print JSON.
+//!   core engine directly, without a network, and print JSON. Only
+//!   `assess --judge` uses the network: it asks a model about flagged texts.
 //! * `assessment-engine health` asks a running server whether it serves
 //!   (for container health checks).
 
 mod commands;
 mod health;
+mod judge;
 mod serve;
 
 use std::io::IsTerminal;
@@ -148,6 +150,10 @@ pub(crate) struct ServeArgs {
     /// Log format (the level comes from `RUST_LOG`, default `info`).
     #[arg(long, env = "ASSESSMENT_LOG_FORMAT", value_enum, default_value_t = LogFormat::Pretty)]
     pub log_format: LogFormat,
+
+    /// The optional judge (off by default).
+    #[command(flatten)]
+    pub judge: judge::JudgeArgs,
 }
 
 /// Parses a slot count: a whole number from 1 to [`MAX_SLOTS`].
@@ -194,6 +200,16 @@ struct AssessArgs {
     /// A partial policy (JSON) merged over the default policy.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
+
+    /// Ask a model about the flagged text changes. It needs an API key in
+    /// `ANTHROPIC_API_KEY` or in `--anthropic-api-key-file`. A judge that
+    /// fails never fails the command: the fields are then `unavailable`.
+    #[arg(long)]
+    judge: bool,
+
+    /// The judge options. They do nothing without `--judge`.
+    #[command(flatten)]
+    client: judge::JudgeClientArgs,
 }
 
 #[derive(Debug, Args)]
@@ -213,9 +229,29 @@ struct CompareTextArgs {
     #[arg(long)]
     after: String,
 
+    /// The field the texts belong to. It decides when `gray_zone` is set.
+    #[arg(long, value_enum, default_value_t = TextField::Description)]
+    field: TextField,
+
     /// A partial policy (JSON) merged over the default policy.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
+}
+
+/// A text field of an entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TextField {
+    Description,
+    Title,
+}
+
+impl TextField {
+    fn name(self) -> &'static str {
+        match self {
+            TextField::Description => assessment_core::model::field::DESCRIPTION,
+            TextField::Title => assessment_core::model::field::TITLE,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -242,7 +278,12 @@ async fn main() -> Result<()> {
         Some(Command::Assess(args)) => {
             init_tracing(LogFormat::Pretty, "warn")?;
             let engine = engine_with_policy(args.policy.as_deref())?;
-            commands::assess(&engine, &args.input)
+            if args.judge {
+                let stack = judge::for_cli(&args.client, judge::key_from_env())?;
+                commands::assess_judged(engine, &args.input, stack).await
+            } else {
+                commands::assess(&engine, &args.input)
+            }
         }
         Some(Command::Policy(args)) => {
             init_tracing(LogFormat::Pretty, "warn")?;
@@ -252,7 +293,7 @@ async fn main() -> Result<()> {
         Some(Command::CompareText(args)) => {
             init_tracing(LogFormat::Pretty, "warn")?;
             let engine = engine_with_policy(args.policy.as_deref())?;
-            commands::compare_text(&engine, &args.before, &args.after)
+            commands::compare_text(&engine, args.field.name(), &args.before, &args.after)
         }
         Some(Command::Health(args)) => {
             let timeout = Duration::from_secs(args.timeout_secs.max(1));
@@ -406,7 +447,38 @@ mod tests {
             "b",
         ])
         .expect("parses");
-        assert!(matches!(cli.command, Some(Command::CompareText(_))));
+        let Some(Command::CompareText(args)) = cli.command else {
+            panic!("expected the compare-text subcommand");
+        };
+        assert_eq!(args.field, TextField::Description);
+        let cli = Cli::try_parse_from([
+            "assessment-engine",
+            "compare-text",
+            "--before",
+            "a",
+            "--after",
+            "b",
+            "--field",
+            "title",
+        ])
+        .expect("parses");
+        let Some(Command::CompareText(args)) = cli.command else {
+            panic!("expected the compare-text subcommand");
+        };
+        assert_eq!(args.field.name(), "title");
+        assert!(
+            Cli::try_parse_from([
+                "assessment-engine",
+                "compare-text",
+                "--before",
+                "a",
+                "--after",
+                "b",
+                "--field",
+                "labels",
+            ])
+            .is_err()
+        );
         let cli = Cli::try_parse_from(["assessment-engine", "assess", "-"]).expect("parses");
         assert!(matches!(cli.command, Some(Command::Assess(_))));
         let cli = Cli::try_parse_from(["assessment-engine", "health"]).expect("parses");

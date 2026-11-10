@@ -85,13 +85,15 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod prelude {
     pub use crate::assessment::{
         Action, Assessment, BasisStatus, ChangeAssessment, ChangeType, Channel, EntityImpact,
-        ImpactLevel, Recommendation, Violation, ViolationKind,
+        FieldJudgment, ImpactLevel, JudgmentKey, JudgmentReason, JudgmentRequest, JudgmentStatus,
+        Recommendation, Violation, ViolationKind,
     };
     pub use crate::engine::Engine;
     pub use crate::error::{Error, ErrorKind};
     pub use crate::model::{
         ActivityEvent, AssessOptions, AssessmentRequest, BasisPin, ChangeSet, Entity, EntityKind,
-        FieldChange, FieldValue, HistoryPoint, RelationKind, StatusCategory, field,
+        FieldChange, FieldValue, HistoryPoint, RelationKind, StatusCategory, TextJudgment,
+        TextRelation, field,
     };
     pub use crate::policy::Policy;
     pub use crate::registry::{PutOptions, Registry};

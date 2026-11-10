@@ -1,0 +1,42 @@
+{
+  "now": "2026-11-09T09:00:00Z",
+  "options": { "judgmentTexts": true },
+  "changes": [
+    {
+      "entityId": "ENG-21",
+      "before": {
+        "id": "ENG-21",
+        "kind": "issue",
+        "version": { "major": 1 },
+        "fields": {
+          "title": { "text": "Sign-in for the customer portal" },
+          "description": { "text": "Users can log in with their email address and password." },
+          "status": { "status": { "category": "STATUS_CATEGORY_STARTED", "name": "In Progress" } }
+        }
+      },
+      "after": {
+        "id": "ENG-21",
+        "kind": "issue",
+        "version": { "major": 1 },
+        "fields": {
+          "title": { "text": "Sign-in for the customer portal" },
+          "description": { "text": "People are able to sign in using e-mail and a password." },
+          "status": { "status": { "category": "STATUS_CATEGORY_STARTED", "name": "In Progress" } }
+        }
+      }
+    }
+  ],
+  "context": [
+    {
+      "id": "ENG-22",
+      "kind": "sub_issue",
+      "parentId": "ENG-21",
+      "basis": [{ "entityId": "ENG-21", "version": { "major": 1 } }],
+      "fields": {
+        "title": { "text": "Login form" },
+        "description": { "text": "Users can log in with their email address and password." },
+        "status": { "status": { "category": "STATUS_CATEGORY_STARTED", "name": "In Progress" } }
+      }
+    }
+  ]
+}

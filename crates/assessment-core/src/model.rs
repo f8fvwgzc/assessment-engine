@@ -746,6 +746,100 @@ pub struct ChangeSet {
     pub field_changes: Vec<FieldChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<ActivityEvent>,
+    /// What a reader decided about text fields of this change. The engine
+    /// never asks for them. It uses one only when its fingerprint matches
+    /// the field's two texts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judgments: Vec<TextJudgment>,
+}
+
+/// How the new text of a field relates to the old one, in meaning.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRelation {
+    /// Both texts ask for the same thing.
+    Equivalent,
+    /// The new text asks for everything the old one did, and more.
+    Extended,
+    /// The new text asks for less, or allows less.
+    Narrowed,
+    /// The new text asks for something else.
+    Replaced,
+    /// The new text asks for the opposite.
+    Reversed,
+    /// The reader could not tell.
+    #[default]
+    Undetermined,
+}
+
+impl TextRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextRelation::Equivalent => "equivalent",
+            TextRelation::Extended => "extended",
+            TextRelation::Narrowed => "narrowed",
+            TextRelation::Replaced => "replaced",
+            TextRelation::Reversed => "reversed",
+            TextRelation::Undetermined => "undetermined",
+        }
+    }
+
+    /// Whether the relation can only raise a change's magnitude.
+    pub fn is_raising(self) -> bool {
+        matches!(
+            self,
+            TextRelation::Narrowed | TextRelation::Replaced | TextRelation::Reversed
+        )
+    }
+}
+
+fn full_confidence() -> f64 {
+    1.0
+}
+
+/// A reader's judgment of one text change (a person or a model; the engine
+/// does not care which).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextJudgment {
+    /// The field the judgment is about, such as `description`.
+    pub field: String,
+    /// [`crate::text::fingerprint`] of the two texts that were judged.
+    pub fingerprint: String,
+    pub relation: TextRelation,
+    /// How sure the reader is, `[0, 1]`.
+    #[serde(default = "full_confidence")]
+    pub confidence: f64,
+    /// Why, in the reader's words. It is passed through, never interpreted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    /// Who judged, such as a model name. It is passed through.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
+impl TextJudgment {
+    /// A judgment of `field` with full confidence.
+    pub fn new(
+        field: impl Into<String>,
+        fingerprint: impl Into<String>,
+        relation: TextRelation,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            fingerprint: fingerprint.into(),
+            relation,
+            confidence: 1.0,
+            rationale: String::new(),
+            source: String::new(),
+        }
+    }
+
+    pub fn with_confidence(mut self, confidence: f64) -> Self {
+        self.confidence = confidence;
+        self
+    }
 }
 
 impl ChangeSet {
@@ -795,6 +889,11 @@ impl ChangeSet {
         self.events.extend(events);
         self
     }
+
+    pub fn with_judgments(mut self, judgments: Vec<TextJudgment>) -> Self {
+        self.judgments.extend(judgments);
+        self
+    }
 }
 
 /// A past change of an entity, for volatility and anomaly statistics.
@@ -817,6 +916,14 @@ pub struct AssessOptions {
     pub explain: bool,
     /// At most this many contributions per impact.
     pub max_contributions: usize,
+    /// Whether a server may ask its judge about flagged text changes.
+    /// `None` leaves it to the server. The engine itself ignores it: it
+    /// never calls a judge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judge: Option<bool>,
+    /// Include the two full texts in every judgment request.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub judgment_texts: bool,
 }
 
 impl Default for AssessOptions {
@@ -825,6 +932,8 @@ impl Default for AssessOptions {
             top_k: 100,
             explain: true,
             max_contributions: 5,
+            judge: None,
+            judgment_texts: false,
         }
     }
 }
