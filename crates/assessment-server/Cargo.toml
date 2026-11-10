@@ -16,10 +16,17 @@ categories.workspace = true
 name = "assessment-engine"
 path = "src/main.rs"
 
+[features]
+default = ["judge"]
+# The HTTP client for the Anthropic Messages API. Without it the binary has
+# no judge and `--judge on` is refused.
+judge = ["assessment-judge/anthropic"]
+
 [dependencies]
 anyhow.workspace = true
 assessment-core.workspace = true
 assessment-grpc.workspace = true
+assessment-judge = { version = "0.1.0", path = "../assessment-judge", default-features = false }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

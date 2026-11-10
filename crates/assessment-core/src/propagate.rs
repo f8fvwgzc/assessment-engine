@@ -670,7 +670,6 @@ impl<'a> Propagator<'a> {
             added: if owned.added { 1.0 } else { added },
             modified: if owned.modified { 1.0 } else { modified_abs },
         };
-        let (removed, added, modified) = (effective.removed, effective.added, effective.modified);
         let mut overlap = effective.max();
         if let (Some(dir), Some(emb)) = (&delta.embedding_delta, &target.embedding)
             && let Some(align) = direction_alignment(dir, emb)
@@ -685,10 +684,20 @@ impl<'a> Propagator<'a> {
             }
             _ => pp.relevance_floor + (1.0 - pp.relevance_floor) * overlap,
         };
+        // An applied judgment leaves only a share of the owner floors and
+        // of the overlaps the notes and the hit report. Relevance is not
+        // scaled. Shares of `(1, 1)` change nothing.
+        let (rs, cs) = delta.shares();
+        let (removed_abs, modified_abs) = (removed_abs * rs, modified_abs * cs);
+        let (removed, added, modified) = (
+            effective.removed * rs,
+            effective.added * cs,
+            effective.modified * cs,
+        );
         let magnitude = if owned.removed {
-            m.max(pp.removed_owner_magnitude)
+            m.max(rs * pp.removed_owner_magnitude)
         } else if owned.modified {
-            m.max(pp.reworded_owner_magnitude)
+            m.max(cs * pp.reworded_owner_magnitude)
         } else {
             m
         };

@@ -17,7 +17,18 @@
 //!   `ACTIVITY_KIND_UNSPECIFIED`, which means a comment.
 //! * An empty `embedding` is no embedding; an empty `author` is no author.
 //! * An absent `AssessOptions` (or an unset field of it) takes the core
-//!   defaults: `top_k` 100, `explain` true, `max_contributions` 5.
+//!   defaults: `top_k` 100, `explain` true, `max_contributions` 5, `judge`
+//!   unset, `judgment_texts` false.
+//! * A `TextJudgment` in a request is checked strictly. Its `relation` must
+//!   be set, and its `confidence` must be finite and in `[0, 1]`; an unset
+//!   confidence is 1. The error names the field, e.g.
+//!   `changes[0].judgments[1].relation: text relation is unspecified`.
+//! * Judgment data in a response is read leniently, so that an older client
+//!   can read a newer server. An unknown `JudgmentStatus` becomes
+//!   `unavailable` with a `detail` that names the value. An unknown or
+//!   unspecified relation of a `FieldJudgment` is no relation. An unknown
+//!   relation of a stored `TextJudgment` is `undetermined`. Unknown reason
+//!   strings are dropped.
 //! * Timestamps must be normalized: `nanos` in `[0, 999_999_999]` and
 //!   seconds within chrono's range.
 //! * `google.protobuf.Struct` numbers are doubles; whole numbers (up to
@@ -34,13 +45,14 @@ use std::fmt;
 
 use assessment_core::assessment::{
     Action, Assessment, BasisStatus, ChangeAssessment, ChangeType, Channel, Contribution,
-    Direction, EntityImpact, FieldAssessment, FieldChangeKind, ImpactLevel, Modifier,
-    Recommendation, Signal, SignalCategory, Violation, ViolationKind,
+    Direction, EntityImpact, FieldAssessment, FieldChangeKind, FieldJudgment, ImpactLevel,
+    JudgmentKey, JudgmentReason, JudgmentRequest, JudgmentStatus, Modifier, Recommendation, Signal,
+    SignalCategory, Violation, ViolationKind,
 };
 use assessment_core::model::{
     ActivityEvent, ActivityKind, AssessOptions, AssessmentRequest, BasisPin, ChangeSet, Entity,
     EntityKind, FieldChange, FieldValue, HistoryPoint, Ordinal, Relation, RelationKind, Status,
-    StatusCategory,
+    StatusCategory, TextJudgment, TextRelation,
 };
 use assessment_core::policy::Policy;
 use assessment_core::registry::{
@@ -48,7 +60,7 @@ use assessment_core::registry::{
     StaleEntry, VersionRecord,
 };
 use assessment_core::semver::{SemVer, VersionBump};
-use assessment_core::text::{StructureDiff, TextDiff};
+use assessment_core::text::{GrayZone, StructureDiff, TextDiff};
 use chrono::{DateTime, Utc};
 use prost_types::value::Kind as JsonKind;
 
@@ -327,6 +339,63 @@ enum_conversions! {
         EstimateOverflow <=> EstimateOverflow,
         Overdue <=> Overdue,
     }
+    text_relation_from_pb, text_relation_to_pb: TextRelation <=> pb::TextRelation, "text relation" {
+        Equivalent <=> Equivalent,
+        Extended <=> Extended,
+        Narrowed <=> Narrowed,
+        Replaced <=> Replaced,
+        Reversed <=> Reversed,
+        Undetermined <=> Undetermined,
+    }
+}
+
+fn judgment_status_to_pb(status: JudgmentStatus) -> i32 {
+    match status {
+        JudgmentStatus::Requested => pb::JudgmentStatus::Requested,
+        JudgmentStatus::OverBudget => pb::JudgmentStatus::OverBudget,
+        JudgmentStatus::Applied => pb::JudgmentStatus::Applied,
+        JudgmentStatus::Stale => pb::JudgmentStatus::Stale,
+        JudgmentStatus::Inconclusive => pb::JudgmentStatus::Inconclusive,
+        JudgmentStatus::NotFlagged => pb::JudgmentStatus::NotFlagged,
+        JudgmentStatus::Unavailable => pb::JudgmentStatus::Unavailable,
+    }
+    .into()
+}
+
+/// A status this build does not know (or an unspecified one) is `None`.
+fn judgment_status_from_pb(value: i32) -> Option<JudgmentStatus> {
+    match pb::JudgmentStatus::try_from(value).ok()? {
+        pb::JudgmentStatus::Unspecified => None,
+        pb::JudgmentStatus::Requested => Some(JudgmentStatus::Requested),
+        pb::JudgmentStatus::OverBudget => Some(JudgmentStatus::OverBudget),
+        pb::JudgmentStatus::Applied => Some(JudgmentStatus::Applied),
+        pb::JudgmentStatus::Stale => Some(JudgmentStatus::Stale),
+        pb::JudgmentStatus::Inconclusive => Some(JudgmentStatus::Inconclusive),
+        pb::JudgmentStatus::NotFlagged => Some(JudgmentStatus::NotFlagged),
+        pb::JudgmentStatus::Unavailable => Some(JudgmentStatus::Unavailable),
+    }
+}
+
+/// The wire name of every reason. Reasons are strings on the wire so that
+/// new ones can be added.
+const JUDGMENT_REASONS: [JudgmentReason; 5] = [
+    JudgmentReason::NegationChanged,
+    JudgmentReason::ScopeQualifier,
+    JudgmentReason::TermSubstitution,
+    JudgmentReason::ParaphraseSuspected,
+    JudgmentReason::NearThreshold,
+];
+
+fn reasons_to_pb(reasons: Vec<JudgmentReason>) -> Vec<String> {
+    reasons.into_iter().map(|r| r.as_str().to_owned()).collect()
+}
+
+/// Unknown reasons are dropped.
+fn reasons_from_pb(reasons: Vec<String>) -> Vec<JudgmentReason> {
+    reasons
+        .iter()
+        .filter_map(|name| JUDGMENT_REASONS.into_iter().find(|r| r.as_str() == name))
+        .collect()
 }
 
 /// `ACTIVITY_KIND_UNSPECIFIED` means a comment, as the core default does.
@@ -706,8 +775,71 @@ impl From<ChangeSet> for pb::ChangeSet {
             after: c.after.map(Into::into),
             field_changes: c.field_changes.into_iter().map(Into::into).collect(),
             events: c.events.into_iter().map(Into::into).collect(),
+            judgments: c.judgments.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+impl From<TextJudgment> for pb::TextJudgment {
+    fn from(j: TextJudgment) -> Self {
+        Self {
+            field: j.field,
+            fingerprint: j.fingerprint,
+            relation: text_relation_to_pb(j.relation),
+            confidence: Some(j.confidence),
+            rationale: j.rationale,
+            source: j.source,
+        }
+    }
+}
+
+/// The strict reading, for requests: the relation must be set, and the
+/// confidence must be finite and in `[0, 1]` (unset = 1).
+impl TryFrom<pb::TextJudgment> for TextJudgment {
+    type Error = ConvertError;
+
+    fn try_from(j: pb::TextJudgment) -> Result<Self> {
+        let confidence = j.confidence.unwrap_or(1.0);
+        if !confidence.is_finite() {
+            return Err(ConvertError::new("confidence is not finite").field("confidence"));
+        }
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(
+                ConvertError::new(format!("confidence {confidence} is outside [0, 1]"))
+                    .field("confidence"),
+            );
+        }
+        Ok(TextJudgment {
+            field: j.field,
+            fingerprint: j.fingerprint,
+            relation: text_relation_from_pb(j.relation).at("relation")?,
+            confidence,
+            rationale: j.rationale,
+            source: j.source,
+        })
+    }
+}
+
+/// The lenient reading, for responses: a relation this build does not know
+/// is `undetermined`, and the confidence is taken as it is.
+fn stored_judgment_from_pb(j: pb::TextJudgment) -> TextJudgment {
+    TextJudgment {
+        field: j.field,
+        fingerprint: j.fingerprint,
+        relation: text_relation_from_pb(j.relation).unwrap_or(TextRelation::Undetermined),
+        confidence: j.confidence.unwrap_or(1.0),
+        rationale: j.rationale,
+        source: j.source,
+    }
+}
+
+/// The judgments of a request message, checked strictly. Errors are
+/// prefixed with `name[i]`.
+pub(crate) fn judgments_from_pb(
+    judgments: Vec<pb::TextJudgment>,
+    name: &'static str,
+) -> Result<Vec<TextJudgment>> {
+    list(judgments, TextJudgment::try_from).at(name)
 }
 
 impl TryFrom<pb::ChangeSet> for ChangeSet {
@@ -715,6 +847,7 @@ impl TryFrom<pb::ChangeSet> for ChangeSet {
 
     fn try_from(c: pb::ChangeSet) -> Result<Self> {
         Ok(ChangeSet {
+            judgments: judgments_from_pb(c.judgments, "judgments")?,
             entity_id: c.entity_id,
             before: entity_opt(c.before).at("before")?,
             after: entity_opt(c.after).at("after")?,
@@ -752,6 +885,8 @@ impl From<AssessOptions> for pb::AssessOptions {
             top_k: Some(to_u32(o.top_k)),
             explain: Some(o.explain),
             max_contributions: Some(to_u32(o.max_contributions)),
+            judge: o.judge,
+            judgment_texts: o.judgment_texts,
         }
     }
 }
@@ -760,6 +895,8 @@ impl From<pb::AssessOptions> for AssessOptions {
     fn from(o: pb::AssessOptions) -> Self {
         let defaults = AssessOptions::default();
         AssessOptions {
+            judge: o.judge,
+            judgment_texts: o.judgment_texts,
             top_k: o.top_k.map_or(defaults.top_k, to_usize),
             explain: o.explain.unwrap_or(defaults.explain),
             max_contributions: o
@@ -769,7 +906,8 @@ impl From<pb::AssessOptions> for AssessOptions {
     }
 }
 
-fn options_from_pb(o: Option<pb::AssessOptions>) -> AssessOptions {
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub(crate) fn options_from_pb(o: Option<pb::AssessOptions>) -> AssessOptions {
     o.map(Into::into).unwrap_or_default()
 }
 
@@ -901,6 +1039,122 @@ impl From<FieldAssessment> for pb::FieldAssessment {
             after: f.after,
             metrics: f.metrics,
             explanation: f.explanation,
+            judgment: f.judgment.map(Into::into),
+        }
+    }
+}
+
+impl From<FieldJudgment> for pb::FieldJudgment {
+    fn from(j: FieldJudgment) -> Self {
+        Self {
+            status: judgment_status_to_pb(j.status),
+            reasons: reasons_to_pb(j.reasons),
+            fingerprint: j.fingerprint,
+            lexical_magnitude: j.lexical_magnitude,
+            relation: j
+                .relation
+                .map_or(pb::TextRelation::Unspecified.into(), text_relation_to_pb),
+            confidence: j.confidence,
+            weight: j.weight,
+            rationale: j.rationale,
+            source: j.source,
+            detail: j.detail,
+        }
+    }
+}
+
+/// Lenient: see the module rules.
+impl From<pb::FieldJudgment> for FieldJudgment {
+    fn from(j: pb::FieldJudgment) -> Self {
+        let (status, detail) = match judgment_status_from_pb(j.status) {
+            Some(status) => (status, j.detail),
+            None => {
+                let note = format!("unknown judgment status {}", j.status);
+                let detail = if j.detail.is_empty() {
+                    note
+                } else {
+                    format!("{note}: {}", j.detail)
+                };
+                (JudgmentStatus::Unavailable, detail)
+            }
+        };
+        FieldJudgment {
+            status,
+            reasons: reasons_from_pb(j.reasons),
+            fingerprint: j.fingerprint,
+            lexical_magnitude: j.lexical_magnitude,
+            relation: text_relation_from_pb(j.relation).ok(),
+            confidence: j.confidence,
+            weight: j.weight,
+            rationale: j.rationale,
+            source: j.source,
+            detail,
+        }
+    }
+}
+
+impl From<JudgmentRequest> for pb::JudgmentRequest {
+    fn from(r: JudgmentRequest) -> Self {
+        Self {
+            change_index: to_u32(r.change_index),
+            entity_id: r.entity_id,
+            field: r.field,
+            fingerprint: r.fingerprint,
+            reasons: reasons_to_pb(r.reasons),
+            lexical_magnitude: r.lexical_magnitude,
+            before: r.before,
+            after: r.after,
+        }
+    }
+}
+
+impl From<pb::JudgmentRequest> for JudgmentRequest {
+    fn from(r: pb::JudgmentRequest) -> Self {
+        JudgmentRequest {
+            change_index: to_usize(r.change_index),
+            entity_id: r.entity_id,
+            field: r.field,
+            fingerprint: r.fingerprint,
+            reasons: reasons_from_pb(r.reasons),
+            lexical_magnitude: r.lexical_magnitude,
+            before: r.before,
+            after: r.after,
+        }
+    }
+}
+
+impl From<JudgmentKey> for pb::JudgmentKey {
+    fn from(k: JudgmentKey) -> Self {
+        Self {
+            entity_id: k.entity_id,
+            field: k.field,
+        }
+    }
+}
+
+impl From<pb::JudgmentKey> for JudgmentKey {
+    fn from(k: pb::JudgmentKey) -> Self {
+        JudgmentKey {
+            entity_id: k.entity_id,
+            field: k.field,
+        }
+    }
+}
+
+impl From<GrayZone> for pb::GrayZone {
+    fn from(g: GrayZone) -> Self {
+        Self {
+            reasons: reasons_to_pb(g.reasons),
+            fingerprint: g.fingerprint,
+        }
+    }
+}
+
+impl From<pb::GrayZone> for GrayZone {
+    fn from(g: pb::GrayZone) -> Self {
+        GrayZone {
+            reasons: reasons_from_pb(g.reasons),
+            fingerprint: g.fingerprint,
         }
     }
 }
@@ -910,6 +1164,7 @@ impl TryFrom<pb::FieldAssessment> for FieldAssessment {
 
     fn try_from(f: pb::FieldAssessment) -> Result<Self> {
         Ok(FieldAssessment {
+            judgment: f.judgment.map(Into::into),
             field: f.field,
             change: field_change_kind_from_pb(f.change).at("change")?,
             direction: direction_from_pb(f.direction).at("direction")?,
@@ -1089,6 +1344,8 @@ impl From<Assessment> for pb::Assessment {
             summary: a.summary,
             engine_version: a.engine_version,
             assessed_at: Some(timestamp_to_pb(a.assessed_at)),
+            judgment_requests: a.judgment_requests.into_iter().map(Into::into).collect(),
+            unmatched_judgments: a.unmatched_judgments.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1098,6 +1355,8 @@ impl TryFrom<pb::Assessment> for Assessment {
 
     fn try_from(a: pb::Assessment) -> Result<Self> {
         Ok(Assessment {
+            judgment_requests: a.judgment_requests.into_iter().map(Into::into).collect(),
+            unmatched_judgments: a.unmatched_judgments.into_iter().map(Into::into).collect(),
             score: a.score,
             level: impact_level_from_pb(a.level).at("level")?,
             recommendation: recommendation_from_pb(a.recommendation).at("recommendation")?,
@@ -1188,6 +1447,7 @@ impl From<TextDiff> for pb::CompareTextResponse {
             passages_removed: d.passages_removed,
             passages_modified: d.passages_modified,
             reordered: d.reordered,
+            gray_zone: d.gray_zone.map(Into::into),
         }
     }
 }
@@ -1201,6 +1461,7 @@ impl TryFrom<pb::CompareTextResponse> for TextDiff {
             usize::try_from(n).map_err(|_| ConvertError::new(format!("{n} does not fit in usize")))
         };
         Ok(TextDiff {
+            gray_zone: d.gray_zone.map(Into::into),
             magnitude: d.magnitude,
             lexical_similarity: d.lexical_similarity,
             char_similarity: d.char_similarity,
@@ -1240,6 +1501,7 @@ impl From<VersionRecord> for pb::VersionRecord {
             level: impact_level_to_pb(r.level),
             changed_fields: r.changed_fields,
             snapshot: r.snapshot.map(Into::into),
+            judgments: r.judgments.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1249,6 +1511,11 @@ impl TryFrom<pb::VersionRecord> for VersionRecord {
 
     fn try_from(r: pb::VersionRecord) -> Result<Self> {
         Ok(VersionRecord {
+            judgments: r
+                .judgments
+                .into_iter()
+                .map(stored_judgment_from_pb)
+                .collect(),
             version: required(r.version).at("version")?.into(),
             bump: version_bump_from_pb(r.bump).at("bump")?,
             at: timestamp_from_pb(required(r.at).at("at")?).at("at")?,
@@ -1328,6 +1595,8 @@ pub fn put_request_to_pb(entity: Entity, options: PutOptions) -> pb::PutEntityRe
         disable_auto_pin: !options.auto_pin,
         options: Some(options.assess.into()),
         source_seq: options.source_seq,
+        judgments: options.judgments.into_iter().map(Into::into).collect(),
+        hold_if_flagged: options.hold_if_flagged,
     }
 }
 
@@ -1337,6 +1606,8 @@ pub fn put_request_from_pb(
 ) -> Result<(Entity, PutOptions), ConvertError> {
     let entity = entity_field(request.entity)?;
     let options = PutOptions {
+        judgments: judgments_from_pb(request.judgments, "judgments")?,
+        hold_if_flagged: request.hold_if_flagged,
         dry_run: request.dry_run,
         expected_version: request.expected_version.map(Into::into),
         events: list(request.events, ActivityEvent::try_from).at("events")?,

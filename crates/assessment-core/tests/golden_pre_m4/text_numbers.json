@@ -1,0 +1,123 @@
+{
+  "score": 0.5240253416649265,
+  "level": "high",
+  "recommendation": "partial_replan",
+  "confidence": 0.9,
+  "severity": 0.47170710054685716,
+  "breadth": 0.22950000000000004,
+  "effort_at_risk": 0.9307071005468572,
+  "effort_total": 2.0,
+  "replan_root": "P",
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.47170710054685716,
+      "local_score": 0.47170710054685716,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.554949530055126,
+          "severity": 0.85,
+          "risk": 0.4717071005468571,
+          "breaking": true,
+          "additive": false,
+          "before": "Support 100 concurrent users",
+          "after": "Support 10000 concurrent users",
+          "metrics": {
+            "char_similarity": 0.9333333333333333,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.6142257781447504,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 1.0,
+            "passages_added": 0.0,
+            "passages_modified": 1.0,
+            "passages_removed": 0.0,
+            "shingle_similarity": 0.2,
+            "tfidf_cosine": 0.6029748160380572,
+            "token_jaccard": 0.6
+          },
+          "explanation": "description: change magnitude 0.55; 1 number(s) changed; dropped: 100; added: 10000"
+        }
+      ],
+      "signals": [],
+      "bump": "major",
+      "previous_version": "1.0.0",
+      "next_version": "2.0.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (major 1.0.0 → 2.0.0); content score 0.47, local score 0.47; strongest: description: change magnitude 0.55; 1 number(s) changed; dropped: 100; added: 10000"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 1,
+      "score": 0.47170710054685716,
+      "level": "medium",
+      "action": "review",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.47170710054685716,
+      "contributions": [],
+      "reasons": [
+        "changed description (major 1.0.0 → 2.0.0); content score 0.47, local score 0.47; strongest: description: change magnitude 0.55; 1 number(s) changed; dropped: 100; added: 10000"
+      ]
+    },
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 2,
+      "score": 0.4590000000000001,
+      "level": "medium",
+      "action": "update_scope",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.4590000000000001,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.459,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.53)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.53)"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "high impact (score 0.52, confidence 0.90); breaking change to \"Parent issue\"; 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: re-plan the work under \"Parent issue\"",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

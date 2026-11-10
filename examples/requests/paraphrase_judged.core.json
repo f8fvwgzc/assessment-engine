@@ -1,0 +1,52 @@
+{
+  "now": "2026-11-09T09:00:00Z",
+  "options": { "judgment_texts": true },
+  "changes": [
+    {
+      "entity_id": "ENG-21",
+      "before": {
+        "id": "ENG-21",
+        "kind": "issue",
+        "version": "1.0.0",
+        "fields": {
+          "title": { "type": "text", "value": "Sign-in for the customer portal" },
+          "description": { "type": "text", "value": "Users can log in with their email address and password." },
+          "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } }
+        }
+      },
+      "after": {
+        "id": "ENG-21",
+        "kind": "issue",
+        "version": "1.0.0",
+        "fields": {
+          "title": { "type": "text", "value": "Sign-in for the customer portal" },
+          "description": { "type": "text", "value": "People are able to sign in using e-mail and a password." },
+          "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } }
+        }
+      },
+      "judgments": [
+        {
+          "field": "description",
+          "fingerprint": "a5092b8fdb1115a48435979471ef040eb3f920811cb6bfdca108c7393e2d56b5",
+          "relation": "equivalent",
+          "confidence": 0.9,
+          "rationale": "Both texts say that a user signs in with an email address and a password.",
+          "source": "example/reviewer"
+        }
+      ]
+    }
+  ],
+  "context": [
+    {
+      "id": "ENG-22",
+      "kind": "sub_issue",
+      "parent_id": "ENG-21",
+      "basis": [{ "entity_id": "ENG-21", "version": "1.0.0" }],
+      "fields": {
+        "title": { "type": "text", "value": "Login form" },
+        "description": { "type": "text", "value": "Users can log in with their email address and password." },
+        "status": { "type": "status", "value": { "category": "started", "name": "In Progress" } }
+      }
+    }
+  ]
+}

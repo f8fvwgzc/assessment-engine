@@ -1,0 +1,41 @@
+[package]
+name = "assessment-judge"
+description = "Optional model judge for the assessment engine: reads a flagged text change and says how its meaning changed"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["anthropic"]
+# The HTTP client for the Anthropic Messages API. Without it the crate has
+# no HTTP or TLS dependency.
+anthropic = ["dep:reqwest"]
+
+[dependencies]
+assessment-core.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "anthropic_http"
+required-features = ["anthropic"]
+
+[[example]]
+name = "judge_cases"
+required-features = ["anthropic"]
+
+[lints]
+workspace = true

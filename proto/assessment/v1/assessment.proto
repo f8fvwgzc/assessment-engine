@@ -20,6 +20,17 @@
 //
 // Scores are in [0, 1]. Timestamps are UTC. Unknown string values of open
 // vocabularies (entity kinds, field names) are accepted.
+//
+// Judgments. The engine compares texts by their words. When it doubts that
+// reading of a changed title or description, it flags the field: the field
+// gets a `judgment` report, the assessment loses some confidence, and
+// `Assessment.judgment_requests` lists what to judge. A reader (a person or
+// a model) answers with a `TextJudgment` that carries the request's `field`
+// and `fingerprint`, and the caller sends the change again with it. A
+// judgment for other texts is reported as stale and changes nothing. A
+// server may also have a judge of its own (see `GetPolicyResponse.judge`).
+// Judging never fails a call: when no usable judgment arrives, the answer
+// is the word-level result, and the field's status says why.
 syntax = "proto3";
 
 package assessment.v1;
@@ -216,6 +227,44 @@ message ChangeSet {
   Entity after = 3;
   repeated FieldChange field_changes = 4;
   repeated ActivityEvent events = 5;
+  // Judgments of this change's text fields, at most one per field and at
+  // most 64. See `TextJudgment`.
+  repeated TextJudgment judgments = 6;
+}
+
+// How the new text of a field relates to the old one, in meaning.
+enum TextRelation {
+  TEXT_RELATION_UNSPECIFIED = 0;
+  // Both texts ask for the same thing.
+  TEXT_RELATION_EQUIVALENT = 1;
+  // The new text asks for everything the old one did, and more.
+  TEXT_RELATION_EXTENDED = 2;
+  // The new text asks for less, or allows less.
+  TEXT_RELATION_NARROWED = 3;
+  // The new text asks for something else.
+  TEXT_RELATION_REPLACED = 4;
+  // The new text asks for the opposite.
+  TEXT_RELATION_REVERSED = 5;
+  // The reader could not tell.
+  TEXT_RELATION_UNDETERMINED = 6;
+}
+
+// A reader's judgment of one text change. In a request, `relation` must be
+// set and `confidence` must be in [0, 1].
+message TextJudgment {
+  // The field the judgment is about, such as `description`.
+  string field = 1;
+  // The `fingerprint` of the judgment request this answers: lowercase hex
+  // SHA-256 of `<len(before)>:<before>,<len(after)>:<after>,` with the
+  // lengths in UTF-8 bytes. An absent text counts as empty.
+  string fingerprint = 2;
+  TextRelation relation = 3;
+  // How sure the reader is, [0, 1]. Unset = 1.
+  optional double confidence = 4;
+  // Why, in the reader's words (at most 2048 bytes). Passed through.
+  string rationale = 5;
+  // Who judged, such as a model name (at most 256 bytes). Passed through.
+  string source = 6;
 }
 
 // A past change, for churn and anomaly statistics.
@@ -234,6 +283,11 @@ message AssessOptions {
   optional bool explain = 2;
   // At most this many contributions per impact. Unset = 5.
   optional uint32 max_contributions = 3;
+  // Whether the server may ask its own judge about flagged text changes.
+  // Unset = the server's default. Without a server judge it has no effect.
+  optional bool judge = 4;
+  // Include the two full texts in every judgment request.
+  bool judgment_texts = 5;
 }
 
 message AssessRequest {
@@ -393,6 +447,76 @@ message FieldAssessment {
   optional string after = 10;
   map<string, double> metrics = 11;
   string explanation = 12;
+  // The judgment state of a text field. Absent when the field is not
+  // flagged and no judgment was supplied for it.
+  FieldJudgment judgment = 13;
+}
+
+// What happened to the judgment of one text field. Clients should read an
+// unknown value as UNAVAILABLE.
+enum JudgmentStatus {
+  JUDGMENT_STATUS_UNSPECIFIED = 0;
+  // Flagged, with no usable judgment: one is asked for in
+  // `Assessment.judgment_requests`.
+  JUDGMENT_STATUS_REQUESTED = 1;
+  // Flagged, but beyond the request budget (policy `judge.max_requests`).
+  JUDGMENT_STATUS_OVER_BUDGET = 2;
+  // The supplied judgment was used.
+  JUDGMENT_STATUS_APPLIED = 3;
+  // The supplied judgment is about other texts: its fingerprint differs.
+  JUDGMENT_STATUS_STALE = 4;
+  // The supplied judgment is undetermined or not confident enough.
+  JUDGMENT_STATUS_INCONCLUSIVE = 5;
+  // A judgment was supplied for a field the engine did not flag.
+  JUDGMENT_STATUS_NOT_FLAGGED = 6;
+  // The server asked its judge and got no answer; `detail` says why.
+  JUDGMENT_STATUS_UNAVAILABLE = 7;
+}
+
+// The judgment state of one text field.
+message FieldJudgment {
+  JudgmentStatus status = 1;
+  // Why the field is flagged (empty when it is not), strongest first. An
+  // open vocabulary: negation_changed | scope_qualifier | term_substitution |
+  // paraphrase_suspected | near_threshold. More may be added; skip the ones
+  // you do not know.
+  repeated string reasons = 2;
+  // The fingerprint of the field's two texts.
+  string fingerprint = 3;
+  // The magnitude before any judgment.
+  double lexical_magnitude = 4;
+  // The supplied relation; unspecified when no judgment was supplied.
+  TextRelation relation = 5;
+  // The supplied confidence.
+  optional double confidence = 6;
+  // How much of the judgment was applied, [0, 1]. Only when applied.
+  optional double weight = 7;
+  string rationale = 8;
+  string source = 9;
+  // A note on the status, such as why the judge was unavailable.
+  string detail = 10;
+}
+
+// A text change the engine would like judged.
+message JudgmentRequest {
+  // The index of the change in the request's `changes`.
+  uint32 change_index = 1;
+  string entity_id = 2;
+  string field = 3;
+  // What the judgment must carry to be used.
+  string fingerprint = 4;
+  // See `FieldJudgment.reasons`.
+  repeated string reasons = 5;
+  double lexical_magnitude = 6;
+  // The two texts; only with `AssessOptions.judgment_texts`.
+  optional string before = 7;
+  optional string after = 8;
+}
+
+// A supplied judgment the engine found no use for.
+message JudgmentKey {
+  string entity_id = 1;
+  string field = 2;
 }
 
 message ChangeAssessment {
@@ -473,6 +597,12 @@ message Assessment {
   string summary = 14;
   string engine_version = 15;
   google.protobuf.Timestamp assessed_at = 16;
+  // The flagged text changes that still need a judgment, most important
+  // first. Answer them with `ChangeSet.judgments` (or
+  // `PutEntityRequest.judgments`, `CompareVersionsRequest.judgments`).
+  repeated JudgmentRequest judgment_requests = 17;
+  // Supplied judgments of fields that did not change.
+  repeated JudgmentKey unmatched_judgments = 18;
 }
 
 // A per-item error inside a batch or a stream.
@@ -502,6 +632,9 @@ message CompareTextRequest {
   string after = 2;
   repeated float before_embedding = 3;
   repeated float after_embedding = 4;
+  // The field the texts belong to; it decides whether and why the change
+  // would be flagged. Empty = description.
+  string field = 5;
 }
 
 message StructureDiff {
@@ -540,6 +673,17 @@ message CompareTextResponse {
   uint32 passages_modified = 19;
   // Same content, only order or layout changed.
   bool reordered = 20;
+  // Set when an assessment would flag this change for a judgment. No
+  // judgment is applied here and no judge is asked.
+  GrayZone gray_zone = 21;
+}
+
+// Why a text change is flagged for a judgment, and the fingerprint a
+// judgment of it must carry.
+message GrayZone {
+  // See `FieldJudgment.reasons`.
+  repeated string reasons = 1;
+  string fingerprint = 2;
 }
 
 message GetPolicyRequest {
@@ -550,6 +694,9 @@ message GetPolicyRequest {
 message GetPolicyResponse {
   google.protobuf.Struct policy = 1;
   string policy_json = 2;
+  // The id of the server's judge, such as a model name. Empty = the server
+  // has no judge: flagged fields are only reported.
+  string judge = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +713,8 @@ message VersionRecord {
   repeated string changed_fields = 7;
   // Absent for a deletion.
   Entity snapshot = 8;
+  // The judgments that were applied to the change that made this version.
+  repeated TextJudgment judgments = 9;
 }
 
 message PutEntityRequest {
@@ -585,6 +734,14 @@ message PutEntityRequest {
   // above the one stored for the item is skipped: see `skipped_stale`.
   // Absent = always apply, and keep the stored sequence.
   optional uint64 source_seq = 8;
+  // Judgments of this put's text changes. The applied ones are kept with
+  // the version and used again by CompareVersions.
+  repeated TextJudgment judgments = 9;
+  // Store nothing when the assessment asks for a judgment (no judgment was
+  // sent for a flagged field, or the one sent is stale): the response has
+  // `stored` false and the requests in `assessment.judgment_requests`. Put
+  // again with the judgments (or without this flag) to store the change.
+  bool hold_if_flagged = 10;
 }
 
 message PutEntityResponse {
@@ -663,6 +820,10 @@ message CompareVersionsRequest {
   SemVer from = 2;
   SemVer to = 3;
   google.protobuf.Timestamp now = 4;
+  AssessOptions options = 5;
+  // Judgments of the text changes between the two versions. One of these
+  // goes before a stored judgment of the same field.
+  repeated TextJudgment judgments = 6;
 }
 
 message CompareVersionsResponse {

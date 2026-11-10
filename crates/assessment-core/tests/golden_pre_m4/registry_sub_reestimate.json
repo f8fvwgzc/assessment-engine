@@ -1,0 +1,496 @@
+{
+  "entity": {
+    "id": "X-2",
+    "kind": "sub_issue",
+    "parent_id": "X",
+    "version": "2.0.0",
+    "fields": {
+      "description": {
+        "type": "text",
+        "value": "metrics report mobile profile alert theme audit upload. reset audit payment email metrics google queue profile. search settings."
+      },
+      "estimate": {
+        "type": "number",
+        "value": 8.0
+      },
+      "status": {
+        "type": "status",
+        "value": {
+          "category": "unstarted",
+          "name": "Status"
+        }
+      },
+      "title": {
+        "type": "text",
+        "value": "Password reset email flow"
+      }
+    },
+    "basis": [
+      {
+        "entity_id": "X",
+        "version": "1.2.0"
+      }
+    ],
+    "updated_at": "2026-11-09T09:00:00Z"
+  },
+  "created": false,
+  "stored": true,
+  "bump": "major",
+  "assessment": {
+    "score": 0.42771561905994093,
+    "level": "medium",
+    "recommendation": "review",
+    "confidence": 1.0,
+    "severity": 0.405,
+    "breadth": 0.09272839603908832,
+    "effort_at_risk": 8.139580277211738,
+    "effort_total": 31.0,
+    "changes": [
+      {
+        "entity_id": "X-2",
+        "kind": "sub_issue",
+        "change_type": "updated",
+        "raw_score": 0.4137658684732026,
+        "local_score": 0.3300331333020561,
+        "modifiers": [
+          {
+            "name": "phase",
+            "factor": 0.75,
+            "detail": "the entity is unstarted"
+          }
+        ],
+        "fields": [
+          {
+            "field": "estimate",
+            "change": "modified",
+            "direction": "increase",
+            "magnitude": 0.689609780788671,
+            "severity": 0.6,
+            "risk": 0.41376586847320257,
+            "breaking": true,
+            "additive": false,
+            "before": "3",
+            "after": "8",
+            "metrics": {
+              "delta": 5.0,
+              "log_ratio": 0.8109302162163288,
+              "ratio": 2.25
+            },
+            "explanation": "estimate: increased from 3 to 8"
+          }
+        ],
+        "signals": [],
+        "bump": "major",
+        "previous_version": "1.0.0",
+        "next_version": "2.0.0",
+        "propagation_truncated": false,
+        "explanation": "changed estimate (major 1.0.0 → 2.0.0); content score 0.41, local score 0.33; strongest: estimate: increased from 3 to 8"
+      }
+    ],
+    "impacts": [
+      {
+        "entity_id": "X",
+        "kind": "issue",
+        "rank": 1,
+        "score": 0.405,
+        "level": "medium",
+        "action": "re_estimate",
+        "channel": "up",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 13.0,
+        "effort_at_risk": 5.265000000000001,
+        "contributions": [
+          {
+            "source_id": "X-2",
+            "field": "estimate",
+            "channel": "up",
+            "path": [
+              "X-2",
+              "X"
+            ],
+            "value": 0.29992130549590396,
+            "detail": "child \"Password reset email flow\" estimate changed; 29% of its effort"
+          }
+        ],
+        "reasons": [
+          "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13",
+          "child \"Password reset email flow\" estimate changed; 29% of its effort"
+        ]
+      },
+      {
+        "entity_id": "X-2",
+        "kind": "sub_issue",
+        "rank": 2,
+        "score": 0.3300331333020561,
+        "level": "medium",
+        "action": "review",
+        "channel": "self",
+        "distance": 0,
+        "changed": true,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 8.0,
+        "effort_at_risk": 2.6402650664164486,
+        "contributions": [],
+        "reasons": [
+          "changed estimate (major 1.0.0 → 2.0.0); content score 0.41, local score 0.33; strongest: estimate: increased from 3 to 8",
+          "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13"
+        ]
+      },
+      {
+        "entity_id": "P0",
+        "kind": "project",
+        "rank": 3,
+        "score": 0.08753460475507213,
+        "level": "low",
+        "action": "re_estimate",
+        "channel": "up",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 1.0,
+        "effort_at_risk": 0.08753460475507213,
+        "contributions": [
+          {
+            "source_id": "X-2",
+            "field": "estimate",
+            "channel": "up",
+            "path": [
+              "X-2",
+              "X",
+              "P0"
+            ],
+            "value": 0.08753460475507212,
+            "detail": "descendant \"Password reset email flow\" estimate changed; 11% of its effort"
+          }
+        ],
+        "reasons": [
+          "descendant \"Password reset email flow\" estimate changed; 11% of its effort"
+        ]
+      },
+      {
+        "entity_id": "X-4",
+        "kind": "sub_issue",
+        "rank": 4,
+        "score": 0.01937649303335287,
+        "level": "none",
+        "action": "none",
+        "channel": "sibling",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 3.0,
+        "effort_at_risk": 0.05812947910005861,
+        "contributions": [
+          {
+            "source_id": "X-2",
+            "field": "estimate",
+            "channel": "sibling",
+            "path": [
+              "X-2",
+              "X-4"
+            ],
+            "value": 0.0168705734341446,
+            "detail": "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+          }
+        ],
+        "reasons": [
+          "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13",
+          "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+        ]
+      },
+      {
+        "entity_id": "X-1",
+        "kind": "sub_issue",
+        "rank": 5,
+        "score": 0.016870573434144553,
+        "level": "none",
+        "action": "none",
+        "channel": "sibling",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 3.0,
+        "effort_at_risk": 0.05061172030243366,
+        "contributions": [
+          {
+            "source_id": "X-2",
+            "field": "estimate",
+            "channel": "sibling",
+            "path": [
+              "X-2",
+              "X-1"
+            ],
+            "value": 0.0168705734341446,
+            "detail": "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+          }
+        ],
+        "reasons": [
+          "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13",
+          "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+        ]
+      },
+      {
+        "entity_id": "X-3",
+        "kind": "sub_issue",
+        "rank": 6,
+        "score": 0.012679802212574365,
+        "level": "none",
+        "action": "none",
+        "channel": "sibling",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 3.0,
+        "effort_at_risk": 0.038039406637723094,
+        "contributions": [
+          {
+            "source_id": "X-2",
+            "field": "estimate",
+            "channel": "sibling",
+            "path": [
+              "X-2",
+              "X-3"
+            ],
+            "value": 0.0168705734341446,
+            "detail": "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+          }
+        ],
+        "reasons": [
+          "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13",
+          "sibling \"Password reset email flow\" estimate changed; competes for the same parent"
+        ]
+      }
+    ],
+    "impacts_total": 6,
+    "violations": [
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S0",
+          "S0-0",
+          "S0-1",
+          "S0-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"search settings account google webhook refund.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S1",
+          "S1-0",
+          "S1-1",
+          "S1-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"reset billing billing login footer password.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S10",
+          "S10-0",
+          "S10-1",
+          "S10-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"retry oauth billing settings footer search.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S11",
+          "S11-0",
+          "S11-1",
+          "S11-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"cache alert invoice export upload session.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S11",
+          "S11-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"cache alert invoice export upload session.\" is completed while \"footer login alert metrics password layout.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S11",
+          "S11-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"cache alert invoice export upload session.\" is completed while \"session webhook payment oauth audit filter.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S2",
+          "S2-0",
+          "S2-1",
+          "S2-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"layout desktop invoice cache login webhook.\" are estimated at 12 in total, above its own 3"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S3",
+          "S3-0",
+          "S3-1",
+          "S3-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"profile avatar layout audit webhook payment.\" are estimated at 10 in total, above its own 4"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S3",
+          "S3-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"profile avatar layout audit webhook payment.\" is completed while \"search search billing audit oauth search.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S3",
+          "S3-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"profile avatar layout audit webhook payment.\" is completed while \"reset email footer reset checkout password.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S4",
+          "S4-0",
+          "S4-1",
+          "S4-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"invoice portal theme upload footer import.\" are estimated at 8 in total, above its own 5"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S5",
+          "S5-0",
+          "S5-1",
+          "S5-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"upload refund session mobile login settings.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S6",
+          "S6-0",
+          "S6-1",
+          "S6-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"portal upload email queue webhook billing.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S7",
+          "S7-0",
+          "S7-1",
+          "S7-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"report google reset reset footer export checkout.\" are estimated at 12 in total, above its own 3"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S7",
+          "S7-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"report google reset reset footer export checkout.\" is completed while \"reset desktop upload metrics checkout cache.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S7",
+          "S7-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"report google reset reset footer export checkout.\" is completed while \"layout avatar profile token report upload.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S8",
+          "S8-0",
+          "S8-1",
+          "S8-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"google payment oauth import login password.\" are estimated at 10 in total, above its own 4"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S9",
+          "S9-0",
+          "S9-1",
+          "S9-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"export report account billing webhook portal.\" are estimated at 8 in total, above its own 5"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "X",
+          "X-1",
+          "X-2",
+          "X-3",
+          "X-4"
+        ],
+        "severity": 0.45,
+        "introduced": true,
+        "message": "children of \"Authentication for the customer portal\" are estimated at 17 in total, above its own 13"
+      }
+    ],
+    "summary": "medium impact (score 0.43, confidence 1.00); breaking change to \"Password reset email flow\"; 2 other item(s) affected, most: \"Authentication for the customer portal\" (medium, re_estimate); \"Project P0\" (low, re_estimate); 1 plan conflict(s) introduced; recommendation: review",
+    "engine_version": "",
+    "assessed_at": "2026-11-09T09:00:00Z"
+  }
+}

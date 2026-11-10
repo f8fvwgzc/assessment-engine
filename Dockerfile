@@ -30,10 +30,11 @@ LABEL org.opencontainers.image.title="assessment-engine" \
       org.opencontainers.image.source="https://github.com/f8fvwgzc/assessment-engine" \
       org.opencontainers.image.licenses="MIT"
 
+# ca-certificates: the optional judge calls its API over TLS.
 # Debian security updates move package versions; the base image tag is the pin.
 # hadolint ignore=DL3008
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends tini ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 assessment \
  && useradd --system --uid 10001 --gid assessment --no-create-home --home-dir /nonexistent \
@@ -44,6 +45,12 @@ COPY --from=builder /out/assessment-engine /usr/local/bin/assessment-engine
 
 # Stateless by default: `Assess` needs no storage. Set ASSESSMENT_JOURNAL=/data/registry.jsonl
 # (and mount /data) to keep the registry of the stateful calls (PutEntity, …) across restarts.
+#
+# The judge is off by default. To turn it on, set ASSESSMENT_JUDGE=on (or auto) and give the API
+# key at run time as a secret: mount it as a file and set ANTHROPIC_API_KEY_FILE to its path, for
+# example /run/secrets/anthropic_api_key. Never put a key into the image, a build argument or an
+# ENV line here. A server with a judge also needs ASSESSMENT_AUTH_TOKEN, because it listens on
+# 0.0.0.0.
 ENV ASSESSMENT_ADDR=0.0.0.0:50061 \
     ASSESSMENT_LOG_FORMAT=json
 

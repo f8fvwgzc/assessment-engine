@@ -37,8 +37,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::TextPolicy;
+use crate::assessment::JudgmentReason;
+use crate::policy::{JudgePolicy, TextPolicy};
 use crate::stats::{clamp01, noisy_or};
+
+mod sha256;
 
 // ---- limits and constants ---------------------------------------------------
 
@@ -205,6 +208,53 @@ pub struct TextDiff {
     /// Same sentences, list items and headings, only their order or layout
     /// changed (the magnitude is then near zero).
     pub reordered: bool,
+    /// Why the wording alone may misread this change, when it is flagged
+    /// for a judgment. Filled by [`crate::Engine::compare_text`] only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gray_zone: Option<GrayZone>,
+}
+
+/// Why a text change is flagged for a judgment, and the fingerprint a
+/// judgment of it must carry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrayZone {
+    pub reasons: Vec<JudgmentReason>,
+    pub fingerprint: String,
+}
+
+impl TextDiff {
+    /// Nothing planned against the old text went away: no passage or list
+    /// item removed or reworded, no negation or requirement-strength change.
+    pub fn nothing_lost(&self) -> bool {
+        self.passages_removed == 0
+            && self.passages_modified == 0
+            && self.structure.items_removed == 0
+            && self.structure.items_modified == 0
+            && self.negation_flips == 0
+            && self.modal_shifts == 0
+    }
+}
+
+/// The fingerprint of a text change: lowercase hex SHA-256 of
+/// `"{len(before)}:{before},{len(after)}:{after},"`, with lengths in UTF-8
+/// bytes. A judgment applies only to the change with its fingerprint.
+pub fn fingerprint(before: &str, after: &str) -> String {
+    let (lb, la) = (before.len().to_string(), after.len().to_string());
+    sha256::hex(&[
+        lb.as_bytes(),
+        b":",
+        before.as_bytes(),
+        b",",
+        la.as_bytes(),
+        b":",
+        after.as_bytes(),
+        b",",
+    ])
+}
+
+/// The number of tokens in a text (for validating policy phrases).
+pub(crate) fn token_count(text: &str) -> usize {
+    raw_tokens(text).len()
 }
 
 /// Document frequencies over a set of texts, for IDF weighting.
@@ -273,6 +323,8 @@ struct Passage {
     modal: BTreeMap<String, Strength>,
     /// Number-like terms (with a digit).
     numbers: BTreeMap<String, u32>,
+    /// How many negation words the passage has.
+    negations: u32,
     /// The passage's tokens in order, space-separated.
     text: String,
 }
@@ -285,6 +337,7 @@ impl Passage {
         let mut numbers = BTreeMap::new();
         let mut negated = BTreeMap::new();
         let mut modal: BTreeMap<String, Strength> = BTreeMap::new();
+        let mut negations = 0u32;
         let next_term = |i: usize| {
             roles[i + 1..roles.len().min(i + 4)]
                 .iter()
@@ -302,6 +355,7 @@ impl Passage {
                     }
                 }
                 Role::Negation => {
+                    negations = negations.saturating_add(1);
                     if let Some(t) = next_term(i) {
                         *negated.entry(t).or_insert(0u32) += 1;
                     }
@@ -326,6 +380,7 @@ impl Passage {
             negated,
             modal,
             numbers,
+            negations,
             text,
         };
         p.rekey();
@@ -1532,6 +1587,8 @@ struct PassagePairing {
     removed: Vec<usize>,
     /// Passages of `b` with no counterpart.
     added: Vec<usize>,
+    /// Unchanged `(a, b)` passage pairs (the same identity).
+    kept: Vec<(usize, usize)>,
 }
 
 fn passage_keys(x: &Analysis) -> Vec<&str> {
@@ -1569,10 +1626,16 @@ fn pair_passages(a: &Analysis, b: &Analysis) -> PassagePairing {
             .map(|(k, _)| *k)
             .collect()
     };
+    let kept = partner
+        .iter()
+        .enumerate()
+        .filter_map(|(i, j)| j.map(|j| (i, j)))
+        .collect();
     PassagePairing {
         removed: unpaired(&gone, &paired_gone),
         added: unpaired(&new, &paired_new),
         reworded,
+        kept,
     }
 }
 
@@ -1689,6 +1752,9 @@ pub(crate) struct TextDelta {
     pub(crate) removed: Vec<SparseVec>,
     pub(crate) added: Vec<SparseVec>,
     pub(crate) modified: Vec<SparseVec>,
+    /// The `(removed, changed)` shares an applied judgment leaves of the
+    /// owner floors and overlaps. `None` without one.
+    judged: Option<(f64, f64)>,
 }
 
 /// How much a text change touches another text: the best cosine between
@@ -1720,6 +1786,29 @@ impl TextDelta {
             removed,
             added,
             modified,
+            judged: None,
+        }
+    }
+
+    /// The `(removed, changed)` shares of the owner floors and overlaps:
+    /// `(1, 1)` unless a judgment lowered them.
+    pub(crate) fn shares(&self) -> (f64, f64) {
+        self.judged.unwrap_or((1.0, 1.0))
+    }
+
+    /// Records an applied judgment's shares.
+    pub(crate) fn set_shares(&mut self, shares: (f64, f64)) {
+        self.judged = Some(shares);
+    }
+
+    /// Adds passages to the modified ones (kept passages whose scope a
+    /// judgment found narrowed), so their owners are reached.
+    pub(crate) fn add_modified(&mut self, extra: Vec<SparseVec>) {
+        let before = self.modified.len();
+        self.modified
+            .extend(extra.into_iter().filter(|v| !v.is_empty()));
+        if self.modified.len() != before {
+            self.index = PassageIndex::build(&self.removed, &self.added, &self.modified);
         }
     }
 
@@ -1893,6 +1982,38 @@ pub fn compare(
     compare_analyses(&a, &b, policy, corpus, embeddings)
 }
 
+/// [`compare`] against the two texts alone, with the reasons a field
+/// would be flagged for a judgment. `flags` is the judge policy and the
+/// field's breaking magnitude; `None` leaves the result unflagged.
+pub(crate) fn compare_flagged(
+    before: &str,
+    after: &str,
+    policy: &TextPolicy,
+    flags: Option<(&JudgePolicy, f64)>,
+    embeddings: Option<(&[f32], &[f32])>,
+) -> TextDiff {
+    let lex = Lexicon::new(policy);
+    let a = analyze_with(before, &lex);
+    let mut b = analyze_with(after, &lex);
+    align_typos(&a, &mut b, &lex);
+    let mut corpus = Corpus::new();
+    corpus.add_terms(a.counts.keys());
+    corpus.add_terms(b.counts.keys());
+    let (mut diff, mut parts) = compare_parts(&a, &b, policy, &corpus, embeddings);
+    if let Some((judge, breaking_magnitude)) = flags
+        && before != after
+    {
+        let reasons = gray_zone(&a, &b, &diff, &mut parts, judge, breaking_magnitude);
+        if !reasons.is_empty() {
+            diff.gray_zone = Some(GrayZone {
+                reasons,
+                fingerprint: fingerprint(before, after),
+            });
+        }
+    }
+    diff
+}
+
 /// How far a text of `longest` characters is into the long-text regime:
 /// 0 up to `short` characters, 1 from twice that, linear in between (so the
 /// lexical formula never jumps at a length).
@@ -1983,6 +2104,46 @@ pub(crate) fn compare_analyses(
     corpus: &Corpus,
     embeddings: Option<(&[f32], &[f32])>,
 ) -> TextDiff {
+    compare_parts(a, b, policy, corpus, embeddings).0
+}
+
+/// What a comparison keeps for a judgment: the base distance, the evidence
+/// and the passage pairing its magnitude was combined from.
+#[derive(Debug)]
+pub(crate) struct Parts {
+    base: f64,
+    evidence: Evidence,
+    pairing: PassagePairing,
+    both_empty: bool,
+    /// Unchanged passage pairs whose scope qualifiers differ; filled by
+    /// [`gray_zone`].
+    scope_kept: Vec<(usize, usize)>,
+}
+
+impl Parts {
+    /// The base distance the evidence was combined with.
+    pub(crate) fn base(&self) -> f64 {
+        self.base
+    }
+}
+
+/// The magnitude of the same change with another base distance.
+pub(crate) fn rejudge(parts: &Parts, base: f64, policy: &TextPolicy) -> f64 {
+    if parts.both_empty {
+        0.0
+    } else {
+        combine(base, &parts.evidence, policy)
+    }
+}
+
+/// [`compare_analyses`] plus the parts a judgment needs.
+pub(crate) fn compare_parts(
+    a: &Analysis,
+    b: &Analysis,
+    policy: &TextPolicy,
+    corpus: &Corpus,
+    embeddings: Option<(&[f32], &[f32])>,
+) -> (TextDiff, Parts) {
     let chars_before = a.char_count();
     let chars_after = b.char_count();
     let both_empty = a.normalized.is_empty() && b.normalized.is_empty();
@@ -2035,24 +2196,21 @@ pub(crate) fn compare_analyses(
     let structure = diff_structure(a, b);
     let pairing = pair_passages(a, b);
     let (negation_flips, modal_shifts, numbers_changed) = passage_evidence(a, b, &pairing);
+    let evidence = Evidence {
+        structural_edits: structure.edits(),
+        negation_flips,
+        modal_shifts,
+        numbers_changed,
+    };
     let magnitude = if both_empty {
         0.0
     } else {
-        combine(
-            base,
-            &Evidence {
-                structural_edits: structure.edits(),
-                negation_flips,
-                modal_shifts,
-                numbers_changed,
-            },
-            policy,
-        )
+        combine(base, &evidence, policy)
     };
 
     let added = count_delta(&a.counts, &b.counts);
     let removed = count_delta(&b.counts, &a.counts);
-    TextDiff {
+    let diff = TextDiff {
         magnitude,
         lexical_similarity: clamp01(lexical_similarity),
         char_similarity,
@@ -2073,7 +2231,189 @@ pub(crate) fn compare_analyses(
         passages_removed: to_u32(pairing.removed.len()),
         passages_modified: to_u32(pairing.reworded.len()),
         reordered,
+        gray_zone: None,
+    };
+    let parts = Parts {
+        base,
+        evidence,
+        pairing,
+        both_empty,
+        scope_kept: Vec::new(),
+    };
+    (diff, parts)
+}
+
+// ---- gray zone ----------------------------------------------------------------
+
+/// How often each phrase occurs in the texts, as whole token windows.
+fn phrase_counts<'a>(texts: impl Iterator<Item = &'a str>, phrases: &[Vec<String>]) -> Vec<u32> {
+    let mut counts = vec![0u32; phrases.len()];
+    for text in texts {
+        let tokens: Vec<&str> = text.split(' ').collect();
+        for (k, phrase) in phrases.iter().enumerate() {
+            if phrase.is_empty() || phrase.len() > tokens.len() {
+                continue;
+            }
+            let hits = tokens
+                .windows(phrase.len())
+                .filter(|w| w.iter().zip(phrase).all(|(x, y)| *x == y.as_str()))
+                .count();
+            counts[k] = counts[k].saturating_add(to_u32(hits));
+        }
     }
+    counts
+}
+
+/// Whether two words are near-identical words that the typo guard already
+/// reads as different words (`increase`/`decrease`, `internal`/`external`).
+fn told_apart(x: &str, y: &str) -> bool {
+    let (w, c): (Vec<char>, Vec<char>) = (x.chars().collect(), y.chars().collect());
+    let short = w.len().min(c.len());
+    let long = w.len().max(c.len());
+    if short <= SHORT_WORD_CHARS || long > MAX_TYPO_TOKEN_CHARS || long - short > 1 {
+        return false;
+    }
+    let mut budget = MAX_TYPO_CELLS;
+    changes_morpheme(&w, &c) && osa_within(&w, &c, long / 4, &mut budget).is_some()
+}
+
+/// Whether a reworded pair swaps a few terms for other terms.
+fn substitutes_terms(x: &Passage, y: &Passage, max: usize) -> bool {
+    let only = |p: &Passage, q: &Passage| -> Vec<String> {
+        p.terms
+            .keys()
+            .filter(|t| !q.terms.contains_key(*t) && !has_digit(t))
+            .cloned()
+            .collect()
+    };
+    let (mut gone, mut new) = (only(x, y), only(y, x));
+    // An inflected form of the same non-Latin word is not another word.
+    let inflected = |s: &str, t: &str| !s.is_ascii() && (t.starts_with(s) || s.starts_with(t));
+    gone.retain(|s| match new.iter().position(|t| inflected(s, t)) {
+        Some(k) => {
+            new.remove(k);
+            false
+        }
+        None => true,
+    });
+    if gone.len() == 1 && new.len() == 1 && told_apart(&gone[0], &new[0]) {
+        return false;
+    }
+    (1..=max).contains(&gone.len()) && (1..=max).contains(&new.len())
+}
+
+/// Why the wording alone may misread a modified text, in priority order;
+/// empty when the lexical reading can stand.
+///
+/// Never flagged: a reorder, a text over `max_text_chars`, an empty side,
+/// a removed list item or a negation flip (a judgment cannot undo the last
+/// two). `breaking_magnitude` is the field's own threshold.
+pub(crate) fn gray_zone(
+    a: &Analysis,
+    b: &Analysis,
+    diff: &TextDiff,
+    parts: &mut Parts,
+    judge: &JudgePolicy,
+    breaking_magnitude: f64,
+) -> Vec<JudgmentReason> {
+    parts.scope_kept.clear();
+    if diff.reordered
+        || a.normalized.is_empty()
+        || b.normalized.is_empty()
+        || diff.chars_before > judge.max_text_chars
+        || diff.chars_after > judge.max_text_chars
+        || diff.structure.items_removed > 0
+        || diff.negation_flips > 0
+    {
+        return Vec::new();
+    }
+    let m = diff.magnitude;
+    let lower = m < breaking_magnitude;
+    let nothing_lost = diff.nothing_lost();
+    let pairing = &parts.pairing;
+    let mut reasons = Vec::new();
+
+    if lower {
+        let reworded = pairing
+            .reworded
+            .iter()
+            .any(|&(i, j)| a.passages[i].negations != b.passages[j].negations);
+        let added = pairing.added.iter().any(|&j| {
+            b.passages[j]
+                .negated
+                .keys()
+                .any(|t| a.counts.contains_key(t))
+        });
+        if reworded || added {
+            reasons.push(JudgmentReason::NegationChanged);
+        }
+
+        let phrases: Vec<Vec<String>> = judge
+            .scope_qualifiers
+            .iter()
+            .map(|q| raw_tokens(q))
+            .collect();
+        let texts = |x: &'_ Analysis| -> Vec<u32> {
+            phrase_counts(x.segments.iter().map(String::as_str), &phrases)
+        };
+        if texts(a) != texts(b) {
+            reasons.push(JudgmentReason::ScopeQualifier);
+            let one = |p: &Passage| phrase_counts(std::iter::once(p.text.as_str()), &phrases);
+            let hits: Vec<(usize, usize)> = pairing
+                .kept
+                .iter()
+                .copied()
+                .filter(|&(i, j)| one(&a.passages[i]) != one(&b.passages[j]))
+                .collect();
+            parts.scope_kept = hits;
+        }
+
+        if !nothing_lost
+            && pairing.reworded.iter().any(|&(i, j)| {
+                substitutes_terms(&a.passages[i], &b.passages[j], judge.max_substituted_terms)
+            })
+        {
+            reasons.push(JudgmentReason::TermSubstitution);
+        }
+    }
+    if !nothing_lost && diff.passages_removed >= 1 && diff.passages_added >= 1 {
+        reasons.push(JudgmentReason::ParaphraseSuspected);
+    }
+    if !nothing_lost
+        && diff.structure.edits() == 0.0
+        && diff.modal_shifts == 0
+        && diff.numbers_changed == 0
+        && m >= breaking_magnitude - judge.near_below
+        && m < breaking_magnitude + judge.near_above
+    {
+        reasons.push(JudgmentReason::NearThreshold);
+    }
+    reasons
+}
+
+/// The kept passages whose scope qualifiers differ, as vectors of the old
+/// and new terms together (what [`text_delta`] builds for a reworded pair).
+pub(crate) fn scope_passages(
+    a: &Analysis,
+    b: &Analysis,
+    parts: &Parts,
+    corpus: &Corpus,
+) -> Vec<SparseVec> {
+    parts
+        .scope_kept
+        .iter()
+        .map(|&(i, j)| tfidf(&term_union(&a.passages[i], &b.passages[j]), corpus))
+        .collect()
+}
+
+/// The terms of both passages, with the larger count of each.
+fn term_union(x: &Passage, y: &Passage) -> BTreeMap<String, u32> {
+    let mut union = x.terms.clone();
+    for (t, c) in &y.terms {
+        let e = union.entry(t.clone()).or_insert(0);
+        *e = (*e).max(*c);
+    }
+    union
 }
 
 #[cfg(test)]

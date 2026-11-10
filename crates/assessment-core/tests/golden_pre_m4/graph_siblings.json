@@ -1,0 +1,720 @@
+{
+  "score": 0.8116208366256819,
+  "level": "critical",
+  "recommendation": "full_replan",
+  "confidence": 0.9,
+  "severity": 0.8054355492137639,
+  "breadth": 0.07759121973182527,
+  "effort_at_risk": 15.591682642079398,
+  "effort_total": 66.0,
+  "replan_root": "X",
+  "changes": [
+    {
+      "entity_id": "X",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.7644568963854821,
+      "local_score": 0.8054355492137639,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        },
+        {
+          "name": "time_pressure",
+          "factor": 1.1321914110001192,
+          "detail": "due in 18.6 days"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.8993610545711554,
+          "severity": 0.85,
+          "risk": 0.7644568963854821,
+          "breaking": true,
+          "additive": false,
+          "before": "Customers sign in to the portal. ## Acceptance criteria - [ ] Sign up and log…",
+          "after": "Customers sign in with their company identity. ## Acceptance criteria - [ ] L…",
+          "metrics": {
+            "char_similarity": 0.5066666666666666,
+            "items_added": 1.0,
+            "items_checked": 0.0,
+            "items_modified": 1.0,
+            "items_removed": 2.0,
+            "lexical_similarity": 0.4096949546733446,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 1.0,
+            "passages_added": 3.0,
+            "passages_modified": 1.0,
+            "passages_removed": 3.0,
+            "shingle_similarity": 0.22448979591836735,
+            "tfidf_cosine": 0.46560449743722576,
+            "token_jaccard": 0.4642857142857143
+          },
+          "explanation": "description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+        }
+      ],
+      "signals": [],
+      "bump": "major",
+      "previous_version": "1.2.0",
+      "next_version": "2.0.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (major 1.2.0 → 2.0.0); content score 0.76, local score 0.81; strongest: description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "X",
+      "kind": "issue",
+      "rank": 1,
+      "score": 0.8054355492137639,
+      "level": "critical",
+      "action": "replan",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 13.0,
+      "effort_at_risk": 10.47066213977893,
+      "contributions": [],
+      "reasons": [
+        "changed description (major 1.2.0 → 2.0.0); content score 0.76, local score 0.81; strongest: description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+      ]
+    },
+    {
+      "entity_id": "X-1",
+      "kind": "sub_issue",
+      "rank": 2,
+      "score": 0.688011206746934,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 3.0,
+      "effort_at_risk": 2.064033620240802,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "X",
+            "X-1"
+          ],
+          "value": 0.688011206746934,
+          "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.51)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.51)"
+      ]
+    },
+    {
+      "entity_id": "X-2",
+      "kind": "sub_issue",
+      "rank": 3,
+      "score": 0.5825502111531307,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 3.0,
+      "effort_at_risk": 1.747650633459392,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "X",
+            "X-2"
+          ],
+          "value": 0.688011206746934,
+          "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.23)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.23)"
+      ]
+    },
+    {
+      "entity_id": "X-4",
+      "kind": "sub_issue",
+      "rank": 4,
+      "score": 0.13115919554918853,
+      "level": "low",
+      "action": "notify",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 3.0,
+      "effort_at_risk": 0.3934775866475656,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "X",
+            "X-4"
+          ],
+          "value": 0.13115919554918853,
+          "detail": "parent \"Authentication for the customer portal\" description changed; text relevance 0.05"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; text relevance 0.05"
+      ]
+    },
+    {
+      "entity_id": "X-3",
+      "kind": "sub_issue",
+      "rank": 5,
+      "score": 0.11705929039491858,
+      "level": "low",
+      "action": "review",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 3.0,
+      "effort_at_risk": 0.35117787118475574,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "X",
+            "X-3"
+          ],
+          "value": 0.15295063418760227,
+          "detail": "parent \"Authentication for the customer portal\" description changed; text relevance 0.09"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; text relevance 0.09"
+      ]
+    },
+    {
+      "entity_id": "P0",
+      "kind": "project",
+      "rank": 6,
+      "score": 0.11466853445782232,
+      "level": "low",
+      "action": "notify",
+      "channel": "up",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.11466853445782232,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "up",
+          "path": [
+            "X",
+            "P0"
+          ],
+          "value": 0.11466853445782231,
+          "detail": "child \"Authentication for the customer portal\" description changed; text relevance 0.00"
+        }
+      ],
+      "reasons": [
+        "child \"Authentication for the customer portal\" description changed; text relevance 0.00"
+      ]
+    },
+    {
+      "entity_id": "S71",
+      "kind": "issue",
+      "rank": 7,
+      "score": 0.011951944541611081,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 2.0,
+      "effort_at_risk": 0.023903889083222163,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S71"
+          ],
+          "value": 0.011951944541611113,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+      ]
+    },
+    {
+      "entity_id": "S115",
+      "kind": "issue",
+      "rank": 8,
+      "score": 0.0118595559757253,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.0118595559757253,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S115"
+          ],
+          "value": 0.011859555975725284,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+      ]
+    },
+    {
+      "entity_id": "S23",
+      "kind": "issue",
+      "rank": 9,
+      "score": 0.011837563310813648,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 4.0,
+      "effort_at_risk": 0.04735025324325459,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S23"
+          ],
+          "value": 0.011837563310813641,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+      ]
+    },
+    {
+      "entity_id": "S175",
+      "kind": "issue",
+      "rank": 10,
+      "score": 0.011784790765085984,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.011784790765085984,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S175"
+          ],
+          "value": 0.011784790765086027,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.23"
+      ]
+    },
+    {
+      "entity_id": "S57",
+      "kind": "issue",
+      "rank": 11,
+      "score": 0.011693080444223347,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 3.0,
+      "effort_at_risk": 0.03507924133267004,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S57"
+          ],
+          "value": 0.011693080444223345,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+      ]
+    },
+    {
+      "entity_id": "S93",
+      "kind": "issue",
+      "rank": 12,
+      "score": 0.011553789059972841,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 4.0,
+      "effort_at_risk": 0.046215156239891364,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S93"
+          ],
+          "value": 0.011553789059972843,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+      ]
+    },
+    {
+      "entity_id": "S55",
+      "kind": "issue",
+      "rank": 13,
+      "score": 0.01154811549646062,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.01154811549646062,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S55"
+          ],
+          "value": 0.011548115496460617,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.22"
+      ]
+    },
+    {
+      "entity_id": "S159",
+      "kind": "issue",
+      "rank": 14,
+      "score": 0.01143914221795661,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 5.0,
+      "effort_at_risk": 0.05719571108978305,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S159"
+          ],
+          "value": 0.01143914221795666,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+      ]
+    },
+    {
+      "entity_id": "S1",
+      "kind": "issue",
+      "rank": 15,
+      "score": 0.01137786711345301,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 2.0,
+      "effort_at_risk": 0.02275573422690602,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S1"
+          ],
+          "value": 0.011377867113453035,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+      ]
+    },
+    {
+      "entity_id": "S195",
+      "kind": "issue",
+      "rank": 16,
+      "score": 0.011271657157045922,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.011271657157045922,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S195"
+          ],
+          "value": 0.011271657157045934,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+      ]
+    },
+    {
+      "entity_id": "S83",
+      "kind": "issue",
+      "rank": 17,
+      "score": 0.011264284678865089,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 4.0,
+      "effort_at_risk": 0.045057138715460354,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S83"
+          ],
+          "value": 0.011264284678865085,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+      ]
+    },
+    {
+      "entity_id": "S27",
+      "kind": "issue",
+      "rank": 18,
+      "score": 0.01119864739584897,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 3.0,
+      "effort_at_risk": 0.03359594218754691,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S27"
+          ],
+          "value": 0.011198647395848952,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.21"
+      ]
+    },
+    {
+      "entity_id": "S7",
+      "kind": "issue",
+      "rank": 19,
+      "score": 0.010342874748610509,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 3.0,
+      "effort_at_risk": 0.031028624245831526,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S7"
+          ],
+          "value": 0.010342874748610538,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.18"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.18"
+      ]
+    },
+    {
+      "entity_id": "S169",
+      "kind": "issue",
+      "rank": 20,
+      "score": 0.010263464637476849,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 5.0,
+      "effort_at_risk": 0.051317323187384245,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S169"
+          ],
+          "value": 0.010263464637476844,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.17"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.17"
+      ]
+    },
+    {
+      "entity_id": "S45",
+      "kind": "issue",
+      "rank": 21,
+      "score": 0.010049123363861767,
+      "level": "none",
+      "action": "none",
+      "channel": "sibling",
+      "distance": 2,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.010049123363861767,
+      "contributions": [
+        {
+          "source_id": "X",
+          "field": "description",
+          "channel": "sibling",
+          "path": [
+            "X",
+            "S45"
+          ],
+          "value": 0.010049123363861717,
+          "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.17"
+        }
+      ],
+      "reasons": [
+        "sibling \"Authentication for the customer portal\" description changed; text relevance 0.17"
+      ]
+    }
+  ],
+  "impacts_total": 21,
+  "violations": [],
+  "summary": "critical impact (score 0.81, confidence 0.90); breaking change to \"Authentication for the customer portal\"; 5 other item(s) affected, most: \"Email and password sign-up form\" (high, obsolete_candidate); \"Password reset email flow\" (high, obsolete_candidate); \"Rate limiting for failed logins\" (low, notify); recommendation: re-plan everything under \"Authentication for the customer portal\"",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

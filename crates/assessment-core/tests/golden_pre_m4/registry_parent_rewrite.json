@@ -1,0 +1,565 @@
+{
+  "entity": {
+    "id": "X",
+    "kind": "issue",
+    "parent_id": "P0",
+    "version": "2.0.0",
+    "fields": {
+      "description": {
+        "type": "text",
+        "value": "Customers sign in with their company identity.\n\n## Acceptance criteria\n- [ ] Log in with Google Workspace (OAuth 2.0 / OIDC)\n- [ ] Sessions expire after 7 days\n- [ ] Rate-limit failed logins\n\nPassword login is no longer needed."
+      },
+      "due_date": {
+        "type": "timestamp",
+        "value": "2026-11-28T00:00:00Z"
+      },
+      "estimate": {
+        "type": "number",
+        "value": 13.0
+      },
+      "status": {
+        "type": "status",
+        "value": {
+          "category": "started",
+          "name": "In Progress"
+        }
+      },
+      "title": {
+        "type": "text",
+        "value": "Authentication for the customer portal"
+      }
+    },
+    "basis": [
+      {
+        "entity_id": "P0",
+        "version": "1.0.0"
+      }
+    ],
+    "updated_at": "2026-11-09T09:00:00Z"
+  },
+  "created": false,
+  "stored": true,
+  "bump": "major",
+  "assessment": {
+    "score": 0.8182656983611116,
+    "level": "critical",
+    "recommendation": "full_replan",
+    "confidence": 0.9,
+    "severity": 0.8054355492137639,
+    "breadth": 0.15679429761692368,
+    "effort_at_risk": 15.331285365903565,
+    "effort_total": 31.0,
+    "replan_root": "X",
+    "changes": [
+      {
+        "entity_id": "X",
+        "kind": "issue",
+        "change_type": "updated",
+        "raw_score": 0.7644568963854821,
+        "local_score": 0.8054355492137639,
+        "modifiers": [
+          {
+            "name": "phase",
+            "factor": 1.0,
+            "detail": "the entity is started"
+          },
+          {
+            "name": "time_pressure",
+            "factor": 1.1321914110001192,
+            "detail": "due in 18.6 days"
+          }
+        ],
+        "fields": [
+          {
+            "field": "description",
+            "change": "modified",
+            "direction": "increase",
+            "magnitude": 0.8993610545711554,
+            "severity": 0.85,
+            "risk": 0.7644568963854821,
+            "breaking": true,
+            "additive": false,
+            "before": "Customers sign in to the portal. ## Acceptance criteria - [ ] Sign up and log…",
+            "after": "Customers sign in with their company identity. ## Acceptance criteria - [ ] L…",
+            "metrics": {
+              "char_similarity": 0.5066666666666666,
+              "items_added": 1.0,
+              "items_checked": 0.0,
+              "items_modified": 1.0,
+              "items_removed": 2.0,
+              "lexical_similarity": 0.4096949546733446,
+              "modal_shifts": 0.0,
+              "negation_flips": 0.0,
+              "numbers_changed": 1.0,
+              "passages_added": 3.0,
+              "passages_modified": 1.0,
+              "passages_removed": 3.0,
+              "shingle_similarity": 0.22448979591836735,
+              "tfidf_cosine": 0.46560449743722576,
+              "token_jaccard": 0.4642857142857143
+            },
+            "explanation": "description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+          }
+        ],
+        "signals": [],
+        "bump": "major",
+        "previous_version": "1.2.0",
+        "next_version": "2.0.0",
+        "propagation_truncated": false,
+        "explanation": "changed description (major 1.2.0 → 2.0.0); content score 0.76, local score 0.81; strongest: description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+      }
+    ],
+    "impacts": [
+      {
+        "entity_id": "X",
+        "kind": "issue",
+        "rank": 1,
+        "score": 0.8054355492137639,
+        "level": "critical",
+        "action": "replan",
+        "channel": "self",
+        "distance": 0,
+        "changed": true,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 13.0,
+        "effort_at_risk": 10.47066213977893,
+        "contributions": [],
+        "reasons": [
+          "changed description (major 1.2.0 → 2.0.0); content score 0.76, local score 0.81; strongest: description: change magnitude 0.90; list items +1 −2 ~1; 1 number(s) changed; dropped: email, 30, link, portal; added: 2.0, 7, company, google"
+        ]
+      },
+      {
+        "entity_id": "X-1",
+        "kind": "sub_issue",
+        "rank": 2,
+        "score": 0.688011206746934,
+        "level": "high",
+        "action": "obsolete_candidate",
+        "channel": "down",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "incompatible",
+        "basis_introduced": true,
+        "effort": 3.0,
+        "effort_at_risk": 2.064033620240802,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "down",
+            "path": [
+              "X",
+              "X-1"
+            ],
+            "value": 0.688011206746934,
+            "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.54)"
+          }
+        ],
+        "reasons": [
+          "it was planned against a version that has since changed in a breaking way",
+          "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.54)"
+        ]
+      },
+      {
+        "entity_id": "X-2",
+        "kind": "sub_issue",
+        "rank": 3,
+        "score": 0.5825502111531307,
+        "level": "high",
+        "action": "obsolete_candidate",
+        "channel": "down",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "incompatible",
+        "basis_introduced": true,
+        "effort": 3.0,
+        "effort_at_risk": 1.747650633459392,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "down",
+            "path": [
+              "X",
+              "X-2"
+            ],
+            "value": 0.688011206746934,
+            "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.35)"
+          }
+        ],
+        "reasons": [
+          "it was planned against a version that has since changed in a breaking way",
+          "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.35)"
+        ]
+      },
+      {
+        "entity_id": "X-4",
+        "kind": "sub_issue",
+        "rank": 4,
+        "score": 0.1516628158985247,
+        "level": "low",
+        "action": "notify",
+        "channel": "down",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "incompatible",
+        "basis_introduced": true,
+        "effort": 3.0,
+        "effort_at_risk": 0.4549884476955741,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "down",
+            "path": [
+              "X",
+              "X-4"
+            ],
+            "value": 0.15166281589852476,
+            "detail": "parent \"Authentication for the customer portal\" description changed; text relevance 0.08"
+          }
+        ],
+        "reasons": [
+          "it was planned against a version that has since changed in a breaking way",
+          "parent \"Authentication for the customer portal\" description changed; text relevance 0.08"
+        ]
+      },
+      {
+        "entity_id": "X-3",
+        "kind": "sub_issue",
+        "rank": 5,
+        "score": 0.13905688064367394,
+        "level": "low",
+        "action": "review",
+        "channel": "down",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "incompatible",
+        "basis_introduced": true,
+        "effort": 3.0,
+        "effort_at_risk": 0.4171706419310218,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "down",
+            "path": [
+              "X",
+              "X-3"
+            ],
+            "value": 0.18097100017652173,
+            "detail": "parent \"Authentication for the customer portal\" description changed; text relevance 0.13"
+          }
+        ],
+        "reasons": [
+          "it was planned against a version that has since changed in a breaking way",
+          "parent \"Authentication for the customer portal\" description changed; text relevance 0.13"
+        ]
+      },
+      {
+        "entity_id": "P0",
+        "kind": "project",
+        "rank": 6,
+        "score": 0.11466853445782232,
+        "level": "low",
+        "action": "notify",
+        "channel": "up",
+        "distance": 1,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 1.0,
+        "effort_at_risk": 0.11466853445782232,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "up",
+            "path": [
+              "X",
+              "P0"
+            ],
+            "value": 0.11466853445782231,
+            "detail": "child \"Authentication for the customer portal\" description changed; text relevance 0.00"
+          }
+        ],
+        "reasons": [
+          "child \"Authentication for the customer portal\" description changed; text relevance 0.00"
+        ]
+      },
+      {
+        "entity_id": "S1",
+        "kind": "issue",
+        "rank": 7,
+        "score": 0.012442100105944487,
+        "level": "none",
+        "action": "none",
+        "channel": "sibling",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 2.0,
+        "effort_at_risk": 0.024884200211888974,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "sibling",
+            "path": [
+              "X",
+              "S1"
+            ],
+            "value": 0.012442100105944518,
+            "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.25"
+          }
+        ],
+        "reasons": [
+          "sibling \"Authentication for the customer portal\" description changed; text relevance 0.25"
+        ]
+      },
+      {
+        "entity_id": "S7",
+        "kind": "issue",
+        "rank": 8,
+        "score": 0.012409049376044257,
+        "level": "none",
+        "action": "none",
+        "channel": "sibling",
+        "distance": 2,
+        "changed": false,
+        "basis_status": "not_pinned",
+        "basis_introduced": false,
+        "effort": 3.0,
+        "effort_at_risk": 0.03722714812813277,
+        "contributions": [
+          {
+            "source_id": "X",
+            "field": "description",
+            "channel": "sibling",
+            "path": [
+              "X",
+              "S7"
+            ],
+            "value": 0.01240904937604422,
+            "detail": "sibling \"Authentication for the customer portal\" description changed; text relevance 0.25"
+          }
+        ],
+        "reasons": [
+          "sibling \"Authentication for the customer portal\" description changed; text relevance 0.25"
+        ]
+      }
+    ],
+    "impacts_total": 8,
+    "violations": [
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S0",
+          "S0-0",
+          "S0-1",
+          "S0-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"search settings account google webhook refund.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S1",
+          "S1-0",
+          "S1-1",
+          "S1-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"reset billing billing login footer password.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S10",
+          "S10-0",
+          "S10-1",
+          "S10-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"retry oauth billing settings footer search.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S11",
+          "S11-0",
+          "S11-1",
+          "S11-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"cache alert invoice export upload session.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S11",
+          "S11-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"cache alert invoice export upload session.\" is completed while \"footer login alert metrics password layout.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S11",
+          "S11-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"cache alert invoice export upload session.\" is completed while \"session webhook payment oauth audit filter.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S2",
+          "S2-0",
+          "S2-1",
+          "S2-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"layout desktop invoice cache login webhook.\" are estimated at 12 in total, above its own 3"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S3",
+          "S3-0",
+          "S3-1",
+          "S3-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"profile avatar layout audit webhook payment.\" are estimated at 10 in total, above its own 4"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S3",
+          "S3-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"profile avatar layout audit webhook payment.\" is completed while \"search search billing audit oauth search.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S3",
+          "S3-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"profile avatar layout audit webhook payment.\" is completed while \"reset email footer reset checkout password.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S4",
+          "S4-0",
+          "S4-1",
+          "S4-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"invoice portal theme upload footer import.\" are estimated at 8 in total, above its own 5"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S5",
+          "S5-0",
+          "S5-1",
+          "S5-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"upload refund session mobile login settings.\" are estimated at 6 in total, above its own 1"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S6",
+          "S6-0",
+          "S6-1",
+          "S6-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"portal upload email queue webhook billing.\" are estimated at 9 in total, above its own 2"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S7",
+          "S7-0",
+          "S7-1",
+          "S7-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"report google reset reset footer export checkout.\" are estimated at 12 in total, above its own 3"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S7",
+          "S7-0"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"report google reset reset footer export checkout.\" is completed while \"reset desktop upload metrics checkout cache.\" is still active"
+      },
+      {
+        "kind": "premature_close",
+        "entities": [
+          "S7",
+          "S7-1"
+        ],
+        "severity": 0.5,
+        "introduced": false,
+        "message": "parent \"report google reset reset footer export checkout.\" is completed while \"layout avatar profile token report upload.\" is still active"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S8",
+          "S8-0",
+          "S8-1",
+          "S8-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"google payment oauth import login password.\" are estimated at 10 in total, above its own 4"
+      },
+      {
+        "kind": "estimate_overflow",
+        "entities": [
+          "S9",
+          "S9-0",
+          "S9-1",
+          "S9-2"
+        ],
+        "severity": 0.45,
+        "introduced": false,
+        "message": "children of \"export report account billing webhook portal.\" are estimated at 8 in total, above its own 5"
+      }
+    ],
+    "summary": "critical impact (score 0.82, confidence 0.90); breaking change to \"Authentication for the customer portal\"; 5 other item(s) affected, most: \"Email and password sign-up form\" (high, obsolete_candidate); \"Password reset email flow\" (high, obsolete_candidate); \"Rate limiting for failed logins\" (low, notify); recommendation: re-plan everything under \"Authentication for the customer portal\"",
+    "engine_version": "",
+    "assessed_at": "2026-11-09T09:00:00Z"
+  }
+}

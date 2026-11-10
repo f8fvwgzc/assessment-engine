@@ -624,6 +624,193 @@ pub struct Policy {
     pub status_transitions: [[f64; 5]; 5],
     /// The comment lexicon.
     pub signals: Vec<SignalRule>,
+    /// Which text changes are flagged for a judgment of their meaning, and
+    /// how a supplied judgment moves the numbers.
+    pub judge: JudgePolicy,
+}
+
+/// The gray zone of text changes and the effect of a judgment.
+///
+/// The engine flags a text change when its lexical reading may be wrong
+/// about the meaning. A caller may then supply a
+/// [`TextJudgment`](crate::model::TextJudgment). The engine never calls a
+/// judge itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JudgePolicy {
+    /// Off: nothing is flagged and supplied judgments are ignored.
+    pub enabled: bool,
+    /// The text fields that can be flagged and judged.
+    pub fields: BTreeSet<String>,
+    /// At most this many flagged fields per assessment are asked for. It
+    /// shapes the output only.
+    pub max_requests: usize,
+    /// A text longer than this (in characters) is never flagged.
+    pub max_text_chars: usize,
+    /// Confidence at which `narrowed`, `replaced` and `reversed` start to count.
+    pub min_confidence: f64,
+    /// Confidence at which `equivalent` and `extended` start to count.
+    pub min_confidence_lowering: f64,
+    /// Factor on the confidence of a flagged field that was not judged.
+    pub unjudged_confidence: f64,
+    /// Use a judgment of a field the engine did not flag.
+    pub apply_unflagged: bool,
+    /// A change with no structural evidence is flagged when its magnitude
+    /// is within `[breaking − near_below, breaking + near_above)`.
+    pub near_below: f64,
+    pub near_above: f64,
+    /// A reworded sentence that swaps at most this many terms each way is
+    /// flagged as a substitution.
+    pub max_substituted_terms: usize,
+    /// The lexical distance an `equivalent` judgment pulls towards.
+    pub equivalent_target: f64,
+    /// The lexical distance an `extended` judgment pulls towards.
+    pub extended_target: f64,
+    /// The evidence a full-weight `narrowed` judgment adds (noisy-OR).
+    pub narrowed_evidence: f64,
+    pub replaced_evidence: f64,
+    pub reversed_evidence: f64,
+    /// The least share of the owner floors a lowering judgment leaves, so
+    /// owners of a changed passage are still notified.
+    pub min_owner_share: f64,
+    /// Words and phrases that narrow or widen a scope (lowercase).
+    pub scope_qualifiers: Vec<String>,
+}
+
+impl Default for JudgePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fields: [field::DESCRIPTION, field::TITLE]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            max_requests: 16,
+            max_text_chars: 20_000,
+            min_confidence: 0.5,
+            min_confidence_lowering: 0.6,
+            unjudged_confidence: 0.85,
+            apply_unflagged: false,
+            near_below: 0.2,
+            near_above: 0.1,
+            max_substituted_terms: 3,
+            equivalent_target: 0.05,
+            extended_target: 0.25,
+            narrowed_evidence: 0.315,
+            replaced_evidence: 0.275,
+            reversed_evidence: 0.403,
+            min_owner_share: 0.25,
+            scope_qualifiers: [
+                "apart from",
+                "at most",
+                "but not",
+                "except",
+                "excepting",
+                "exclude",
+                "excluded",
+                "excludes",
+                "excluding",
+                "exclusively",
+                "instead of",
+                "limited to",
+                "no longer",
+                "only",
+                "other than",
+                "rather than",
+                "restricted to",
+                "solely",
+                "unless",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        }
+    }
+}
+
+impl JudgePolicy {
+    /// The evidence a full-weight judgment of a raising relation adds.
+    pub(crate) fn evidence(&self, relation: crate::model::TextRelation) -> f64 {
+        use crate::model::TextRelation as R;
+        match relation {
+            R::Narrowed => self.narrowed_evidence,
+            R::Replaced => self.replaced_evidence,
+            R::Reversed => self.reversed_evidence,
+            R::Equivalent | R::Extended | R::Undetermined => 0.0,
+        }
+    }
+
+    /// The confidence at which a judgment of `relation` starts to count.
+    pub(crate) fn threshold(&self, relation: crate::model::TextRelation) -> f64 {
+        if relation.is_raising() {
+            self.min_confidence
+        } else {
+            self.min_confidence_lowering
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (what, v) in [
+            ("min_confidence", self.min_confidence),
+            ("min_confidence_lowering", self.min_confidence_lowering),
+            ("unjudged_confidence", self.unjudged_confidence),
+            ("near_below", self.near_below),
+            ("near_above", self.near_above),
+            ("equivalent_target", self.equivalent_target),
+            ("extended_target", self.extended_target),
+            ("narrowed_evidence", self.narrowed_evidence),
+            ("replaced_evidence", self.replaced_evidence),
+            ("reversed_evidence", self.reversed_evidence),
+            ("min_owner_share", self.min_owner_share),
+        ] {
+            unit(&format!("judge.{what}"), v)?;
+        }
+        let bad = |m: String| Err(Error::invalid_policy(m));
+        if self.min_confidence >= 1.0 || self.min_confidence_lowering >= 1.0 {
+            return bad(
+                "judge.min_confidence and judge.min_confidence_lowering must be below 1".to_owned(),
+            );
+        }
+        let least_evidence = self
+            .narrowed_evidence
+            .min(self.replaced_evidence)
+            .min(self.reversed_evidence);
+        if !(self.equivalent_target <= self.extended_target
+            && self.extended_target <= least_evidence)
+        {
+            return bad(
+                "judge: equivalent_target ≤ extended_target ≤ every *_evidence must hold"
+                    .to_owned(),
+            );
+        }
+        if !(1..=16).contains(&self.max_substituted_terms) {
+            return bad(format!(
+                "judge.max_substituted_terms must be in [1, 16], got {}",
+                self.max_substituted_terms
+            ));
+        }
+        if self.max_requests > 1_000 {
+            return bad(format!(
+                "judge.max_requests must be at most 1000, got {}",
+                self.max_requests
+            ));
+        }
+        if self.max_text_chars > 1_048_576 {
+            return bad(format!(
+                "judge.max_text_chars must be at most 1048576, got {}",
+                self.max_text_chars
+            ));
+        }
+        if self.fields.iter().any(|f| f.trim().is_empty()) {
+            return bad("judge.fields has a blank field name".to_owned());
+        }
+        for q in &self.scope_qualifiers {
+            if crate::text::token_count(q) == 0 {
+                return bad(format!("judge.scope_qualifiers: `{q}` has no word"));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Policy {
@@ -724,6 +911,7 @@ impl Default for Policy {
                 [0.40, 0.45, 0.50, 0.40, 0.0], // from canceled
             ],
             signals: default_signals(),
+            judge: JudgePolicy::default(),
         }
     }
 }
@@ -1077,6 +1265,7 @@ impl Policy {
         for (i, rule) in self.signals.iter().enumerate() {
             unit(&format!("signals[{i}].weight"), rule.weight)?;
         }
+        self.judge.validate()?;
         Ok(())
     }
 }
@@ -1194,6 +1383,66 @@ mod tests {
         assert_eq!(p.field("cycle").max_bump, VersionBump::Major);
         assert_eq!(p.field("assignee").max_bump, VersionBump::Minor);
         assert_eq!(p.field("description").max_bump, VersionBump::Major);
+    }
+
+    #[test]
+    fn judge_defaults_are_valid_and_merge_keeps_the_rest() {
+        let d = JudgePolicy::default();
+        d.validate().expect("valid");
+        assert!(d.enabled && d.fields.contains("description") && d.fields.contains("title"));
+        let p = Policy::default()
+            .merged(&serde_json::json!({"judge": {"enabled": false, "max_requests": 2}}))
+            .expect("valid patch");
+        assert!(!p.judge.enabled);
+        assert_eq!(p.judge.max_requests, 2);
+        assert_eq!(
+            JudgePolicy {
+                enabled: true,
+                max_requests: 16,
+                ..p.judge.clone()
+            },
+            d
+        );
+        assert_eq!(p.text, Policy::default().text);
+        // A policy stored before the judge existed still loads.
+        let mut old = serde_json::to_value(Policy::default()).expect("serializes");
+        old.as_object_mut().expect("an object").remove("judge");
+        let back: Policy = serde_json::from_value(old).expect("deserializes");
+        assert_eq!(back, Policy::default());
+    }
+
+    #[test]
+    fn invalid_judge_settings_are_rejected() {
+        use serde_json::json;
+        for patch in [
+            json!({"min_confidence": 1.0}),
+            json!({"min_confidence_lowering": 1.0}),
+            json!({"min_confidence": -0.1}),
+            json!({"unjudged_confidence": 1.5}),
+            json!({"near_below": 2}),
+            json!({"near_above": -1}),
+            json!({"equivalent_target": 0.3}),
+            json!({"extended_target": 0.3}),
+            json!({"replaced_evidence": 0.2}),
+            json!({"reversed_evidence": 1.1}),
+            json!({"min_owner_share": 1.2}),
+            json!({"max_substituted_terms": 0}),
+            json!({"max_substituted_terms": 17}),
+            json!({"max_requests": 1001}),
+            json!({"max_text_chars": 1_048_577}),
+            json!({"fields": ["description", " "]}),
+            json!({"scope_qualifiers": ["except", "…"]}),
+        ] {
+            let bad = Policy::default().merged(&json!({ "judge": patch }));
+            assert_eq!(
+                bad.expect_err(&patch.to_string()).kind(),
+                crate::error::ErrorKind::InvalidPolicy,
+                "{patch}"
+            );
+        }
+        Policy::default()
+            .merged(&json!({"judge": {"max_requests": 0, "scope_qualifiers": []}}))
+            .expect("zero requests and no qualifiers are fine");
     }
 
     #[test]

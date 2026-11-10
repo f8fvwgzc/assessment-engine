@@ -12,6 +12,7 @@
 //! | [`pb`] | always | The generated messages, client and server traits, and the encoded descriptor set for reflection. |
 //! | [`convert`] | always | `core ↔ pb` conversions; proto → core errors name the offending field. |
 //! | [`service`] | `server` | [`AssessmentService`](service::AssessmentService), the `AssessmentEngine` implementation. |
+//! | [`flow`] | `server` | [`assess_judged`](flow::assess_judged), the two-pass assessment with an optional judge. |
 //! | [`auth`] | `server` | [`BearerAuth`](auth::BearerAuth), a constant-time bearer-token interceptor. |
 //! | [`server`] | `server` | Serving with health, reflection, limits, auth and graceful shutdown. |
 //! | [`client`] | `client` | [`AssessmentClient`](client::AssessmentClient), which takes and returns core types. |
@@ -81,6 +82,8 @@ pub mod convert;
 
 #[cfg(feature = "server")]
 pub mod auth;
+#[cfg(feature = "server")]
+pub mod flow;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]

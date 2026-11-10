@@ -1,0 +1,121 @@
+{
+  "score": 0.4778873429309043,
+  "level": "medium",
+  "recommendation": "review",
+  "confidence": 0.9,
+  "severity": 0.4590000000000001,
+  "breadth": 0.08500780177497369,
+  "effort_at_risk": 0.6290156035499475,
+  "effort_total": 2.0,
+  "changes": [
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.17001560354994738,
+      "local_score": 0.17001560354994738,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.2000183571175852,
+          "severity": 0.85,
+          "risk": 0.1700156035499474,
+          "breaking": false,
+          "additive": false,
+          "before": "Хэрэглэгч имэйл болон нууц үгээр нэвтэрч чадна.",
+          "after": "Хэрэглэгч имэйл болон нууц үгээр нэвтэрч чадахгүй.",
+          "metrics": {
+            "char_similarity": 0.9,
+            "items_added": 0.0,
+            "items_checked": 0.0,
+            "items_modified": 0.0,
+            "items_removed": 0.0,
+            "lexical_similarity": 0.7999816428824148,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 0.0,
+            "passages_added": 0.0,
+            "passages_modified": 1.0,
+            "passages_removed": 0.0,
+            "shingle_similarity": 0.7142857142857143,
+            "tfidf_cosine": 0.7523197619890014,
+            "token_jaccard": 0.75
+          },
+          "explanation": "description: change magnitude 0.20; dropped: чадна; added: чадахгүй"
+        }
+      ],
+      "signals": [],
+      "bump": "patch",
+      "previous_version": "1.0.0",
+      "next_version": "1.0.1",
+      "propagation_truncated": false,
+      "explanation": "changed description (patch 1.0.0 → 1.0.1); content score 0.17, local score 0.17; strongest: description: change magnitude 0.20; dropped: чадна; added: чадахгүй"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "C",
+      "kind": "sub_issue",
+      "rank": 1,
+      "score": 0.4590000000000001,
+      "level": "medium",
+      "action": "update_scope",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "compatible",
+      "basis_introduced": true,
+      "effort": 1.0,
+      "effort_at_risk": 0.4590000000000001,
+      "contributions": [
+        {
+          "source_id": "P",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "P",
+            "C"
+          ],
+          "value": 0.459,
+          "detail": "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.65)"
+        }
+      ],
+      "reasons": [
+        "parent \"Parent issue\" description changed; it is the closest match for text that was reworded (overlap 0.65)"
+      ]
+    },
+    {
+      "entity_id": "P",
+      "kind": "issue",
+      "rank": 2,
+      "score": 0.17001560354994738,
+      "level": "low",
+      "action": "notify",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.17001560354994738,
+      "contributions": [],
+      "reasons": [
+        "changed description (patch 1.0.0 → 1.0.1); content score 0.17, local score 0.17; strongest: description: change magnitude 0.20; dropped: чадна; added: чадахгүй"
+      ]
+    }
+  ],
+  "impacts_total": 2,
+  "violations": [],
+  "summary": "medium impact (score 0.48, confidence 0.90); 1 other item(s) affected, most: \"Child task\" (medium, update_scope); recommendation: review",
+  "engine_version": "",
+  "assessed_at": "2026-11-09T09:00:00Z"
+}

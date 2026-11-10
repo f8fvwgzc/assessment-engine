@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/assessment-core", "crates/assessment-grpc", "crates/assessment-server"]
+members = ["crates/assessment-core", "crates/assessment-grpc", "crates/assessment-judge", "crates/assessment-server"]
 
 [workspace.package]
 version = "0.1.0"

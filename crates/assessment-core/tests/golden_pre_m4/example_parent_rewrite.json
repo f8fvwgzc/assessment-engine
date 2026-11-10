@@ -1,0 +1,223 @@
+{
+  "score": 0.8333154847969815,
+  "level": "critical",
+  "recommendation": "full_replan",
+  "confidence": 0.9,
+  "severity": 0.8104005554867298,
+  "breadth": 0.275321312478047,
+  "effort_at_risk": 17.142918720800616,
+  "effort_total": 24.0,
+  "replan_root": "ENG-12",
+  "changes": [
+    {
+      "entity_id": "ENG-12",
+      "kind": "issue",
+      "change_type": "updated",
+      "raw_score": 0.775050929898797,
+      "local_score": 0.8104005554867298,
+      "modifiers": [
+        {
+          "name": "phase",
+          "factor": 1.0,
+          "detail": "the entity is started"
+        },
+        {
+          "name": "time_pressure",
+          "factor": 1.1145938127327963,
+          "detail": "due in 20.6 days"
+        }
+      ],
+      "fields": [
+        {
+          "field": "description",
+          "change": "modified",
+          "direction": "increase",
+          "magnitude": 0.9118246234103494,
+          "severity": 0.85,
+          "risk": 0.775050929898797,
+          "breaking": true,
+          "additive": false,
+          "before": "Customers sign in to the portal. ## Acceptance criteria - [ ] Sign up and log…",
+          "after": "Customers sign in to the portal with their company identity. ## Acceptance cr…",
+          "metrics": {
+            "char_similarity": 0.5406360424028269,
+            "items_added": 2.0,
+            "items_checked": 0.0,
+            "items_modified": 1.0,
+            "items_removed": 2.0,
+            "lexical_similarity": 0.42801563682932325,
+            "modal_shifts": 0.0,
+            "negation_flips": 0.0,
+            "numbers_changed": 1.0,
+            "passages_added": 3.0,
+            "passages_modified": 2.0,
+            "passages_removed": 2.0,
+            "shingle_similarity": 0.2545454545454545,
+            "tfidf_cosine": 0.45132527834852043,
+            "token_jaccard": 0.45161290322580644
+          },
+          "explanation": "description: change magnitude 0.91; list items +2 −2 ~1; 1 number(s) changed; dropped: email, 30, link, reset; added: oidc, 2.0, 7, company"
+        }
+      ],
+      "signals": [],
+      "bump": "major",
+      "previous_version": "1.2.0",
+      "next_version": "2.0.0",
+      "propagation_truncated": false,
+      "explanation": "changed description (major 1.2.0 → 2.0.0); content score 0.78, local score 0.81; strongest: description: change magnitude 0.91; list items +2 −2 ~1; 1 number(s) changed; dropped: email, 30, link, reset; added: oidc, 2.0, 7, company"
+    }
+  ],
+  "impacts": [
+    {
+      "entity_id": "ENG-12",
+      "kind": "issue",
+      "rank": 1,
+      "score": 0.8104005554867298,
+      "level": "critical",
+      "action": "replan",
+      "channel": "self",
+      "distance": 0,
+      "changed": true,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 13.0,
+      "effort_at_risk": 10.535207221327488,
+      "contributions": [],
+      "reasons": [
+        "changed description (major 1.2.0 → 2.0.0); content score 0.78, local score 0.81; strongest: description: change magnitude 0.91; list items +2 −2 ~1; 1 number(s) changed; dropped: email, 30, link, reset; added: oidc, 2.0, 7, company"
+      ]
+    },
+    {
+      "entity_id": "ENG-13",
+      "kind": "sub_issue",
+      "rank": 2,
+      "score": 0.6975458369089172,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 5.0,
+      "effort_at_risk": 3.487729184544586,
+      "contributions": [
+        {
+          "source_id": "ENG-12",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "ENG-12",
+            "ENG-13"
+          ],
+          "value": 0.6975458369089172,
+          "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.61)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.61)"
+      ]
+    },
+    {
+      "entity_id": "ENG-14",
+      "kind": "sub_issue",
+      "rank": 3,
+      "score": 0.592155438944327,
+      "level": "high",
+      "action": "obsolete_candidate",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 3.0,
+      "effort_at_risk": 1.7764663168329808,
+      "contributions": [
+        {
+          "source_id": "ENG-12",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "ENG-12",
+            "ENG-14"
+          ],
+          "value": 0.6975458369089172,
+          "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.66)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was removed (overlap 0.66)"
+      ]
+    },
+    {
+      "entity_id": "ENG-15",
+      "kind": "sub_issue",
+      "rank": 4,
+      "score": 0.592155438944327,
+      "level": "high",
+      "action": "update_scope",
+      "channel": "down",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "incompatible",
+      "basis_introduced": true,
+      "effort": 2.0,
+      "effort_at_risk": 1.184310877888654,
+      "contributions": [
+        {
+          "source_id": "ENG-12",
+          "field": "description",
+          "channel": "down",
+          "path": [
+            "ENG-12",
+            "ENG-15"
+          ],
+          "value": 0.6975458369089172,
+          "detail": "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was reworded (overlap 0.44)"
+        }
+      ],
+      "reasons": [
+        "it was planned against a version that has since changed in a breaking way",
+        "parent \"Authentication for the customer portal\" description changed; it is the closest match for text that was reworded (overlap 0.44)"
+      ]
+    },
+    {
+      "entity_id": "PRJ-1",
+      "kind": "project",
+      "rank": 5,
+      "score": 0.1592051202069079,
+      "level": "low",
+      "action": "notify",
+      "channel": "up",
+      "distance": 1,
+      "changed": false,
+      "basis_status": "not_pinned",
+      "basis_introduced": false,
+      "effort": 1.0,
+      "effort_at_risk": 0.1592051202069079,
+      "contributions": [
+        {
+          "source_id": "ENG-12",
+          "field": "description",
+          "channel": "up",
+          "path": [
+            "ENG-12",
+            "PRJ-1"
+          ],
+          "value": 0.15920512020690789,
+          "detail": "child \"Authentication for the customer portal\" description changed; text it is about was reworded (overlap 0.37)"
+        }
+      ],
+      "reasons": [
+        "child \"Authentication for the customer portal\" description changed; text it is about was reworded (overlap 0.37)"
+      ]
+    }
+  ],
+  "impacts_total": 5,
+  "violations": [],
+  "summary": "critical impact (score 0.83, confidence 0.90); breaking change to \"Authentication for the customer portal\"; 4 other item(s) affected, most: \"Email and password sign-up form\" (high, obsolete_candidate); \"Password reset email flow\" (high, obsolete_candidate); \"Session expiry and refresh\" (high, update_scope); recommendation: re-plan everything under \"Authentication for the customer portal\"",
+  "engine_version": "",
+  "assessed_at": "2026-11-07T09:00:00Z"
+}

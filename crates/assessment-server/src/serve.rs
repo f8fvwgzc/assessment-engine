@@ -12,9 +12,10 @@ use assessment_core::registry::RegistryOptions;
 use assessment_grpc::auth::BearerAuth;
 use assessment_grpc::server::{ServerOptions, serve_with_incoming_shutdown};
 use assessment_grpc::service::{AssessmentService, ServiceLimits};
+use tokio::sync::watch;
 use tonic::transport::server::TcpIncoming;
 
-use crate::{ServeArgs, engine_with_policy};
+use crate::{ServeArgs, engine_with_policy, judge};
 
 /// Serves until SIGINT or SIGTERM.
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
@@ -30,6 +31,14 @@ async fn run_until(
     listening: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 ) -> Result<()> {
     let engine = engine_with_policy(args.policy.as_deref())?;
+    let auth = BearerAuth::from_option(args.auth_token.as_deref());
+    // Checked before the journal is opened: a bad judge setup fails fast.
+    let judge = judge::from_args(
+        &args.judge,
+        judge::key_from_env(),
+        args.addr,
+        auth.is_enabled(),
+    )?;
     // 0 turns compaction off, on shutdown too: the journal then stays in
     // the one-file format that older versions read.
     let compact_after_ops = (args.compact_after_ops > 0).then_some(args.compact_after_ops);
@@ -82,11 +91,24 @@ async fn run_until(
     if let Some(n) = args.max_in_flight {
         limits = limits.with_max_in_flight(n);
     }
-    let service = AssessmentService::new(engine, Arc::clone(&registry)).with_limits(limits);
+    // The signal turns this to `true` first, so that calls in flight stop
+    // asking the judge and answer with what they have.
+    let (shutting_down, shutdown_seen) = watch::channel(false);
+    let shutdown = async move {
+        shutdown.await;
+        let _ = shutting_down.send(true);
+    };
+    let mut service = AssessmentService::new(engine, Arc::clone(&registry))
+        .with_limits(limits)
+        .with_shutdown(shutdown_seen);
+    if let Some(stack) = judge {
+        stack.spawn_startup_probe();
+        service = service.with_judge(stack.judge, stack.settings);
+    }
     // The values in force (the service brings them into range).
     let limits = service.limits();
 
-    let auth = BearerAuth::from_option(args.auth_token.as_deref());
+    let judge_id = service.judge_id().unwrap_or("off").to_owned();
     let timeout =
         (args.request_timeout_secs > 0).then(|| Duration::from_secs(args.request_timeout_secs));
     let options = ServerOptions::default()
@@ -111,6 +133,7 @@ async fn run_until(
         max_batch_size = limits.max_batch_size,
         max_in_flight = limits.max_in_flight,
         max_concurrent_assessments = limits.max_concurrent_assessments,
+        judge = %judge_id,
         engine_version = assessment_core::ENGINE_VERSION,
         "assessment engine listening (gRPC, health and reflection on)"
     );
@@ -274,8 +297,10 @@ mod tests {
     async fn observed(client: &mut AssessmentClient) -> String {
         let mut out = String::new();
         for id in ["ENG-1", "ENG-2", "ENG-3"] {
-            let entity = client.get_entity(id, None).await;
-            let history = client.history(id, 0).await;
+            // Errors are shown without their cause: a status carries the
+            // response's `date` header, which differs between two calls.
+            let entity = client.get_entity(id, None).await.map_err(|e| e.to_string());
+            let history = client.history(id, 0).await.map_err(|e| e.to_string());
             out.push_str(&format!("{id}: {entity:?}\n{history:?}\n"));
         }
         let stale = client.stale(None).await.expect("stale answers");
@@ -374,6 +399,41 @@ mod tests {
         let mut second = Running::start(serve_args(&journal, &["--compact-after-ops", "0"])).await;
         assert_eq!(observed(&mut second.client).await, before);
         second.shutdown().await;
+        let _ = std::fs::remove_dir_all(journal.parent().expect("the journal has a directory"));
+    }
+
+    /// The judge points at a local port nothing listens on, so the startup
+    /// check fails and is only logged.
+    #[cfg(feature = "judge")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_with_a_judge_names_it_and_one_without_does_not() {
+        let journal = journal_path("judge");
+        let key_file = journal.with_file_name("key");
+        std::fs::write(&key_file, "test-key-0123456789\n").expect("the key file is written");
+
+        let mut plain = Running::start(serve_args(&journal, &["--judge", "off"])).await;
+        assert_eq!(plain.client.judge_info().await.expect("answers"), None);
+        plain.shutdown().await;
+
+        let args = serve_args(
+            &journal,
+            &[
+                "--judge",
+                "on",
+                "--judge-model",
+                "claude-haiku-4-5",
+                "--judge-base-url",
+                "http://127.0.0.1:9",
+                "--anthropic-api-key-file",
+                key_file.to_str().expect("the path is UTF-8"),
+            ],
+        );
+        let mut judged = Running::start(args).await;
+        assert_eq!(
+            judged.client.judge_info().await.expect("answers"),
+            Some("anthropic/claude-haiku-4-5".to_owned())
+        );
+        judged.shutdown().await;
         let _ = std::fs::remove_dir_all(journal.parent().expect("the journal has a directory"));
     }
 

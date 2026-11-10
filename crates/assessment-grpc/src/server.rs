@@ -144,6 +144,7 @@ impl std::error::Error for ServeError {
 
 /// The engine API with `options`' size limits and auth applied.
 pub fn engine_server(service: AssessmentService, options: &ServerOptions) -> EngineServer {
+    let service = service.with_call_timeout(options.request_timeout);
     let server = AssessmentEngineServer::new(service)
         .max_decoding_message_size(options.max_message_bytes)
         .max_encoding_message_size(options.max_message_bytes);

@@ -4,7 +4,8 @@
 //! [`assessment_core`] values ([`AssessmentRequest`] → [`Assessment`],
 //! [`Entity`] + [`PutOptions`] → [`PutOutcome`], …), adds an optional
 //! `authorization: Bearer …` header to every call, and reports failures as
-//! one opaque [`ClientError`].
+//! one opaque [`ClientError`]. With [`AssessmentClient::with_timeout`] every
+//! call also carries a deadline that the server sees.
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), assessment_grpc::client::ClientError> {
@@ -30,8 +31,11 @@
 use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use assessment_core::model::{ActivityEvent, AssessmentRequest, Entity};
+use assessment_core::model::{
+    ActivityEvent, AssessOptions, AssessmentRequest, Entity, TextJudgment, field,
+};
 use assessment_core::policy::Policy;
 use assessment_core::registry::{
     DeleteOptions, DeleteOutcome, ImportItem, ImportSummary, PutOptions, PutOutcome, StaleEntry,
@@ -295,6 +299,7 @@ pub struct AssessmentClient {
     inner: RawClient,
     channel: Channel,
     max_message_bytes: Option<usize>,
+    timeout: Option<Duration>,
 }
 
 impl AssessmentClient {
@@ -330,6 +335,7 @@ impl AssessmentClient {
             inner: AssessmentEngineClient::with_interceptor(channel.clone(), BearerToken::none()),
             channel,
             max_message_bytes: None,
+            timeout: None,
         }
     }
 
@@ -362,7 +368,26 @@ impl AssessmentClient {
             inner,
             channel: self.channel,
             max_message_bytes: self.max_message_bytes,
+            timeout: self.timeout,
         }
+    }
+
+    /// This client with a deadline for every call. It is sent to the server
+    /// as `grpc-timeout`, so the server stops working on a call that the
+    /// client has given up. A timeout set on the [`Endpoint`] is not sent.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// A request with this client's timeout, if it has one.
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        if let Some(timeout) = self.timeout {
+            request.set_timeout(timeout);
+        }
+        request
     }
 
     /// The generated client, for calls in protobuf terms.
@@ -397,9 +422,10 @@ impl AssessmentClient {
     }
 
     async fn assess_input(&mut self, input: AssessInput) -> Result<Assessment, ClientError> {
+        let request = self.request(pb::AssessRequest::from(input));
         let response = self
             .inner
-            .assess(pb::AssessRequest::from(input))
+            .assess(request)
             .await
             .map_err(|s| ClientError::from_status("assess", s))?
             .into_inner();
@@ -428,9 +454,10 @@ impl AssessmentClient {
                 pb
             })
             .collect();
+        let request = self.request(pb::AssessBatchRequest { requests });
         let response = self
             .inner
-            .assess_batch(pb::AssessBatchRequest { requests })
+            .assess_batch(request)
             .await
             .map_err(|s| ClientError::from_status("assess_batch", s))?
             .into_inner();
@@ -452,9 +479,10 @@ impl AssessmentClient {
             pb.request_id = request_id;
             pb
         });
+        let request = self.request(outbound);
         let inbound = self
             .inner
-            .assess_stream(outbound)
+            .assess_stream(request)
             .await
             .map_err(|s| ClientError::from_status("assess_stream", s))?
             .into_inner();
@@ -462,21 +490,38 @@ impl AssessmentClient {
     }
 
     /// Compares two texts; `embeddings` are both sides' vectors, if any.
+    /// The texts are read as a description.
     pub async fn compare_text(
         &mut self,
         before: impl Into<String>,
         after: impl Into<String>,
         embeddings: Option<(Vec<f32>, Vec<f32>)>,
     ) -> Result<TextDiff, ClientError> {
+        self.compare_text_as(field::DESCRIPTION, before, after, embeddings)
+            .await
+    }
+
+    /// [`compare_text`](Self::compare_text) for the text of `field`. The
+    /// result's `gray_zone` says why an assessment would flag the change
+    /// for a judgment in that field, when it would. No judge is asked.
+    pub async fn compare_text_as(
+        &mut self,
+        field: impl Into<String>,
+        before: impl Into<String>,
+        after: impl Into<String>,
+        embeddings: Option<(Vec<f32>, Vec<f32>)>,
+    ) -> Result<TextDiff, ClientError> {
         let (before_embedding, after_embedding) = embeddings.unwrap_or_default();
+        let request = self.request(pb::CompareTextRequest {
+            before: before.into(),
+            after: after.into(),
+            before_embedding,
+            after_embedding,
+            field: field.into(),
+        });
         let response = self
             .inner
-            .compare_text(pb::CompareTextRequest {
-                before: before.into(),
-                after: after.into(),
-                before_embedding,
-                after_embedding,
-            })
+            .compare_text(request)
             .await
             .map_err(|s| ClientError::from_status("compare_text", s))?
             .into_inner();
@@ -493,9 +538,10 @@ impl AssessmentClient {
             .map(policy_object)
             .transpose()?
             .map(convert::map_to_struct);
+        let request = self.request(pb::GetPolicyRequest { overrides });
         let response = self
             .inner
-            .get_policy(pb::GetPolicyRequest { overrides })
+            .get_policy(request)
             .await
             .map_err(|s| ClientError::from_status("get_policy", s))?
             .into_inner();
@@ -508,6 +554,19 @@ impl AssessmentClient {
         })
     }
 
+    /// The id of the server's judge, such as a model name. `None` when the
+    /// server has no judge: it then only reports flagged fields.
+    pub async fn judge_info(&mut self) -> Result<Option<String>, ClientError> {
+        let request = self.request(pb::GetPolicyRequest { overrides: None });
+        let response = self
+            .inner
+            .get_policy(request)
+            .await
+            .map_err(|s| ClientError::from_status("get_policy", s))?
+            .into_inner();
+        Ok(Some(response.judge).filter(|judge| !judge.is_empty()))
+    }
+
     /// Creates or updates an entity in the server's registry.
     ///
     /// With [`PutOptions::source_seq`], a put that is not newer than what
@@ -517,9 +576,10 @@ impl AssessmentClient {
         entity: Entity,
         options: PutOptions,
     ) -> Result<PutOutcome, ClientError> {
+        let request = self.request(convert::put_request_to_pb(entity, options));
         let response = self
             .inner
-            .put_entity(convert::put_request_to_pb(entity, options))
+            .put_entity(request)
             .await
             .map_err(|s| ClientError::from_status("put_entity", s))?
             .into_inner();
@@ -535,15 +595,16 @@ impl AssessmentClient {
         expected_version: Option<SemVer>,
         now: Option<DateTime<Utc>>,
     ) -> Result<Assessment, ClientError> {
+        let request = self.request(pb::DeleteEntityRequest {
+            id: id.into(),
+            dry_run,
+            expected_version: expected_version.map(Into::into),
+            now: now.map(convert::timestamp_to_pb),
+            source_seq: None,
+        });
         let response = self
             .inner
-            .delete_entity(pb::DeleteEntityRequest {
-                id: id.into(),
-                dry_run,
-                expected_version: expected_version.map(Into::into),
-                now: now.map(convert::timestamp_to_pb),
-                source_seq: None,
-            })
+            .delete_entity(request)
             .await
             .map_err(|s| ClientError::from_status("delete_entity", s))?
             .into_inner();
@@ -558,9 +619,10 @@ impl AssessmentClient {
         id: impl Into<String>,
         options: DeleteOptions,
     ) -> Result<DeleteOutcome, ClientError> {
+        let request = self.request(convert::delete_request_to_pb(id, options));
         let response = self
             .inner
-            .delete_entity(convert::delete_request_to_pb(id, options))
+            .delete_entity(request)
             .await
             .map_err(|s| ClientError::from_status("delete_entity", s))?
             .into_inner();
@@ -579,9 +641,10 @@ impl AssessmentClient {
     where
         S: Stream<Item = ImportItem> + Send + 'static,
     {
+        let request = self.request(items.map(pb::ImportRequest::from));
         let response = self
             .inner
-            .import(items.map(pb::ImportRequest::from))
+            .import(request)
             .await
             .map_err(|s| ClientError::from_status("import", s))?
             .into_inner();
@@ -607,13 +670,14 @@ impl AssessmentClient {
         events: Vec<ActivityEvent>,
         now: Option<DateTime<Utc>>,
     ) -> Result<Assessment, ClientError> {
+        let request = self.request(pb::RecordActivityRequest {
+            entity_id: id.into(),
+            events: events.into_iter().map(Into::into).collect(),
+            now: now.map(convert::timestamp_to_pb),
+        });
         let response = self
             .inner
-            .record_activity(pb::RecordActivityRequest {
-                entity_id: id.into(),
-                events: events.into_iter().map(Into::into).collect(),
-                now: now.map(convert::timestamp_to_pb),
-            })
+            .record_activity(request)
             .await
             .map_err(|s| ClientError::from_status("record_activity", s))?
             .into_inner();
@@ -627,12 +691,13 @@ impl AssessmentClient {
         id: impl Into<String>,
         version: Option<SemVer>,
     ) -> Result<Entity, ClientError> {
+        let request = self.request(pb::GetEntityRequest {
+            id: id.into(),
+            version: version.map(Into::into),
+        });
         let response = self
             .inner
-            .get_entity(pb::GetEntityRequest {
-                id: id.into(),
-                version: version.map(Into::into),
-            })
+            .get_entity(request)
             .await
             .map_err(|s| ClientError::from_status("get_entity", s))?
             .into_inner();
@@ -646,12 +711,13 @@ impl AssessmentClient {
         id: impl Into<String>,
         limit: u32,
     ) -> Result<Vec<VersionRecord>, ClientError> {
+        let request = self.request(pb::GetHistoryRequest {
+            id: id.into(),
+            limit,
+        });
         let response = self
             .inner
-            .get_history(pb::GetHistoryRequest {
-                id: id.into(),
-                limit,
-            })
+            .get_history(request)
             .await
             .map_err(|s| ClientError::from_status("get_history", s))?
             .into_inner();
@@ -660,6 +726,7 @@ impl AssessmentClient {
     }
 
     /// Assesses the difference between two stored versions of an entity.
+    /// The judgments that were applied when `to` was stored are used again.
     pub async fn compare_versions(
         &mut self,
         id: impl Into<String>,
@@ -667,14 +734,33 @@ impl AssessmentClient {
         to: SemVer,
         now: Option<DateTime<Utc>>,
     ) -> Result<Assessment, ClientError> {
+        self.compare_versions_with(id, from, to, now, AssessOptions::default(), Vec::new())
+            .await
+    }
+
+    /// [`compare_versions`](Self::compare_versions) with assessment options
+    /// and judgments of the text changes between the two versions. A given
+    /// judgment of a field goes before the stored one.
+    pub async fn compare_versions_with(
+        &mut self,
+        id: impl Into<String>,
+        from: SemVer,
+        to: SemVer,
+        now: Option<DateTime<Utc>>,
+        options: AssessOptions,
+        judgments: Vec<TextJudgment>,
+    ) -> Result<Assessment, ClientError> {
+        let request = self.request(pb::CompareVersionsRequest {
+            id: id.into(),
+            from: Some(from.into()),
+            to: Some(to.into()),
+            now: now.map(convert::timestamp_to_pb),
+            options: Some(options.into()),
+            judgments: judgments.into_iter().map(Into::into).collect(),
+        });
         let response = self
             .inner
-            .compare_versions(pb::CompareVersionsRequest {
-                id: id.into(),
-                from: Some(from.into()),
-                to: Some(to.into()),
-                now: now.map(convert::timestamp_to_pb),
-            })
+            .compare_versions(request)
             .await
             .map_err(|s| ClientError::from_status("compare_versions", s))?
             .into_inner();
@@ -685,11 +771,12 @@ impl AssessmentClient {
     /// Plans that are behind what they were planned against: under `root`
     /// (and `root` itself), or everywhere.
     pub async fn stale(&mut self, root: Option<&str>) -> Result<Vec<StaleEntry>, ClientError> {
+        let request = self.request(pb::ListStaleRequest {
+            root_id: root.unwrap_or_default().to_owned(),
+        });
         let response = self
             .inner
-            .list_stale(pb::ListStaleRequest {
-                root_id: root.unwrap_or_default().to_owned(),
-            })
+            .list_stale(request)
             .await
             .map_err(|s| ClientError::from_status("list_stale", s))?
             .into_inner();
@@ -703,12 +790,13 @@ impl AssessmentClient {
         id: impl Into<String>,
         now: Option<DateTime<Utc>>,
     ) -> Result<Entity, ClientError> {
+        let request = self.request(pb::AcknowledgeRequest {
+            id: id.into(),
+            now: now.map(convert::timestamp_to_pb),
+        });
         let response = self
             .inner
-            .acknowledge(pb::AcknowledgeRequest {
-                id: id.into(),
-                now: now.map(convert::timestamp_to_pb),
-            })
+            .acknowledge(request)
             .await
             .map_err(|s| ClientError::from_status("acknowledge", s))?
             .into_inner();

@@ -82,6 +82,7 @@ Any other language: generate a client from
 |---|---|---|
 | [`assessment-core`](crates/assessment-core) | The engine: pure Rust, no I/O except the optional registry journal. `Engine`, `Registry`, `Policy`. | You are in Rust and want it in-process. |
 | [`assessment-grpc`](crates/assessment-grpc) | Generated protobuf types, conversions, the tonic service, and a typed client. | You serve or call it over gRPC from Rust. |
+| [`assessment-judge`](crates/assessment-judge) | The optional model judge: asks the Anthropic API how two texts relate. The only crate that makes network calls out. | You want the server to judge flagged text changes. |
 | [`assessment-server`](crates/assessment-server) | The `assessment-engine` binary: gRPC server (health, reflection, auth, limits, graceful shutdown) and an offline CLI. | You run it as a service for any language. |
 | [`proto/assessment/v1/assessment.proto`](proto/assessment/v1/assessment.proto) | The contract. | You generate a client in Go, TypeScript, Python, Java, C#… |
 
@@ -326,6 +327,109 @@ From Rust, `AssessmentClient::import_iter(items)` and `import(stream)` send
 `ImportItem`s and return an `ImportReport`; in-process,
 `Registry::import(items)` returns an `ImportSummary` with the same counts.
 
+## Judgments
+
+Word counts cannot tell a paraphrase from a new requirement. The engine
+flags such a text change (the *gray zone*) and reports it in
+`judgment_requests`, with a fingerprint of the two texts. A *judgment* says
+how the two texts relate: `equivalent`, `extended`, `narrowed`, `replaced`,
+`reversed` or `undetermined`. With a judgment the engine can lower a
+paraphrase to a patch, or raise a swapped term to a major change. The rules
+and formulas are in [docs/SCORING.md](docs/SCORING.md) §2a.
+
+The engine itself never calls a model. There are two ways to get a
+judgment into it.
+
+### Bring your own judgments
+
+Assess, read `judgment_requests`, decide (a person, your own model, a
+rule), and assess again with the answers in `ChangeSet.judgments`:
+
+```bash
+cargo run -p assessment-server -- assess examples/requests/paraphrase.core.json
+#   bump "major", next_version "2.0.0"; description judgment status "requested";
+#   judgment_requests[0].fingerprint "a5092b8f…"
+cargo run -p assessment-server -- assess examples/requests/paraphrase_judged.core.json
+#   bump "patch", next_version "1.0.1"; status "applied"
+```
+
+Over gRPC the same pair is `examples/requests/paraphrase.json` and
+`paraphrase_judged.json`:
+
+```bash
+grpcurl -plaintext -d @ 127.0.0.1:50061 assessment.v1.AssessmentEngine/Assess < examples/requests/paraphrase_judged.json
+```
+
+A judgment is used only when its fingerprint matches the two texts.
+Otherwise its status is `stale` and the result is the engine's own (a
+server with a judge asks its judge about that field instead). Copy
+the fingerprint from the request, or compute it (SCORING.md §2a has test
+vectors). Set `options.judgment_texts` to get the two texts in each
+request. `compare-text` shows the gray zone of any two texts:
+
+```bash
+cargo run -p assessment-server -- compare-text --field title --before "Build the login button" --after "Build the logout button"
+```
+
+In Rust, fill `ChangeSet::judgments` with `TextJudgment`s, or
+`PutOptions::judgments` for the registry. `PutOptions::hold_if_flagged`
+stores nothing while a judgment is still wanted, also when a supplied one
+is stale.
+
+### Let the server ask a model
+
+`serve --judge on` makes the server ask the Anthropic API about the flagged
+`title` and `description` changes and assess again with the answers. It is
+off by default. Details, flags, limits and the threat model are in
+[docs/JUDGE.md](docs/JUDGE.md).
+
+```bash
+export ANTHROPIC_API_KEY=...          # or --anthropic-api-key-file <file>
+assessment-engine serve --judge on --auth-token "$TOKEN"
+assessment-engine assess request.json --judge      # the same from the command line
+```
+
+A judge spends money, so the server does not start with a judge on an
+address that is not loopback unless `--auth-token` is set (or use
+`--addr 127.0.0.1:50061`).
+
+* **It never fails a call.** A field the judge did not answer keeps the
+  engine's result and gets the status `unavailable` with a short `detail`.
+* **`Assess`, `AssessBatch`, `AssessStream`, `PutEntity` and
+  `CompareVersions` are judged.** `Import` and `CompareText` never call a
+  model.
+* **`options.judge = false` turns it off for one call.** Send it for
+  autosave, for previews, and whenever the user has not agreed to send
+  the text to a model. `options.judge = true` asks for it on a server that
+  has `--judge-default off`.
+* **Always send a deadline.** The judge gets the time your deadline leaves,
+  and at most `--judge-timeout-secs` (15). The Rust client has
+  `AssessmentClient::with_timeout`. Without a deadline a call can wait for
+  two judge passes.
+* **To see whether a server has a judge**, read `GetPolicyResponse.judge`
+  (`AssessmentClient::judge_info`). It holds the judge id, for example
+  `anthropic/claude-opus-5-5`, and is empty without a judge.
+
+**Privacy: what leaves the process.** With the judge off, nothing does.
+With it on, for each flagged field one request goes to the Anthropic API
+with: the two texts of that field, the field name, the entity kind, the
+entity's title as context (not for the title field itself), and four
+counts (list items, negations, requirement words, numbers that changed).
+No ids, no other fields, no other entities and no comments are sent. At
+startup the server also sends one `GET /v1/models/{model}` to check the key
+and the model. Texts longer than `--judge-max-text-chars` (8000) are not
+sent.
+
+**Cost and latency.** These are estimates. They have not been measured:
+the paid evaluation (`cargo run -p assessment-judge --example judge_cases`,
+at most 0.30 US dollars) has not been run yet. A judged field is one
+request of roughly 2000 input tokens and a few hundred output tokens. With
+the price table in `crates/assessment-judge/src/price.rs` that is about one
+to two US cents on the default model. Expect a few seconds per judged
+call. Equal questions are answered from a cache at no cost. The server
+stops asking at `--judge-max-usd-per-hour` (10). The price table is there
+for that cap and is not a bill.
+
 ## Wiring it into nexc-engine
 
 | nexc | engine |
@@ -348,6 +452,11 @@ siblings and blockers as context), store `changes[0].next_version` on the
 issue, and if `recommendation ≥ REVIEW` notify the owners of `impacts[]`
 with their `action`; on `PARTIAL_REPLAN`/`FULL_REPLAN`, open a re-plan for
 `replan_root` (for example, by asking the Planner to re-plan that subtree).
+
+For judgments: send `options.judge = false` from autosave and preview
+paths, and always set a deadline. A field with the status `requested` or
+`unavailable` carries the engine's own result, which is safe to store. It
+can be shown as "meaning not verified".
 
 ## Tuning
 
@@ -373,6 +482,14 @@ cargo run -p assessment-core --example nexc_scenario
 
 Rust 1.88+ (the toolchain file pins 1.99). The protos compile with
 [`protox`](https://crates.io/crates/protox), so no `protoc` is needed.
+
+The judge's TLS stack (`aws-lc-sys`) needs a C compiler. A build without
+it needs none: `cargo build -p assessment-server --no-default-features`
+has no HTTP client and no TLS crate, and refuses `--judge on`. A client
+built with `assessment-grpc` `default-features = false, features =
+["client"]` does not pull in the judge either. CI checks both, and that
+`assessment-core` depends only on `chrono`, `serde`, `serde_json` and
+`thiserror`.
 
 This workspace uses [Symposium](https://github.com/symposium-dev/symposium)
 (`cargo agents`) to give AI coding agents crate-specific skills: run

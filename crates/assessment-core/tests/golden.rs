@@ -10,6 +10,10 @@
 //! Review the diff of `tests/golden/` before committing a re-bless, and say in
 //! the CHANGELOG what moved and why. `engine_version` is blanked so a version
 //! bump alone does not rewrite every file.
+//!
+//! `tests/golden_pre_m4/` is a copy of the outputs from before text judgments
+//! existed. It is never re-blessed: with `judge.enabled = false` the engine
+//! must still give exactly those bytes.
 
 mod support;
 
@@ -42,8 +46,12 @@ fn without_version(mut a: Assessment) -> Assessment {
 /// Compares (or, when blessing, writes) one golden file; returns a
 /// description of the first difference, if any.
 fn check(name: &str, actual: &str) -> Option<String> {
-    let path = golden_dir().join(format!("{name}.json"));
-    if blessing() {
+    check_in(&golden_dir(), blessing(), name, actual)
+}
+
+fn check_in(dir: &std::path::Path, bless: bool, name: &str, actual: &str) -> Option<String> {
+    let path = dir.join(format!("{name}.json"));
+    if bless {
         std::fs::create_dir_all(golden_dir()).expect("the golden directory can be created");
         std::fs::write(&path, actual).expect("the golden file can be written");
         return None;
@@ -87,24 +95,21 @@ fn assert_all(results: Vec<Option<String>>) {
     );
 }
 
-fn assess(req: &AssessmentRequest) -> Assessment {
-    without_version(Engine::default().assess(req).expect("the request assesses"))
+fn assess(engine: &Engine, req: &AssessmentRequest) -> Assessment {
+    without_version(engine.assess(req).expect("the request assesses"))
 }
 
-#[test]
-fn text_cases_match_their_golden_files() {
-    let results = support::TEXT_CASES
+fn text_cases(engine: &Engine) -> Vec<(String, String)> {
+    support::TEXT_CASES
         .iter()
         .map(|(name, before, after)| {
-            let a = assess(&support::text_case(before, after));
-            check(&format!("text_{name}"), &render(&a))
+            let a = assess(engine, &support::text_case(before, after));
+            (format!("text_{name}"), render(&a))
         })
-        .collect();
-    assert_all(results);
+        .collect()
 }
 
-#[test]
-fn synthetic_graphs_match_their_golden_files() {
+fn synthetic_graphs(engine: &Engine) -> Vec<(String, String)> {
     let graphs: Vec<(&str, AssessmentRequest)> = vec![
         ("graph_siblings", support::siblings(200, 120, 25)),
         ("graph_cousins", support::cousins(40, 3, 120, 25)),
@@ -113,32 +118,29 @@ fn synthetic_graphs_match_their_golden_files() {
         ("graph_unrelated", support::unrelated(100, 120, 25)),
         ("graph_blocking_chain", support::blocking_chain(8, 120, 25)),
     ];
-    let results = graphs
+    graphs
         .iter()
-        .map(|(name, req)| check(name, &render(&assess(req))))
-        .collect();
-    assert_all(results);
+        .map(|(name, req)| ((*name).to_owned(), render(&assess(engine, req))))
+        .collect()
 }
 
-#[test]
-fn the_shipped_example_matches_its_golden_file() {
+fn shipped_example(engine: &Engine) -> Vec<(String, String)> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/requests/parent_rewrite.core.json"
     );
     let json = std::fs::read_to_string(path).expect("the example exists");
     let req: AssessmentRequest = serde_json::from_str(&json).expect("the example parses");
-    assert_all(vec![check(
-        "example_parent_rewrite",
-        &render(&assess(&req)),
-    )]);
+    vec![(
+        "example_parent_rewrite".to_owned(),
+        render(&assess(engine, &req)),
+    )]
 }
 
 /// The registry path: a project tree stored put by put, then the parent's
 /// rewrite and a sub-issue's re-estimate assessed against the stored graph.
-#[test]
-fn registry_puts_match_their_golden_files() {
-    let registry = Registry::new(Engine::default());
+fn registry_puts(engine: &Engine) -> Vec<(String, String)> {
+    let registry = Registry::new(engine.clone());
     let opts = || PutOptions {
         now: Some(support::now()),
         ..PutOptions::default()
@@ -164,9 +166,61 @@ fn registry_puts_match_their_golden_files() {
     );
     let reestimated = outcome(sub);
     let stale = render(&registry.stale(Some("X")).expect("stale lists"));
-    assert_all(vec![
-        check("registry_parent_rewrite", &rewritten),
-        check("registry_sub_reestimate", &reestimated),
-        check("registry_stale", &stale),
-    ]);
+    vec![
+        ("registry_parent_rewrite".to_owned(), rewritten),
+        ("registry_sub_reestimate".to_owned(), reestimated),
+        ("registry_stale".to_owned(), stale),
+    ]
+}
+
+fn check_all(outputs: Vec<(String, String)>) {
+    assert_all(outputs.iter().map(|(n, a)| check(n, a)).collect());
+}
+
+#[test]
+fn text_cases_match_their_golden_files() {
+    check_all(text_cases(&Engine::default()));
+}
+
+#[test]
+fn synthetic_graphs_match_their_golden_files() {
+    check_all(synthetic_graphs(&Engine::default()));
+}
+
+#[test]
+fn the_shipped_example_matches_its_golden_file() {
+    check_all(shipped_example(&Engine::default()));
+}
+
+#[test]
+fn registry_puts_match_their_golden_files() {
+    check_all(registry_puts(&Engine::default()));
+}
+
+/// With the judge off, every output is byte for byte what it was before text
+/// judgments existed. The copy in `tests/golden_pre_m4/` is never re-blessed.
+#[test]
+fn judge_disabled_is_byte_identical_to_the_outputs_before_judgments() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden_pre_m4");
+    let mut policy = Policy::default();
+    policy.judge.enabled = false;
+    let engine = Engine::new(policy).expect("the policy is valid");
+    let mut outputs = text_cases(&engine);
+    outputs.extend(synthetic_graphs(&engine));
+    outputs.extend(shipped_example(&engine));
+    outputs.extend(registry_puts(&engine));
+    assert_eq!(outputs.len(), 24);
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("the copy exists").count(),
+        outputs.len(),
+        "every pre-M4 file is covered"
+    );
+    assert_all(
+        outputs
+            .iter()
+            .map(|(n, a)| check_in(&dir, false, n, a))
+            .collect(),
+    );
 }

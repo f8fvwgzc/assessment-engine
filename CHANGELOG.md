@@ -8,6 +8,159 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Text judgments (core). The engine flags a text change whose meaning its
+  word counts cannot settle, and uses a judgment of it when one is supplied.
+  The engine never calls a model: a judgment is plain data in the request.
+  - `TextDiff.gray_zone` (reasons and fingerprint) and
+    `FieldAssessment.judgment` (`FieldJudgment`: status, reasons,
+    fingerprint, lexical magnitude, and the supplied relation, confidence,
+    weight, rationale and source). Reasons are `negation_changed`,
+    `scope_qualifier`, `term_substitution`, `paraphrase_suspected` and
+    `near_threshold`. A reorder, a removed list item and a clear negation
+    flip are never flagged. The scope words are English.
+  - `ChangeSet.judgments` takes `TextJudgment`s (`TextRelation`:
+    `equivalent`, `extended`, `narrowed`, `replaced`, `reversed`,
+    `undetermined`). A judgment is used only when its fingerprint matches
+    the two texts (`text::fingerprint`, SHA-256). Otherwise it is `stale`.
+    A decisive `equivalent` lowers a paraphrase to a patch. A decisive
+    raising relation makes the change breaking.
+  - `Assessment.judgment_requests` lists the flagged fields that still wait,
+    in a fixed order. Only the first `judge.max_requests` flagged fields of
+    a request can be listed. The rest are `over_budget`, and supplied
+    judgments do not free a place.
+    A removed list item, a negation flip, a requirement-word shift or a
+    changed number blocks every lowering judgment: the magnitude and the
+    bump stay. `AssessOptions.judgment_texts` adds the two texts.
+    `Assessment.unmatched_judgments` lists judgments of fields that did not
+    change. `AssessOptions.judge` is carried for servers. The engine
+    ignores it.
+  - `Policy.judge` (`JudgePolicy`) holds every threshold.
+    `judge.enabled = false` turns the feature off: nothing is flagged,
+    supplied judgments are ignored, and every output is byte for byte what
+    it was before.
+  - `Engine::compare_text_as(field, …)` reports the gray zone for a field.
+    `compare_text` reports it for a description.
+  - Registry: `PutOptions.judgments`, `PutOptions.hold_if_flagged` (a put
+    that would ask for a judgment stores nothing, also when a supplied
+    judgment is stale), `VersionRecord.judgments`
+    (the applied judgments) and `Registry::compare_with`. `compare` uses the
+    stored judgments again, so it agrees with the history. Import never
+    uses judgments.
+- Text judgments (gRPC contract and client). Every change is additive: an
+  old client and an old server keep working.
+  - Proto: enums `TextRelation` and `JudgmentStatus`, messages
+    `TextJudgment`, `FieldJudgment`, `JudgmentRequest`, `JudgmentKey` and
+    `GrayZone`. New fields: `AssessOptions.judge` and `.judgment_texts`,
+    `ChangeSet.judgments`, `FieldAssessment.judgment`,
+    `Assessment.judgment_requests` and `.unmatched_judgments`,
+    `CompareTextRequest.field`, `CompareTextResponse.gray_zone`,
+    `GetPolicyResponse.judge`, `VersionRecord.judgments`,
+    `PutEntityRequest.judgments` and `.hold_if_flagged`,
+    `CompareVersionsRequest.options` and `.judgments`.
+  - A request judgment is checked strictly. An unspecified or unknown
+    relation, or a confidence that is not a finite number in [0, 1], is
+    `INVALID_ARGUMENT` with the field path, for example
+    `changes[0].judgments[1].relation`. An unset confidence is 1.
+  - A response is read leniently. An unknown judgment status reads as
+    `unavailable` with a note in `detail`. An unknown relation reads as
+    none. Unknown reasons are dropped.
+  - `CompareText` never calls a model. `GetPolicyResponse.judge` is empty on
+    a server without a judge.
+  - Client: `AssessmentClient::with_timeout` (sent as `grpc-timeout` on
+    every call), `compare_text_as`, `compare_versions_with` and
+    `judge_info`.
+- Model judge (new crate `assessment-judge`). `assessment-core` is unchanged
+  and still makes no calls.
+  - `Judge` (a trait that works behind `dyn`), `Question`, `Hints`,
+    `Verdict`, `Usage`, `JudgeError`, `JudgeErrorKind`, and `ask`, which
+    enforces the deadline and checks the answer.
+  - `AnthropicJudge` (feature `anthropic`, on by default) asks the Anthropic
+    Messages API for one of the six relations as schema-checked JSON. The
+    two texts are sent as untrusted data and may be in any language. The
+    rationale is English. It retries only timeouts, connection errors and
+    408, 409, 429 and 5xx answers, at most three attempts, always inside the
+    deadline. It follows no redirect, allows plain http for loopback only,
+    reads at most 1 MiB, and keeps the API key out of `Debug` output, errors
+    and logs. A background probe checks the key and the model at startup.
+  - `CachedJudge` keeps 4096 successful verdicts and shares one call among
+    equal questions that arrive together.
+  - `LimitedJudge` allows 8 calls at once, 60 per minute and 10 US dollars
+    per hour (reserved before the call, corrected after it), and pauses
+    after repeated failures. A question waits for a free place as long as
+    its call could still start inside its deadline, so 16 questions asked
+    together run as two rounds of 8.
+  - Without the `anthropic` feature the crate pulls in no HTTP or TLS crate.
+  - `examples/judge_cases.rs` is a paid evaluation of six cases. It does
+    not run without `ANTHROPIC_API_KEY` and is not part of the tests.
+- Judged assessments (server, off by default). A server with a judge asks
+  it about the flagged `title` and `description` changes and assesses again
+  with the answers. A judge never fails a call: a field it did not answer
+  keeps the engine's result and gets the status `unavailable` with a short
+  detail, such as `judge timed out after 15 s` or `spend cap reached`.
+  - `assessment_grpc::flow`: `assess_judged`, `Flow`, `JudgeSettings`,
+    `JudgeReport`, `Judged` and `FlowError`. The service and the command
+    line share it.
+  - `AssessmentService::with_judge`, `with_call_timeout` and
+    `with_shutdown`. `Assess`, `AssessBatch`, `AssessStream`, `PutEntity`
+    and `CompareVersions` are judged. `Import` and `CompareText` never are.
+    `options.judge = false` gives the engine's own result. A call with
+    `options.judge = true` on a server without a judge gets `unavailable`
+    with `this server has no judge`.
+  - One call asks about at most 4 fields and one batch about at most 16.
+    Texts longer than 8000 characters are not sent. The judge gets the time
+    the call's deadline leaves, and at most 15 s. The second passes of a
+    batch run inside the same per-call limit as the first passes.
+  - A stale judgment from the caller is not used: the judge is asked
+    about that field, and without an answer the field is `unavailable`
+    with a detail.
+  - A flagged `PutEntity` is judged before it is stored, and the version
+    record keeps the judgments. A put is stored when the judge fails.
+  - `GetPolicy` returns the judge id. Each judged call writes one log line
+    with the counts, the tokens and the estimated cost.
+  - Server flags `--judge off|on|auto` (`ASSESSMENT_JUDGE`, default `off`),
+    `--judge-default`, `--judge-model`, `--judge-effort`,
+    `--judge-timeout-secs`, `--judge-max-fields-per-request`,
+    `--judge-max-fields-per-batch`, `--judge-concurrency`,
+    `--judge-max-calls-per-minute`, `--judge-max-usd-per-hour`,
+    `--judge-max-text-chars`, `--judge-max-tokens`, `--judge-cache-entries`,
+    `--judge-fallbacks`, `--judge-base-url` and
+    `--judge-allow-unauthenticated`, each with an `ASSESSMENT_JUDGE_*`
+    variable. The API key is read only from `ANTHROPIC_API_KEY` or from
+    `--anthropic-api-key-file` (`ANTHROPIC_API_KEY_FILE`). There is no key
+    flag.
+  - Startup checks: `--judge on` needs a key, and `auto` runs without a
+    judge when there is none. A judge without `--auth-token` on an address
+    that is not loopback is refused unless
+    `--judge-allow-unauthenticated` is set. A plain `http://` base URL is
+    refused unless it is loopback.
+  - `assessment-engine assess FILE|- --judge` asks the judge from the
+    command line and prints one summary line on stderr.
+    `compare-text --field description|title` prints `gray_zone` for that
+    field.
+  - Cargo feature `judge` of `assessment-server` (on by default). A binary
+    built without it has no HTTP client and refuses `--judge on`.
+  - The container image now has `ca-certificates`.
+- Judgment docs, examples and CI checks.
+  - `docs/SCORING.md` §2a describes the gray zone, the fingerprint (with
+    test vectors), the relations, the formulas, the propagation shares and
+    the confidence. `docs/JUDGE.md` describes the server judge: where the
+    prompt lives, the flags, the limits, the failure details and the threat
+    model. The README has a "Judgments" section.
+  - `examples/requests/paraphrase.core.json` and
+    `paraphrase_judged.core.json`, with the proto JSON twins
+    `paraphrase.json` and `paraphrase_judged.json`. A test checks the
+    fingerprint in them and that the judged one is a patch.
+  - CI job `features`: clippy for `assessment-grpc` without features, with
+    the client only and with the server only, for `assessment-judge`
+    without the Anthropic client and for `assessment-server` without the
+    judge. It also checks that `assessment-core` depends on `chrono`,
+    `serde`, `serde_json` and `thiserror` only, and that a client-only
+    build and a judge-less server pull in no HTTP client or TLS crate.
+  - The Docker job checks that the image has a CA bundle and that
+    `assess --judge` without a network returns the engine's own result
+    with the status `unavailable`.
+  - The paid evaluation of the judge against the real API has not been run.
+    The cost and latency figures in the README are estimates.
 - Registry as an ingest target (core):
   - A put that matches the stored entity is answered before the engine runs.
     `PutOutcome::unchanged` reports it. The returned assessment is then an
@@ -138,6 +291,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- A flagged text change that has no judgment keeps its bump and its score.
+  Its confidence is multiplied by `judge.unjudged_confidence` (0.85), and the
+  explanation and the summary say the meaning was not verified. Seven of
+  the 24 golden files were re-blessed, each because its description is now
+  flagged. In each the bump, the score and the impacts are the same. The
+  confidence is lower, the field has a `judgment` block with the status
+  `requested`, the texts say "meaning not verified", and there is one
+  `judgment_requests` entry.
+  - `text_paraphrase`: `paraphrase_suspected`. Confidence 0.9 → 0.765.
+  - `text_postgres_mongo`: `term_substitution` (PostgreSQL → MongoDB).
+    Confidence 0.9 → 0.765.
+  - `text_flexible_fixed`: `term_substitution` (flexible → fixed).
+    Confidence 0.9 → 0.765.
+  - `text_except_paypal`: `scope_qualifier` (added "except").
+    Confidence 0.9 → 0.765.
+  - `text_login_logout`: `term_substitution` and `near_threshold`.
+    Confidence 0.7 → 0.595.
+  - `text_http_https`: `term_substitution`. Confidence 0.7 → 0.595.
+  - `text_mongolian_negation`: `term_substitution`. Confidence 0.9 → 0.765.
+    The rules do not read Mongolian: the changed word is seen as a swapped
+    term.
+
+  The other 17 files are byte-identical. With `judge.enabled = false` all
+  24 match the outputs from before judgments, which are kept in
+  `tests/golden_pre_m4/` and checked by a test.
 - A put that matches the stored entity is no longer assessed. Before, the
   engine ran and the answer held one change with no field changes. Now
   `PutOutcome::unchanged` (`PutEntityResponse.unchanged`) is set and the
@@ -168,8 +346,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Compatibility
 
-- Assessment results are unchanged. Every golden output is byte-identical
-  under the default policy.
+- Rust struct literals of `ChangeSet`, `AssessOptions`, `PutOptions`,
+  `FieldAssessment`, `Assessment`, `TextDiff`, `VersionRecord` and `Policy`
+  need the new fields (or `..Default::default()` where there is one). The
+  new JSON fields are optional, so journals and snapshots written by 0.1.0
+  and later still load.
+- Text judgments change no bump, score or impact unless a judgment is
+  supplied or a server judge is on. A flagged text field has a lower
+  confidence and new output fields (see Changed). `judge.enabled = false`
+  in the policy gives the earlier outputs byte for byte.
+- A server started without `--judge` behaves as before and makes no
+  outgoing call. Callers that never set `options.judge` or send judgments
+  need no change.
+- The engine version is still 0.1.0. To find out whether a server has a
+  judge, read `GetPolicyResponse.judge`, not the version.
+- The default build of `assessment-server` now needs a C compiler (for
+  the judge's TLS stack). `--no-default-features` builds without it.
 - The gRPC contract only grows: one new RPC, new messages and new fields
   with new numbers. Nothing is renamed or renumbered. A 0.1 client keeps
   working. It cannot see `unchanged` or `skipped_stale`, and it gets an

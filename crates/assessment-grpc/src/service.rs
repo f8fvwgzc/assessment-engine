@@ -23,17 +23,22 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use assessment_core::engine::{MAX_EMBEDDING_DIM, MAX_TEXT_BYTES};
+use assessment_core::model::field;
 use assessment_core::registry::{ImportItem, ImportSummary};
 use assessment_core::{Engine, Error as CoreError, ErrorKind, Registry};
+use assessment_judge::Judge;
 use prost::Message as _;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::time::Instant;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::convert::{self, AssessInput, ConvertError};
+use crate::flow::{self, Flow, JudgeReport, JudgeSettings};
 use crate::pb;
 use crate::pb::assessment_engine_server::AssessmentEngine;
 
@@ -47,7 +52,8 @@ pub struct ServiceLimits {
     /// Most items one `AssessBatch` or `AssessStream` call has started at
     /// the same time (results are still returned in request order). Each
     /// started item waits for its own assessment slot, so a call holds up
-    /// to this many places in the slot queue. On a stream this also bounds
+    /// to this many places in the slot queue. The second passes of a judged
+    /// batch count against the same number. On a stream this also bounds
     /// the responses buffered for a slow reader. Default: the number of
     /// CPUs, at least 2. [`AssessmentService::with_limits`] keeps it within
     /// 1 and [`MAX_SLOTS`].
@@ -178,19 +184,36 @@ pub struct AssessmentService {
     /// of an `Import`. Separate, so a wait on the registry lock or the
     /// journal never holds a stateless slot.
     registry_slots: Arc<Semaphore>,
+    /// The optional judge and its settings.
+    flow: Flow,
+    /// The server's request timeout: a unary call's deadline counts from
+    /// the start of the request.
+    call_timeout: Option<Duration>,
 }
+
+/// When the server began to handle a request. The auth interceptor puts it
+/// in the request's extensions; the judge's deadline counts from it.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestStart(pub Instant);
+
+/// A stream with a judge may have this many more items in flight: an item
+/// that waits for the judge uses no CPU.
+const JUDGED_STREAM_EXTRA: usize = 8;
 
 impl AssessmentService {
     /// A service over `engine` (stateless calls; per-request policy overrides
     /// are merged over its policy) and `registry` (stateful calls).
     pub fn new(engine: Engine, registry: Arc<Registry>) -> Self {
         let limits = ServiceLimits::default().normalised();
+        let stateless_slots = Arc::new(Semaphore::new(limits.max_concurrent_assessments));
         Self {
             engine: Arc::new(engine),
             registry,
             limits,
-            stateless_slots: Arc::new(Semaphore::new(limits.max_concurrent_assessments)),
+            flow: Flow::new().with_slots(Arc::clone(&stateless_slots)),
+            stateless_slots,
             registry_slots: Arc::new(Semaphore::new(limits.max_concurrent_assessments)),
+            call_timeout: None,
         }
     }
 
@@ -220,7 +243,60 @@ impl AssessmentService {
         self.limits = limits;
         self.stateless_slots = Arc::new(Semaphore::new(limits.max_concurrent_assessments));
         self.registry_slots = Arc::new(Semaphore::new(limits.max_concurrent_assessments));
+        self.flow = self.flow.with_slots(Arc::clone(&self.stateless_slots));
         self
+    }
+
+    /// This service with a judge for the flagged `title` and `description`
+    /// changes of `Assess`, `AssessBatch`, `AssessStream`, `PutEntity` and
+    /// `CompareVersions`. A judge that fails or is slow never fails a call.
+    #[must_use]
+    pub fn with_judge(mut self, judge: Arc<dyn Judge>, settings: JudgeSettings) -> Self {
+        self.flow = self.flow.with_judge(judge, settings);
+        self
+    }
+
+    /// This service with the server's request timeout. A unary call gives
+    /// its judge only the time that leaves room to answer within it.
+    /// [`engine_server`](crate::server::engine_server) sets it.
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    /// This service with a shutdown signal. Once it is `true`, open calls
+    /// stop waiting for the judge and answer without it.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.flow = self.flow.with_shutdown(shutdown);
+        self
+    }
+
+    /// The name of the judge, if the service has one.
+    pub fn judge_id(&self) -> Option<&str> {
+        self.flow.judge_id()
+    }
+
+    /// When the caller of `request` stops waiting: the start of the request
+    /// plus the shorter of the server's timeout (unary calls only) and the
+    /// client's `grpc-timeout`.
+    fn call_deadline<T>(&self, request: &Request<T>, unary: bool) -> Option<Instant> {
+        let start = request
+            .extensions()
+            .get::<RequestStart>()
+            .map_or_else(Instant::now, |start| start.0);
+        let client = request
+            .metadata()
+            .get("grpc-timeout")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_grpc_timeout);
+        let server = if unary { self.call_timeout } else { None };
+        let limit = match (server, client) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        limit.and_then(|limit| start.checked_add(limit))
     }
 
     /// Runs one stateless assessment on the blocking pool once a stateless
@@ -241,6 +317,21 @@ impl AssessmentService {
         T: Send + 'static,
     {
         blocking_in_slot(&self.registry_slots, f).await
+    }
+
+    /// One registry put, in a registry slot.
+    async fn put(
+        &self,
+        entity: assessment_core::model::Entity,
+        options: assessment_core::registry::PutOptions,
+    ) -> Result<assessment_core::registry::PutOutcome, Status> {
+        let registry = Arc::clone(&self.registry);
+        self.registry_blocking(move || {
+            let outcome = registry.put(entity, options);
+            log_compaction_error(&registry);
+            into_core_result(outcome)
+        })
+        .await
     }
 
     /// The limits in force.
@@ -388,20 +479,53 @@ fn engine_for(
     }
 }
 
-/// Decodes, assesses and encodes one request (blocking).
-fn assess_one(engine: &Arc<Engine>, input: AssessInput) -> Result<pb::Assessment, Failure> {
-    let engine = engine_for(engine, input.policy_overrides).map_err(Failure::Core)?;
-    let assessment = engine.assess(&input.request).map_err(Failure::Core)?;
-    Ok(assessment.into())
+/// The value of a `grpc-timeout` header: up to 8 digits and a unit.
+fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+    let unit = value.chars().last()?;
+    let digits = value.strip_suffix(unit)?;
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        'H' => Duration::from_secs(n * 3_600),
+        'M' => Duration::from_secs(n * 60),
+        'S' => Duration::from_secs(n),
+        'm' => Duration::from_millis(n),
+        'u' => Duration::from_micros(n),
+        'n' => Duration::from_nanos(n),
+        _ => return None,
+    })
 }
 
-/// One request of a batch or a stream: never fails, errors go in the response.
-fn assess_item(engine: &Arc<Engine>, request: pb::AssessRequest) -> pb::AssessResponse {
-    let request_id = request.request_id.clone();
-    let result = AssessInput::try_from(request)
-        .map_err(Failure::Convert)
-        .and_then(|input| assess_one(engine, input));
-    item_response(request_id, result)
+/// The first pass of one request.
+enum First {
+    /// Nothing for the judge: the answer is ready.
+    Done(Box<pb::Assessment>),
+    /// The judge may be asked about a flagged field.
+    Open(Box<flow::Pass1>),
+}
+
+/// Assesses one request (blocking). Without flagged fields for the judge,
+/// the answer is encoded here too.
+fn first_pass(engine: &Arc<Engine>, input: AssessInput, flow: &Flow) -> Result<First, Failure> {
+    let engine = engine_for(engine, input.policy_overrides).map_err(Failure::Core)?;
+    let first = flow::pass_1(engine, input.request, flow).map_err(Failure::Core)?;
+    Ok(if first.flagged() {
+        First::Open(Box::new(first))
+    } else {
+        First::Done(Box::new(first.into_assessment().into()))
+    })
+}
+
+/// Decodes and assesses one request of a batch or a stream (blocking).
+fn first_item(
+    engine: &Arc<Engine>,
+    request: pb::AssessRequest,
+    flow: &Flow,
+) -> Result<First, Failure> {
+    let input = AssessInput::try_from(request).map_err(Failure::Convert)?;
+    first_pass(engine, input, flow)
 }
 
 fn item_response(
@@ -422,64 +546,132 @@ fn item_response(
     }
 }
 
+/// A task that is aborted when this is dropped.
+struct Task<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Task<T> {
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Waits for a stateless slot, then runs the first pass of one item on the
+/// blocking pool. `permit` (the per-call permit, when the item should hold
+/// it) is released with the slot.
+async fn run_first(
+    engine: Arc<Engine>,
+    slots: Arc<Semaphore>,
+    request: pb::AssessRequest,
+    permit: Option<OwnedSemaphorePermit>,
+    flow: Flow,
+) -> Result<First, Failure> {
+    let Ok(slot) = slots.acquire_owned().await else {
+        return Err(Failure::Internal("the service is shutting down".to_owned()));
+    };
+    let work = tokio::task::spawn_blocking(move || {
+        let _held = (permit, slot);
+        first_item(&engine, request, &flow)
+    });
+    match work.await {
+        Ok(result) => result,
+        Err(err) => Err(join_failure(&err)),
+    }
+}
+
 /// One started item of a batch or a stream.
 ///
 /// Its task waits for a stateless slot, then runs the assessment on the
 /// blocking pool. Dropping this aborts the task: an item still waiting gives
 /// up its place in the queue and its permits; an item already assessing runs
-/// to completion and then frees its slot.
-struct ItemTask {
+/// to completion and then frees its slot; an item waiting for the judge
+/// stops asking.
+struct ItemTask<T> {
     request_id: String,
-    handle: tokio::task::JoinHandle<pb::AssessResponse>,
+    task: Task<T>,
 }
 
-impl ItemTask {
-    /// Starts one item. The item waits for its slot on its own task, so the
-    /// caller never waits for a slot and a call can queue several items at
-    /// once. `permit` (the per-call permit, when the item should hold it) is
-    /// taken before the slot and released when the item finishes.
-    fn spawn(
+impl ItemTask<Result<First, Failure>> {
+    /// Starts the first pass of one batch item. The item waits for its slot
+    /// on its own task, so the caller never waits for a slot and a call can
+    /// queue several items at once.
+    fn first(
         engine: &Arc<Engine>,
         slots: &Arc<Semaphore>,
         request: pb::AssessRequest,
-        permit: Option<OwnedSemaphorePermit>,
+        permit: OwnedSemaphorePermit,
+        flow: &Flow,
     ) -> Self {
         let request_id = request.request_id.clone();
-        let engine = Arc::clone(engine);
-        let slots = Arc::clone(slots);
-        let handle = tokio::spawn(async move {
-            let request_id = request.request_id.clone();
-            let Ok(slot) = slots.acquire_owned().await else {
-                let failure = Failure::Internal("the service is shutting down".to_owned());
-                return item_response(request_id, Err(failure));
-            };
-            let work = tokio::task::spawn_blocking(move || {
-                let _held = (permit, slot);
-                assess_item(&engine, request)
-            });
-            match work.await {
-                Ok(response) => response,
-                Err(err) => item_response(request_id, Err(join_failure(&err))),
-            }
-        });
-        Self { request_id, handle }
+        let work = run_first(
+            Arc::clone(engine),
+            Arc::clone(slots),
+            request,
+            Some(permit),
+            flow.clone(),
+        );
+        Self {
+            request_id,
+            task: Task(tokio::spawn(work)),
+        }
     }
 
-    /// The item's response (an `internal` error if its task failed).
-    async fn finish(mut self) -> pb::AssessResponse {
-        match (&mut self.handle).await {
-            Ok(response) => response,
-            Err(err) => {
-                let request_id = std::mem::take(&mut self.request_id);
-                item_response(request_id, Err(join_failure(&err)))
-            }
+    /// The item's id and its first pass.
+    async fn finish(mut self) -> (String, Result<First, Failure>) {
+        let request_id = std::mem::take(&mut self.request_id);
+        match self.task.join().await {
+            Ok(first) => (request_id, first),
+            Err(err) => (request_id, Err(join_failure(&err))),
         }
     }
 }
 
-impl Drop for ItemTask {
-    fn drop(&mut self) {
-        self.handle.abort();
+impl ItemTask<pb::AssessResponse> {
+    /// Starts one stream item: both passes and the judge between them.
+    /// `deadline` is when the client stops waiting, if it said so.
+    fn spawn(
+        engine: &Arc<Engine>,
+        slots: &Arc<Semaphore>,
+        request: pb::AssessRequest,
+        flow: &Flow,
+        deadline: Option<Instant>,
+    ) -> Self {
+        let request_id = request.request_id.clone();
+        let engine = Arc::clone(engine);
+        let slots = Arc::clone(slots);
+        let flow = flow.clone();
+        let handle = tokio::spawn(async move {
+            let request_id = request.request_id.clone();
+            let first = run_first(engine, slots, request, None, flow.clone()).await;
+            let result = match first {
+                Ok(First::Done(assessment)) => Ok(*assessment),
+                Ok(First::Open(first)) => {
+                    let judged = flow::complete(*first, &flow, deadline).await;
+                    judged.report.log("AssessStream");
+                    Ok(judged.assessment.into())
+                }
+                Err(failure) => Err(failure),
+            };
+            item_response(request_id, result)
+        });
+        Self {
+            request_id,
+            task: Task(handle),
+        }
+    }
+
+    /// The item's response (an `internal` error if its task failed).
+    async fn finish(mut self) -> pb::AssessResponse {
+        let request_id = std::mem::take(&mut self.request_id);
+        match self.task.join().await {
+            Ok(response) => response,
+            Err(err) => item_response(request_id, Err(join_failure(&err))),
+        }
     }
 }
 
@@ -488,7 +680,7 @@ type ResponseStream = Pin<Box<dyn Stream<Item = Result<pb::AssessResponse, Statu
 /// What the stream reader hands the writer, in request order.
 enum Pending {
     Item {
-        task: ItemTask,
+        task: ItemTask<pb::AssessResponse>,
         permit: OwnedSemaphorePermit,
     },
     Failed(Status),
@@ -615,6 +807,9 @@ fn non_empty(id: String) -> Option<String> {
     (!id.trim().is_empty()).then_some(id)
 }
 
+/// The longest field name CompareText accepts.
+const MAX_FIELD_NAME_BYTES: usize = 256;
+
 fn check_text(name: &'static str, text: &str) -> Result<(), Status> {
     if text.len() > MAX_TEXT_BYTES {
         return Err(Status::invalid_argument(format!(
@@ -642,17 +837,27 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<pb::AssessRequest>,
     ) -> Result<Response<pb::AssessResponse>, Status> {
+        let deadline = self.call_deadline(&request, true);
         let request = request.into_inner();
         let request_id = request.request_id.clone();
         let engine = Arc::clone(&self.engine);
-        let assessment = self
+        let flow = self.flow.clone();
+        let first = self
             .assess_blocking(move || {
                 AssessInput::try_from(request)
                     .map_err(Failure::Convert)
-                    .and_then(|input| assess_one(&engine, input))
+                    .and_then(|input| first_pass(&engine, input, &flow))
                     .map_err(Failure::into_status)
             })
             .await?;
+        let assessment = match first {
+            First::Done(assessment) => *assessment,
+            First::Open(first) => {
+                let judged = flow::complete(*first, &self.flow, deadline).await;
+                judged.report.log("Assess");
+                judged.assessment.into()
+            }
+        };
         Ok(Response::new(pb::AssessResponse {
             request_id,
             assessment: Some(assessment),
@@ -664,6 +869,7 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<pb::AssessBatchRequest>,
     ) -> Result<Response<pb::AssessBatchResponse>, Status> {
+        let deadline = self.call_deadline(&request, true);
         let requests = request.into_inner().requests;
         if requests.len() > self.limits.max_batch_size {
             return Err(Status::invalid_argument(format!(
@@ -679,22 +885,104 @@ impl AssessmentEngine for AssessmentService {
         // `running`, which aborts the items still waiting.
         let permits = Arc::new(Semaphore::new(self.limits.max_in_flight));
         let mut running = Vec::with_capacity(requests.len());
+        // The loop below waits for permits, so in a batch larger than
+        // `max_in_flight` most of the first pass runs inside it. The time of
+        // the first pass counts from here.
+        let started = Instant::now();
         for request in requests {
             let permit = Arc::clone(&permits)
                 .acquire_owned()
                 .await
                 .map_err(|_| Status::internal("the batch was cancelled"))?;
-            running.push(ItemTask::spawn(
+            running.push(ItemTask::first(
                 &self.engine,
                 &self.stateless_slots,
                 request,
-                Some(permit),
+                permit,
+                &self.flow,
             ));
         }
-        let mut responses = Vec::with_capacity(running.len());
+        let mut items = Vec::with_capacity(running.len());
         for task in running {
-            responses.push(task.finish().await);
+            items.push(task.finish().await);
         }
+
+        // One selection over the whole batch: the questions are spent on
+        // the most doubtful fields first, whichever item they are in.
+        let mut candidates: Vec<flow::Candidate> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, first))| match first {
+                Ok(First::Open(first)) => Some(first.candidates(i)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        candidates.sort_by(flow::Candidate::batch_order);
+        let answers = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let cap = self.flow.settings().max_fields_per_batch;
+            flow::ask_all(&self.flow, &candidates, cap, deadline, started.elapsed()).await
+        };
+        let mut asked: Vec<(Vec<flow::Candidate>, Vec<flow::Answer>)> =
+            items.iter().map(|_| (Vec::new(), Vec::new())).collect();
+        for (candidate, answer) in candidates.into_iter().zip(answers) {
+            let slot = &mut asked[candidate.item];
+            slot.0.push(candidate);
+            slot.1.push(answer);
+        }
+
+        // The second passes run side by side, each in its own slot. Like the
+        // first passes, each takes a per-call permit before it queues for a
+        // slot, so the call still holds at most `max_in_flight` places in
+        // the slot queue. An item with no answer has no second pass and
+        // takes no permit.
+        enum Second {
+            Ready(Box<pb::AssessResponse>),
+            Running(String, Task<flow::Judged>),
+        }
+        let mut seconds = Vec::with_capacity(items.len());
+        for ((request_id, first), (candidates, answers)) in items.into_iter().zip(asked) {
+            seconds.push(match first {
+                Ok(First::Done(assessment)) => {
+                    Second::Ready(Box::new(item_response(request_id, Ok(*assessment))))
+                }
+                Ok(First::Open(first)) => {
+                    let flow = self.flow.clone();
+                    let permit = if flow::has_verdict(&answers) {
+                        let permit = Arc::clone(&permits)
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| Status::internal("the batch was cancelled"))?;
+                        Some(permit)
+                    } else {
+                        None
+                    };
+                    let work = async move {
+                        let _permit = permit;
+                        flow::finish(*first, candidates, answers, &flow, deadline).await
+                    };
+                    Second::Running(request_id, Task(tokio::spawn(work)))
+                }
+                Err(failure) => Second::Ready(Box::new(item_response(request_id, Err(failure)))),
+            });
+        }
+        let mut report = JudgeReport::default();
+        let mut responses = Vec::with_capacity(seconds.len());
+        for second in seconds {
+            responses.push(match second {
+                Second::Ready(response) => *response,
+                Second::Running(request_id, task) => match task.join().await {
+                    Ok(judged) => {
+                        report.add(&judged.report);
+                        item_response(request_id, Ok(judged.assessment.into()))
+                    }
+                    Err(err) => item_response(request_id, Err(join_failure(&err))),
+                },
+            });
+        }
+        report.log("AssessBatch");
         Ok(Response::new(pb::AssessBatchResponse { responses }))
     }
 
@@ -704,8 +992,20 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<Streaming<pb::AssessRequest>>,
     ) -> Result<Response<Self::AssessStreamStream>, Status> {
+        // A stream has no server-side deadline: only the client's counts.
+        let deadline = self.call_deadline(&request, false);
         let mut inbound = request.into_inner();
-        let in_flight = self.limits.max_in_flight;
+        let flow = self.flow.clone();
+        let extra = if flow.has_judge() {
+            JUDGED_STREAM_EXTRA
+        } else {
+            0
+        };
+        let in_flight = self
+            .limits
+            .max_in_flight
+            .saturating_add(extra)
+            .min(MAX_SLOTS);
         let permits = Arc::new(Semaphore::new(in_flight));
         let (pending_tx, mut pending_rx) = mpsc::channel::<Pending>(in_flight);
         let (out_tx, out_rx) = mpsc::channel::<Result<pb::AssessResponse, Status>>(in_flight);
@@ -733,7 +1033,7 @@ impl AssessmentEngine for AssessmentService {
                         let Ok(permit) = permit else {
                             break;
                         };
-                        let task = ItemTask::spawn(&engine, &slots, request, None);
+                        let task = ItemTask::spawn(&engine, &slots, request, &flow, deadline);
                         Pending::Item { task, permit }
                     }
                     Ok(None) => break,
@@ -781,6 +1081,11 @@ impl AssessmentEngine for AssessmentService {
         let r = request.into_inner();
         check_text("before", &r.before)?;
         check_text("after", &r.after)?;
+        if r.field.len() > MAX_FIELD_NAME_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "field: is longer than {MAX_FIELD_NAME_BYTES} bytes"
+            )));
+        }
         check_embedding("before_embedding", &r.before_embedding)?;
         check_embedding("after_embedding", &r.after_embedding)?;
         let engine = Arc::clone(&self.engine);
@@ -788,8 +1093,14 @@ impl AssessmentEngine for AssessmentService {
             .assess_blocking(move || {
                 let embeddings = (!r.before_embedding.is_empty() && !r.after_embedding.is_empty())
                     .then_some((r.before_embedding.as_slice(), r.after_embedding.as_slice()));
+                // An empty field is the description.
+                let field = if r.field.is_empty() {
+                    field::DESCRIPTION
+                } else {
+                    r.field.as_str()
+                };
                 engine
-                    .compare_text(&r.before, &r.after, embeddings)
+                    .compare_text_as(field, &r.before, &r.after, embeddings)
                     .map_err(|e| status_from_core(&e))
             })
             .await?;
@@ -807,6 +1118,8 @@ impl AssessmentEngine for AssessmentService {
             .transpose()
             .map_err(|e| Status::from(e.field("overrides")))?;
         let engine = Arc::clone(&self.engine);
+        // Empty when this service has no judge.
+        let judge = self.flow.judge_id().unwrap_or_default().to_owned();
         let response = blocking(move || {
             let engine = into_core_result(engine_for(&engine, overrides))?;
             let policy = engine.policy();
@@ -818,6 +1131,7 @@ impl AssessmentEngine for AssessmentService {
             Ok(pb::GetPolicyResponse {
                 policy: Some(policy),
                 policy_json,
+                judge,
             })
         })
         .await?;
@@ -828,15 +1142,77 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<pb::PutEntityRequest>,
     ) -> Result<Response<pb::PutEntityResponse>, Status> {
+        let deadline = self.call_deadline(&request, true);
         let (entity, options) = convert::put_request_from_pb(request.into_inner())?;
-        let registry = Arc::clone(&self.registry);
-        let outcome = self
-            .registry_blocking(move || {
-                let outcome = registry.put(entity, options);
-                log_compaction_error(&registry);
-                into_core_result(outcome)
-            })
-            .await?;
+        let asked = options.assess.judge;
+        // A dry run is judged only when the caller asks for it.
+        let judged = self.flow.wants(asked) && (!options.dry_run || asked == Some(true));
+        if !judged {
+            let mut outcome = self.put(entity, options).await?;
+            if asked == Some(true) && !self.flow.has_judge() {
+                flow::mark_no_judge(&mut outcome.assessment);
+            }
+            return Ok(Response::new(outcome.into()));
+        }
+
+        // Put 1 stores the change unless a field is flagged.
+        let keep_texts = options.assess.judgment_texts;
+        let mut first_options = options.clone();
+        first_options.hold_if_flagged = true;
+        first_options.assess.judgment_texts = true;
+        let started = Instant::now();
+        let mut outcome = self.put(entity.clone(), first_options).await?;
+        let pass_1_time = started.elapsed();
+        // Put 1 was held only if it asks for a judgment. Any other put is
+        // settled: stored, unchanged, stale, or assessed with nothing to
+        // store (activity on the same content). Running it again would be
+        // wrong: its `source_seq` is remembered now, so put 2 would be stale.
+        if outcome.assessment.judgment_requests.is_empty() {
+            if !keep_texts {
+                flow::strip_texts(&mut outcome.assessment);
+            }
+            return Ok(Response::new(outcome.into()));
+        }
+
+        let title = entity.title().to_owned();
+        let candidates = flow::candidates(&outcome.assessment, 0, |_| Some(title.clone()));
+        let mut answers = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let cap = self.flow.settings().max_fields_per_request;
+            flow::ask_all(&self.flow, &candidates, cap, deadline, pass_1_time).await
+        };
+        let verdicts = flow::judgments(&candidates, &answers);
+        // With no answer, a dry run and a put the caller wanted held are
+        // already what put 1 returned.
+        if !(verdicts.is_empty() && (options.dry_run || options.hold_if_flagged)) {
+            // Put 2 is the caller's own put, with the answers added. Its
+            // version check and its time are the caller's.
+            let mut second_options = options.clone();
+            for (_, judgment) in verdicts.iter().cloned() {
+                flow::merge_judgment(&mut second_options.judgments, judgment);
+            }
+            outcome = match self.put(entity.clone(), second_options).await {
+                Ok(outcome) => outcome,
+                Err(status)
+                    if !verdicts.is_empty() && status.code() == tonic::Code::InvalidArgument =>
+                {
+                    // Put 1 took the same entity, so an answer is at fault.
+                    tracing::warn!(error = %status.message(), "a judged put was rejected; storing without the judge");
+                    flow::void_verdicts(&mut answers, flow::PASS_2_FAILED);
+                    self.put(entity, options).await?
+                }
+                Err(status) => return Err(status),
+            };
+        }
+        let report = flow::settle(
+            &mut outcome.assessment,
+            &candidates,
+            &answers,
+            keep_texts,
+            &self.flow,
+        );
+        report.log("PutEntity");
         Ok(Response::new(outcome.into()))
     }
 
@@ -904,14 +1280,95 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<pb::CompareVersionsRequest>,
     ) -> Result<Response<pb::CompareVersionsResponse>, Status> {
+        let deadline = self.call_deadline(&request, true);
         let r = request.into_inner();
         let from = convert::decode_version(r.from, "from")?;
         let to = convert::decode_version(r.to, "to")?;
         let now = convert::decode_time(r.now, "now")?;
-        let registry = Arc::clone(&self.registry);
-        let assessment = self
-            .registry_blocking(move || into_core_result(registry.compare(&r.id, from, to, now)))
-            .await?;
+        let mut options = convert::options_from_pb(r.options);
+        let judgments = convert::judgments_from_pb(r.judgments, "judgments")?;
+        let asked = options.judge;
+        if !self.flow.wants(asked) {
+            let registry = Arc::clone(&self.registry);
+            let mut assessment = self
+                .registry_blocking(move || {
+                    into_core_result(
+                        registry.compare_with(&r.id, from, to, now, &options, &judgments),
+                    )
+                })
+                .await?;
+            if asked == Some(true) && !self.flow.has_judge() {
+                flow::mark_no_judge(&mut assessment);
+            }
+            return Ok(Response::new(pb::CompareVersionsResponse {
+                assessment: Some(assessment.into()),
+            }));
+        }
+
+        // Pass 1, with the texts of the flagged fields. Both passes see the
+        // same time.
+        let keep_texts = options.judgment_texts;
+        options.judgment_texts = true;
+        let now = Some(now.unwrap_or_else(chrono::Utc::now));
+        let id = r.id;
+        let started = Instant::now();
+        let (mut assessment, title) = {
+            let registry = Arc::clone(&self.registry);
+            let (id, options, judgments) = (id.clone(), options.clone(), judgments.clone());
+            self.registry_blocking(move || {
+                let assessment = into_core_result(
+                    registry.compare_with(&id, from, to, now, &options, &judgments),
+                )?;
+                let title = registry
+                    .get(&id, Some(to))
+                    .ok()
+                    .map(|e| e.title().to_owned());
+                Ok((assessment, title))
+            })
+            .await?
+        };
+        let pass_1_time = started.elapsed();
+        let candidates = flow::candidates(&assessment, 0, |_| title.clone());
+        let mut answers = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let cap = self.flow.settings().max_fields_per_request;
+            flow::ask_all(&self.flow, &candidates, cap, deadline, pass_1_time).await
+        };
+        let verdicts = flow::judgments(&candidates, &answers);
+        if !verdicts.is_empty() {
+            // Pass 2: the caller's judgments and the answers.
+            let mut judgments = judgments;
+            for (_, judgment) in verdicts {
+                flow::merge_judgment(&mut judgments, judgment);
+            }
+            let registry = Arc::clone(&self.registry);
+            let second = self.registry_blocking(move || {
+                into_core_result(registry.compare_with(&id, from, to, now, &options, &judgments))
+            });
+            let second = match flow::watchdog(deadline) {
+                Some(at) => tokio::time::timeout_at(at, second)
+                    .await
+                    .map_err(|_| flow::LATE),
+                None => Ok(second.await),
+            };
+            match second {
+                Ok(Ok(second)) => assessment = second,
+                Ok(Err(status)) => {
+                    tracing::warn!(error = %status.message(), "the second pass was rejected; using the first");
+                    flow::void_verdicts(&mut answers, flow::PASS_2_FAILED);
+                }
+                Err(detail) => flow::void_verdicts(&mut answers, detail),
+            }
+        }
+        let report = flow::settle(
+            &mut assessment,
+            &candidates,
+            &answers,
+            keep_texts,
+            &self.flow,
+        );
+        report.log("CompareVersions");
         Ok(Response::new(pb::CompareVersionsResponse {
             assessment: Some(assessment.into()),
         }))
@@ -1096,6 +1553,7 @@ mod tests {
             after: "Export invoices as PDF".to_owned(),
             before_embedding: Vec::new(),
             after_embedding: Vec::new(),
+            field: String::new(),
         }
     }
 
@@ -1134,6 +1592,8 @@ mod tests {
             from: Some(from.into()),
             to: Some(to.into()),
             now: None,
+            options: None,
+            judgments: Vec::new(),
         }
     }
 
@@ -1384,5 +1844,187 @@ mod tests {
             .await
             .expect("the batch succeeds");
         assert_eq!(batch.into_inner().responses.len(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // A batch with a judge
+    // -----------------------------------------------------------------
+
+    use std::sync::Mutex;
+
+    use assessment_core::model::TextRelation;
+    use assessment_judge::{BoxFuture, JudgeError, Question, Verdict};
+
+    /// A judge for the batch tests. It records the deadline of each
+    /// question. With `cached`, every answer is already known (`peek`), and
+    /// the first `peek` takes every permit of `pool`: that is after the
+    /// first passes and before the second ones.
+    #[derive(Debug, Default)]
+    struct BatchJudge {
+        cached: bool,
+        pool: Mutex<Option<(Arc<Semaphore>, u32)>>,
+        taken: Mutex<Option<OwnedSemaphorePermit>>,
+        deadlines: Mutex<Vec<Instant>>,
+    }
+
+    impl BatchJudge {
+        fn verdict() -> Verdict {
+            Verdict::new(
+                TextRelation::Equivalent,
+                0.9,
+                "the same requirement",
+                "fake",
+            )
+        }
+    }
+
+    impl Judge for BatchJudge {
+        fn id(&self) -> &str {
+            "fake/batch"
+        }
+
+        fn judge<'a>(
+            &'a self,
+            _question: &'a Question,
+            deadline: Instant,
+        ) -> BoxFuture<'a, Result<Verdict, JudgeError>> {
+            Box::pin(async move {
+                self.deadlines.lock().expect("not poisoned").push(deadline);
+                Ok(Self::verdict())
+            })
+        }
+
+        fn peek(&self, _question: &Question) -> Option<Verdict> {
+            if !self.cached {
+                return None;
+            }
+            if let Some((pool, size)) = self.pool.lock().expect("not poisoned").take() {
+                let all = pool
+                    .try_acquire_many_owned(size)
+                    .expect("the first passes gave their slots back");
+                *self.taken.lock().expect("not poisoned") = Some(all);
+            }
+            Some(Self::verdict())
+        }
+    }
+
+    /// A request whose description is a paraphrase: the engine flags it.
+    fn flagged_request(id: &str) -> pb::AssessRequest {
+        let before = Entity::new(id, "issue")
+            .with_title("Sign-in")
+            .with_description("Users can log in with their email address and password.")
+            .with_version(SemVer::new(1, 0, 0));
+        let after = before
+            .clone()
+            .with_description("People are able to sign in using e-mail and a password.");
+        let mut request = pb::AssessRequest::from(AssessmentRequest {
+            changes: vec![ChangeSet::update(before, after)],
+            ..Default::default()
+        });
+        request.request_id = id.to_owned();
+        request
+    }
+
+    fn flagged_batch(n: usize) -> pb::AssessBatchRequest {
+        pb::AssessBatchRequest {
+            requests: (0..n).map(|i| flagged_request(&format!("F-{i}"))).collect(),
+        }
+    }
+
+    fn judged_service(judge: &Arc<BatchJudge>) -> AssessmentService {
+        let judge: Arc<dyn Judge> = Arc::clone(judge) as Arc<dyn Judge>;
+        service(1, 1).with_judge(judge, JudgeSettings::default())
+    }
+
+    /// The first passes of a batch larger than `max_in_flight` run mostly
+    /// while the items are still being started. That time counts: the judge
+    /// must leave twice the first pass for the second one.
+    #[tokio::test]
+    async fn a_batch_reserves_its_whole_first_pass_for_the_second() {
+        const HELD: Duration = Duration::from_secs(1);
+        const CALL: Duration = Duration::from_secs(10);
+        let judge = Arc::new(BatchJudge::default());
+        let svc = judged_service(&judge);
+
+        // The only slot is busy for a second, so the first pass of the
+        // first item takes that long. The second item is started after it.
+        let held = take_all(&svc.stateless_slots, 1).await;
+        tokio::spawn(async move {
+            tokio::time::sleep(HELD).await;
+            drop(held);
+        });
+        let mut request = Request::new(flagged_batch(2));
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", "10S".parse().expect("a valid value"));
+        let start = Instant::now();
+        let batch = done(svc.assess_batch(request))
+            .await
+            .expect("the batch succeeds")
+            .into_inner();
+        assert_eq!(batch.responses.len(), 2);
+
+        let deadlines = judge.deadlines.lock().expect("not poisoned").clone();
+        assert_eq!(deadlines.len(), 2);
+        // The reserve is at least twice the held second. Measured after
+        // the items were started, it was 1.25 s.
+        let latest = start + CALL - HELD * 2;
+        for deadline in deadlines {
+            assert!(
+                deadline < latest,
+                "the judge got {:?} of a 10 s call",
+                deadline - start
+            );
+        }
+    }
+
+    /// The second passes of a batch queue for slots `max_in_flight` at a
+    /// time, like the first ones, so another caller waits for one item of
+    /// the batch and not for all of them.
+    #[tokio::test]
+    async fn the_second_passes_of_a_batch_queue_max_in_flight_at_a_time() {
+        let judge = Arc::new(BatchJudge {
+            cached: true,
+            ..BatchJudge::default()
+        });
+        let svc = judged_service(&judge);
+        let slots = Arc::clone(&svc.stateless_slots);
+        *judge.pool.lock().expect("not poisoned") = Some((Arc::clone(&slots), 1));
+
+        let call = svc.clone();
+        let mut batch =
+            tokio::spawn(async move { call.assess_batch(Request::new(flagged_batch(3))).await });
+        // The judge takes the only slot once the first passes are done.
+        let taken = done(async {
+            loop {
+                if let Some(taken) = judge.taken.lock().expect("not poisoned").take() {
+                    break taken;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        // The second passes queue for the slot; then another caller does.
+        tokio::time::sleep(BLOCKED).await;
+        let other = tokio::spawn(Arc::clone(&slots).acquire_owned());
+        tokio::time::sleep(BLOCKED).await;
+        drop(taken);
+
+        // The other caller gets the slot after at most one second pass of
+        // the batch (`max_in_flight` is 1), so the batch is not done yet.
+        let other = done(other).await.expect("joins").expect("the pool is open");
+        assert!(is_blocked(&mut batch).await);
+        drop(other);
+        let responses = done(batch)
+            .await
+            .expect("joins")
+            .expect("the batch succeeds")
+            .into_inner()
+            .responses;
+        assert_eq!(responses.len(), 3);
+        for response in &responses {
+            assert!(response.assessment.is_some() && response.error.is_none());
+        }
+        wait_until_full(&slots, 1).await;
     }
 }
