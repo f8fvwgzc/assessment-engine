@@ -160,14 +160,20 @@ async fn fails(kind: CliKind, body: &str) -> JudgeError {
     error
 }
 
+/// Whether the process still runs. A killed process whose parent is gone
+/// can stay in the table as a zombie until the init process collects it,
+/// and some init processes (a container, a CI runner) are slow to do so.
+/// A zombie runs nothing, so it counts as gone.
 fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p"])
         .arg(pid.to_string())
         .stderr(Stdio::null())
-        .status()
-        .expect("kill runs")
-        .success()
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 async fn gone(pid: u32) {

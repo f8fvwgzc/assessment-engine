@@ -683,8 +683,10 @@ impl Drop for Running {
 const KILL_PROGRAMS: [&str; 2] = ["/bin/kill", "/usr/bin/kill"];
 
 #[cfg(unix)]
-fn kill_group_args(group: u32) -> [String; 2] {
-    ["-KILL".to_owned(), format!("-{group}")]
+fn kill_group_args(group: u32) -> [String; 3] {
+    // `--` ends the options: without it the `kill` of procps reads the
+    // negative number as an option and reports a failure.
+    ["-KILL".to_owned(), "--".to_owned(), format!("-{group}")]
 }
 
 /// Stops what is left of the child's process group, such as a helper the

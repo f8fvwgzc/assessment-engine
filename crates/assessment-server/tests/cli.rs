@@ -327,13 +327,18 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":321,"output_tokens":45}
 
 #[cfg(all(unix, feature = "judge"))]
 fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
+    // A killed process whose parent is gone can stay in the table as a
+    // zombie until the init process collects it. It runs nothing, so it
+    // counts as gone.
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p"])
         .arg(pid.to_string())
         .stderr(Stdio::null())
-        .status()
-        .expect("kill runs")
-        .success()
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 /// Whether the process goes away within two seconds. One that stays is
