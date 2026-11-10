@@ -10,15 +10,19 @@
 //! - [`Judge`], [`Question`], [`Verdict`] and [`JudgeError`]: the contract.
 //! - [`CachedJudge`] and [`LimitedJudge`]: wrappers that cache answers and
 //!   bound calls, spend and failures.
-//! - `AnthropicJudge` (feature `anthropic`): the HTTP client for the Anthropic
-//!   Messages API. Without the feature the crate has no HTTP or TLS code.
+//! - The providers. `AnthropicJudge` (feature `anthropic`) is the HTTP client
+//!   for the Anthropic Messages API. `CliJudge` (feature `cli`) runs a locally
+//!   installed agent command line, Claude Code or Codex, as a child process
+//!   and uses its login. Without both features the crate has no HTTP, TLS or
+//!   process code.
 //!
-//! The usual stack is `CachedJudge(LimitedJudge(AnthropicJudge))`, so cache
-//! hits cost nothing and never touch a limit.
+//! The usual stack is `CachedJudge(LimitedJudge(provider))`, so cache hits
+//! cost nothing and never touch a limit.
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use assessment_core::assessment::JudgmentReason;
 use assessment_core::engine::{MAX_JUDGMENT_SOURCE_BYTES, MAX_RATIONALE_BYTES};
@@ -29,13 +33,17 @@ use tokio::time::Instant;
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
 pub mod cache;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod limits;
 pub mod price;
 pub mod prompt;
 
 #[cfg(feature = "anthropic")]
-pub use anthropic::{AnthropicConfig, AnthropicJudge, ApiKey, Effort, Fallbacks};
+pub use anthropic::{AnthropicConfig, AnthropicJudge, ApiKey, Fallbacks};
 pub use cache::CachedJudge;
+#[cfg(feature = "cli")]
+pub use cli::{CliConfig, CliJudge, CliKind};
 pub use limits::{LimitedJudge, Limits};
 pub use prompt::PROMPT_VERSION;
 
@@ -45,9 +53,51 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The longest context title a question carries, in characters.
 pub const MAX_CONTEXT_TITLE_CHARS: usize = 300;
 
+/// The model the Claude providers ask when none is named.
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+
+/// How much work the model puts into an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Effort {
+    #[default]
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+}
+
+impl FromStr for Effort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            "xhigh" => Ok(Effort::Xhigh),
+            "max" => Ok(Effort::Max),
+            _ => Err("expected low, medium, high, xhigh or max".to_owned()),
+        }
+    }
+}
+
 /// Reads one text change and says how its meaning changed.
 pub trait Judge: Send + Sync + fmt::Debug {
-    /// A stable name, such as `anthropic/claude-opus-5-5`.
+    /// A stable name, such as `anthropic/claude-opus-5-5` or
+    /// `codex-cli/default`.
     fn id(&self) -> &str;
 
     /// Answers the question before `deadline`.
@@ -285,6 +335,7 @@ pub struct JudgeError {
     message: String,
     http_status: Option<u16>,
     usage: Option<Usage>,
+    persistent: bool,
 }
 
 impl JudgeError {
@@ -294,7 +345,19 @@ impl JudgeError {
             message: message.into(),
             http_status: None,
             usage: None,
+            persistent: false,
         }
+    }
+
+    /// Marks a failure that will not fix itself, such as a command line
+    /// that is not logged in. A [`LimitedJudge`] pauses the judge at once.
+    pub fn persistent(mut self) -> Self {
+        self.persistent = true;
+        self
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
     }
 
     /// The HTTP status the API answered with.
@@ -395,7 +458,6 @@ pub(crate) fn truncate_bytes(s: &mut String, max: usize) {
 }
 
 /// Cuts `s` to at most `max` characters.
-#[cfg(feature = "anthropic")]
 pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((end, _)) => s[..end].to_owned(),
@@ -403,9 +465,20 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// A model name that is safe in a URL path and as one program argument.
+#[cfg(any(feature = "anthropic", feature = "cli"))]
+pub(crate) fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 128
+        && !model.starts_with('-')
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+}
+
 /// A pseudo-random number from the process-random hasher keys. Good enough
-/// for jitter; not for secrets.
-#[cfg(feature = "anthropic")]
+/// for jitter and for the name of a private directory; not for secrets.
+#[cfg(any(feature = "anthropic", feature = "cli"))]
 pub(crate) fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();

@@ -12,31 +12,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use assessment_core::model::TextRelation;
 use reqwest::header::HeaderValue;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::prompt::{SYSTEM_PROMPT, schema, user_content};
+pub use crate::prompt::MAX_RATIONALE_CHARS;
+use crate::prompt::{Answer, SYSTEM_PROMPT, schema, user_content};
 use crate::{
     BoxFuture, Judge, JudgeError, JudgeErrorKind, Question, Usage, Verdict, random_u64,
-    retryable_status, truncate_chars,
+    retryable_status, truncate_chars, valid_model,
 };
+pub use crate::{DEFAULT_MODEL, Effort};
 
 /// The API version this client speaks.
 pub const API_VERSION: &str = "2026-10-21";
 /// The beta that goes with the `fallbacks` field.
 pub const FALLBACKS_BETA: &str = "server-side-fallback-2026-07-01";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Attempts per question, the first one included.
 pub const MAX_ATTEMPTS: u32 = 3;
 /// The largest response body that is read.
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-/// The longest rationale that is kept, in characters.
-pub const MAX_RATIONALE_CHARS: usize = 400;
 /// The longest wait between two attempts when the API names none.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(8);
 
@@ -86,44 +83,6 @@ impl ApiKey {
 impl fmt::Debug for ApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ApiKey([redacted])")
-    }
-}
-
-/// How much work the model puts into an answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Effort {
-    #[default]
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl Effort {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Effort::Low => "low",
-            Effort::Medium => "medium",
-            Effort::High => "high",
-            Effort::Xhigh => "xhigh",
-            Effort::Max => "max",
-        }
-    }
-}
-
-impl FromStr for Effort {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "low" => Ok(Effort::Low),
-            "medium" => Ok(Effort::Medium),
-            "high" => Ok(Effort::High),
-            "xhigh" => Ok(Effort::Xhigh),
-            "max" => Ok(Effort::Max),
-            _ => Err("expected low, medium, high, xhigh or max".to_owned()),
-        }
     }
 }
 
@@ -246,14 +205,6 @@ pub(crate) fn validate_base_url(raw: &str) -> Result<(String, bool), JudgeError>
     Ok((url.as_str().trim_end_matches('/').to_owned(), loopback))
 }
 
-fn valid_model(model: &str) -> bool {
-    !model.is_empty()
-        && model.len() <= 128
-        && model
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
-}
-
 /// The request body. It never holds `thinking`, a sampling setting,
 /// `tool_choice`, `stream` or an assistant turn.
 pub(crate) fn build_body(config: &AnthropicConfig, user: &str, fallbacks: bool) -> Value {
@@ -344,20 +295,6 @@ fn usage_of(usage: Option<&Value>) -> Usage {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawVerdict {
-    relation: TextRelation,
-    confidence: f64,
-    rationale: String,
-}
-
-/// Reads one answer text. `None` when it is not exactly a verdict.
-fn read_verdict(text: &str) -> Option<RawVerdict> {
-    let raw: RawVerdict = serde_json::from_str(text.trim()).ok()?;
-    (raw.confidence.is_finite() && (0.0..=1.0).contains(&raw.confidence)).then_some(raw)
-}
-
 fn block_type(block: &Value) -> Option<&str> {
     block.get("type").and_then(Value::as_str)
 }
@@ -414,12 +351,12 @@ pub(crate) fn parse_response(body: &[u8], default_model: &str) -> Result<Verdict
         .rposition(|block| block_type(block) == Some("fallback"))
         .map_or(0, |at| at + 1);
     let answer: String = content[start..].iter().filter_map(block_text).collect();
-    let raw = read_verdict(&answer).or_else(|| {
+    let raw = Answer::parse(&answer).or_else(|| {
         content[start..]
             .iter()
             .rev()
             .filter_map(block_text)
-            .find_map(read_verdict)
+            .find_map(Answer::parse)
     });
     let Some(raw) = raw else {
         return fail(
@@ -433,13 +370,9 @@ pub(crate) fn parse_response(body: &[u8], default_model: &str) -> Result<Verdict
         .and_then(Value::as_str)
         .filter(|m| valid_model(m))
         .unwrap_or(default_model);
-    Ok(Verdict::new(
-        raw.relation,
-        raw.confidence,
-        truncate_chars(raw.rationale.trim(), MAX_RATIONALE_CHARS),
-        format!("anthropic/{model}"),
-    )
-    .with_usage(usage))
+    Ok(raw
+        .into_verdict(format!("anthropic/{model}"))
+        .with_usage(usage))
 }
 
 /// The type and the message of an API error body, when it has them.
@@ -767,6 +700,7 @@ impl Judge for AnthropicJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assessment_core::model::TextRelation;
 
     const KEY: &str = "sk-ant-test-0123456789abcdef";
 

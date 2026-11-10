@@ -82,7 +82,7 @@ Any other language: generate a client from
 |---|---|---|
 | [`assessment-core`](crates/assessment-core) | The engine: pure Rust, no I/O except the optional registry journal. `Engine`, `Registry`, `Policy`. | You are in Rust and want it in-process. |
 | [`assessment-grpc`](crates/assessment-grpc) | Generated protobuf types, conversions, the tonic service, and a typed client. | You serve or call it over gRPC from Rust. |
-| [`assessment-judge`](crates/assessment-judge) | The optional model judge: asks the Anthropic API how two texts relate. The only crate that makes network calls out. | You want the server to judge flagged text changes. |
+| [`assessment-judge`](crates/assessment-judge) | The optional model judge: asks the Anthropic API, or a logged-in Claude Code or Codex command line, how two texts relate. The only crate that makes network calls out or starts a program. | You want the server to judge flagged text changes. |
 | [`assessment-server`](crates/assessment-server) | The `assessment-engine` binary: gRPC server (health, reflection, auth, limits, graceful shutdown) and an offline CLI. | You run it as a service for any language. |
 | [`proto/assessment/v1/assessment.proto`](proto/assessment/v1/assessment.proto) | The contract. | You generate a client in Go, TypeScript, Python, Java, C#… |
 
@@ -389,9 +389,31 @@ assessment-engine serve --judge on --auth-token "$TOKEN"
 assessment-engine assess request.json --judge      # the same from the command line
 ```
 
-A judge spends money, so the server does not start with a judge on an
-address that is not loopback unless `--auth-token` is set (or use
-`--addr 127.0.0.1:50061`).
+Without an API key you can use a command line that is already installed
+and logged in on your machine: Claude Code or Codex.
+
+```bash
+assessment-engine assess request.json --judge --judge-provider codex-cli
+assessment-engine serve --judge on --judge-provider claude-cli --addr 127.0.0.1:50061
+```
+
+`--judge-provider` is `anthropic` (the default), `claude-cli` or
+`codex-cli`. `--judge-cli-path` names the program when it is not in
+`PATH`. A command line provider reads no API key. It uses the login and
+the quota of the account that is logged in, and no cost is measured. The
+program gets a short list of environment variables, not the environment
+of the engine, and it is stopped with its helpers at the timeout and on
+Ctrl-C.
+`codex-cli` is not a Claude model: it sends the flagged texts to OpenAI.
+It is there because a user without an API key asked for it. These
+providers are meant for a developer machine or a host with one tenant.
+The Docker image holds neither program. Read
+[Command line providers](docs/JUDGE.md#command-line-providers) and the
+threat model before you use one on a shared server.
+
+A judge spends money or the quota of an account, so the server does not
+start with a judge on an address that is not loopback unless
+`--auth-token` is set (or use `--addr 127.0.0.1:50061`).
 
 * **It never fails a call.** A field the judge did not answer keeps the
   engine's result and gets the status `unavailable` with a short `detail`.
@@ -408,7 +430,8 @@ address that is not loopback unless `--auth-token` is set (or use
   two judge passes.
 * **To see whether a server has a judge**, read `GetPolicyResponse.judge`
   (`AssessmentClient::judge_info`). It holds the judge id, for example
-  `anthropic/claude-opus-5-5`, and is empty without a judge.
+  `anthropic/claude-opus-5-5` or `codex-cli/default`, and is empty
+  without a judge.
 
 **Privacy: what leaves the process.** With the judge off, nothing does.
 With it on, for each flagged field one request goes to the Anthropic API
@@ -418,7 +441,10 @@ counts (list items, negations, requirement words, numbers that changed).
 No ids, no other fields, no other entities and no comments are sent. At
 startup the server also sends one `GET /v1/models/{model}` to check the key
 and the model. Texts longer than `--judge-max-text-chars` (8000) are not
-sent.
+sent. With `claude-cli` the same content goes to Anthropic through the
+Claude Code program, under its logged-in account. With `codex-cli` it goes
+to OpenAI through the Codex program, under its logged-in account. There is
+no startup request with these two.
 
 **Cost and latency.** These are estimates. They have not been measured:
 the paid evaluation (`cargo run -p assessment-judge --example judge_cases`,
@@ -428,7 +454,11 @@ the price table in `crates/assessment-judge/src/price.rs` that is about one
 to two US cents on the default model. Expect a few seconds per judged
 call. Equal questions are answered from a cache at no cost. The server
 stops asking at `--judge-max-usd-per-hour` (10). The price table is there
-for that cap and is not a bill.
+for that cap and is not a bill. With a command line provider no cost is
+measured and the spend cap has no effect. The limits of the subscription
+apply. The six evaluation cases ran once through Codex 0.160.0 on a free
+ChatGPT login: all six got the expected relation, at 4.5 seconds per case
+on average. That is one run, not a benchmark. The Claude Code command line has not been run for real.
 
 ## Wiring it into nexc-engine
 

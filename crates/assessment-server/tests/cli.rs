@@ -196,6 +196,395 @@ fn assess_with_the_judge_needs_a_key() {
     assert!(output.stdout.is_empty());
 }
 
+/// A fake Codex command line in a directory of its own. It records its
+/// arguments and its stdin, writes one answer and reports its tokens.
+#[cfg(all(unix, feature = "judge"))]
+struct FakeCodex {
+    dir: std::path::PathBuf,
+    program: std::path::PathBuf,
+}
+
+#[cfg(all(unix, feature = "judge"))]
+impl Drop for FakeCodex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(all(unix, feature = "judge"))]
+impl FakeCodex {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "assessment-server-fake-codex-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a test directory");
+        let program = dir.join("fake-codex");
+        let script = format!(
+            r#"#!/bin/sh
+dir='{dir}'
+printf '%s\n' "$@" > "$dir/argv"
+env > "$dir/env"
+out=''
+prev=''
+for arg in "$@"; do
+  if [ "$prev" = '-o' ]; then out="$arg"; fi
+  prev="$arg"
+done
+cat > "$dir/stdin"
+# With the file `hang` there, the program starts a helper and waits for
+# it, like a launcher script around the real binary.
+if [ -e "$dir/hang" ]; then
+  sleep 40 &
+  echo $! > "$dir/helper"
+  echo $$ > "$dir/pid"
+  wait
+fi
+printf '%s' '{{"relation":"equivalent","confidence":0.97,"rationale":"Both say the same."}}' > "$out"
+echo '{{"type":"turn.completed","usage":{{"input_tokens":321,"output_tokens":45}}}}'
+"#,
+            dir = dir.display()
+        );
+        // Written by another process, so that this one never holds the
+        // file open for writing while a test starts it.
+        let mut writer = Command::new("sh")
+            .arg("-c")
+            .arg(r#"cat > "$1" && chmod 700 "$1""#)
+            .arg("sh")
+            .arg(&program)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sh starts");
+        writer
+            .stdin
+            .take()
+            .expect("a pipe")
+            .write_all(script.as_bytes())
+            .expect("the script is written");
+        assert!(writer.wait().expect("sh ends").success());
+        Self { dir, program }
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    /// `assess --judge` with this program as the Codex command line. The
+    /// temporary directory of the engine is a directory of this test, so
+    /// the test sees what the judge leaves there.
+    fn assess(&self, timeout_secs: &str) -> Command {
+        let tmp = self.tmp();
+        std::fs::create_dir_all(&tmp).expect("a temporary directory");
+        let mut command = engine();
+        command
+            .args(["assess", "-", "--judge", "--judge-provider", "codex-cli"])
+            .arg("--judge-cli-path")
+            .arg(&self.program)
+            .args(["--judge-timeout-secs", timeout_secs])
+            .env("TMPDIR", &tmp);
+        command
+    }
+
+    fn tmp(&self) -> std::path::PathBuf {
+        self.dir.join("tmp")
+    }
+
+    /// What the engine left in its temporary directory.
+    fn left_in_tmp(&self) -> Vec<String> {
+        std::fs::read_dir(self.tmp())
+            .expect("readable")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// Runs the program once with a good answer, then makes every later
+    /// run hang. The first start of a new script can take seconds, and
+    /// the tests below count time.
+    fn warm_up_then_hang(&self) {
+        let output = run_with_stdin(self.assess("60"), &request(PARAPHRASE));
+        assert_eq!(description_judgment(&json(&output))["status"], "applied");
+        std::fs::write(self.dir.join("hang"), "").expect("a flag file");
+    }
+
+    /// Waits until the hanging program has written a process id.
+    fn pid(&self, name: &str) -> u32 {
+        for _ in 0..1000 {
+            if let Ok(pid) = self.read(name).trim().parse() {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the fake program never wrote {name}");
+    }
+}
+
+#[cfg(all(unix, feature = "judge"))]
+fn alive(pid: u32) -> bool {
+    // A killed process whose parent is gone can stay in the table as a
+    // zombie until the init process collects it. It runs nothing, so it
+    // counts as gone.
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p"])
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .output()
+        .expect("ps runs");
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
+}
+
+/// Whether the process goes away within two seconds. One that stays is
+/// killed, so a failed test leaves nothing behind.
+#[cfg(all(unix, feature = "judge"))]
+fn goes_away(pid: u32) -> bool {
+    for _ in 0..200 {
+        if !alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+    false
+}
+
+/// The command ends right after the judge gave up. The program and the
+/// helper it started must be gone by then, and the private directory too:
+/// nothing may be left to a task that the ending runtime never runs.
+#[cfg(all(unix, feature = "judge"))]
+#[test]
+fn a_judge_that_times_out_leaves_no_process_and_no_directory() {
+    let fake = FakeCodex::new("timeout");
+    fake.warm_up_then_hang();
+    assert_eq!(fake.left_in_tmp(), Vec::<String>::new());
+
+    let output = run_with_stdin(fake.assess("2"), &request(PARAPHRASE));
+    let judged = json(&output);
+    let judgment = description_judgment(&judged);
+    assert_eq!(judgment["status"], "unavailable", "{judgment}");
+    assert!(
+        stderr(&output).contains("1 flagged, 0 judged (codex-cli/default"),
+        "{}",
+        stderr(&output)
+    );
+    let (pid, helper) = (fake.pid("pid"), fake.pid("helper"));
+    let (pid_gone, helper_gone) = (goes_away(pid), goes_away(helper));
+    assert!(pid_gone, "the program outlived the command");
+    assert!(
+        helper_gone,
+        "the helper of the program outlived the command"
+    );
+    assert_eq!(fake.left_in_tmp(), Vec::<String>::new());
+}
+
+/// Ctrl-C in a terminal does not reach the program, which has a process
+/// group of its own. The command takes the signal, stops the program and
+/// its helper, removes the private directory and ends with an error.
+#[cfg(all(unix, feature = "judge"))]
+#[test]
+fn an_interrupt_stops_the_program_and_removes_its_directory() {
+    for signal in ["-INT", "-TERM"] {
+        let fake = FakeCodex::new(&format!("signal{signal}"));
+        fake.warm_up_then_hang();
+        let _ = std::fs::remove_file(fake.dir.join("pid"));
+        let _ = std::fs::remove_file(fake.dir.join("helper"));
+
+        let mut child = fake
+            .assess("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary starts");
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(request(PARAPHRASE).as_bytes())
+            .expect("the request is written");
+        let (pid, helper) = (fake.pid("pid"), fake.pid("helper"));
+        assert!(alive(pid) && alive(helper));
+        assert_eq!(fake.left_in_tmp().len(), 1, "the directory of the call");
+
+        let sent = Command::new("kill")
+            .arg(signal)
+            .arg(child.id().to_string())
+            .status()
+            .expect("kill runs");
+        assert!(sent.success());
+        let output = child.wait_with_output().expect("the binary ends");
+        // It ended by its own choice, not by the signal, and printed no
+        // assessment.
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{signal}: {:?}",
+            output.status
+        );
+        assert!(output.stdout.is_empty(), "{signal}");
+        assert!(
+            stderr(&output).contains("interrupted"),
+            "{signal}: {}",
+            stderr(&output)
+        );
+
+        let (pid_gone, helper_gone) = (goes_away(pid), goes_away(helper));
+        assert!(pid_gone, "{signal}: the program is still running");
+        assert!(helper_gone, "{signal}: the helper is still running");
+        assert_eq!(fake.left_in_tmp(), Vec::<String>::new(), "{signal}");
+    }
+}
+
+#[cfg(all(unix, feature = "judge"))]
+#[test]
+fn assess_with_a_command_line_provider_needs_no_key() {
+    let fake = FakeCodex::new("assess");
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge", "--judge-provider", "codex-cli"])
+        .arg("--judge-cli-path")
+        .arg(&fake.program)
+        // Not a real key. It and the server's own token must not reach
+        // the program.
+        .env("ANTHROPIC_API_KEY", "dummy-key-0123456789")
+        .env("ASSESSMENT_AUTH_TOKEN", "server-token-0123456789")
+        // Not real either. A variable like these would point a program at
+        // another account or endpoint, or is a secret of the host.
+        .env("ANTHROPIC_AUTH_TOKEN", "other-token-0123456789")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token-0123456789")
+        .env("OPENAI_API_KEY", "openai-key-0123456789")
+        .env(
+            "DATABASE_URL",
+            "postgres://user:database-password@127.0.0.1/db",
+        )
+        // The first start of a new script can be slow.
+        .env("ASSESSMENT_JUDGE_TIMEOUT_SECS", "60");
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    let judged = json(&output);
+    let judgment = description_judgment(&judged);
+    assert_eq!(judgment["status"], "applied", "{judgment}");
+
+    let report = stderr(&output);
+    assert!(
+        report
+            .contains("1 flagged, 1 judged (codex-cli/default, 321/45 tokens, cost not measured)"),
+        "{report}"
+    );
+    assert!(!report.contains('$'), "{report}");
+
+    // The texts went to stdin only, and the program ran without the
+    // secrets of this process.
+    let argv = fake.read("argv");
+    assert!(argv.starts_with("exec\n"), "{argv}");
+    assert!(argv.contains("read-only"), "{argv}");
+    assert!(!argv.contains("log in"), "{argv}");
+    assert!(!argv.contains("sign in"), "{argv}");
+    let stdin = fake.read("stdin");
+    assert!(stdin.contains(PARAPHRASE.0), "{stdin}");
+    assert!(stdin.contains(PARAPHRASE.1), "{stdin}");
+    let env = fake.read("env");
+    assert!(!env.contains("ANTHROPIC_API_KEY"), "{env}");
+    assert!(!env.contains("dummy-key-0123456789"), "{env}");
+    assert!(!env.contains("server-token-0123456789"), "{env}");
+    for name in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "DATABASE_URL",
+        "ASSESSMENT_",
+        "0123456789",
+        "database-password",
+    ] {
+        assert!(!env.contains(name), "{name} reached the program: {env}");
+    }
+    assert!(env.contains("PATH="), "{env}");
+    assert!(
+        argv.contains("-c\nshell_environment_policy.inherit=none\n"),
+        "{argv}"
+    );
+}
+
+#[cfg(feature = "judge")]
+#[test]
+fn a_command_line_provider_whose_program_is_missing_is_an_error() {
+    const MISSING: &str = "/nonexistent/assessment-judge-cli";
+    for provider in ["claude-cli", "codex-cli"] {
+        let mut command = engine();
+        command.args([
+            "assess",
+            "-",
+            "--judge",
+            "--judge-provider",
+            provider,
+            "--judge-cli-path",
+            MISSING,
+        ]);
+        let output = run_with_stdin(command, &request(PARAPHRASE));
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("was not found"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty());
+
+        // `serve --judge on` refuses to start. The provider and the path
+        // are read from the environment here.
+        let output = engine()
+            .args(["serve", "--addr", "127.0.0.1:0", "--judge", "on"])
+            .env("ASSESSMENT_JUDGE_PROVIDER", provider)
+            .env("ASSESSMENT_JUDGE_CLI_PATH", MISSING)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs");
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("was not found"),
+            "{}",
+            stderr(&output)
+        );
+    }
+
+    // A flag of the API has no meaning with a command line provider.
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge", "--judge-provider", "codex-cli"])
+        .env("ASSESSMENT_JUDGE_BASE_URL", CLOSED);
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--judge-base-url"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A provider that does not exist is a usage error.
+    let output = engine()
+        .args([
+            "serve",
+            "--addr",
+            "127.0.0.1:0",
+            "--judge-provider",
+            "openai",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}
+
 #[test]
 fn the_judge_mode_is_read_from_the_environment() {
     // `on` without a key: the server refuses to start.

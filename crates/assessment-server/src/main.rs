@@ -201,9 +201,12 @@ struct AssessArgs {
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
 
-    /// Ask a model about the flagged text changes. It needs an API key in
-    /// `ANTHROPIC_API_KEY` or in `--anthropic-api-key-file`. A judge that
-    /// fails never fails the command: the fields are then `unavailable`.
+    /// Ask a model about the flagged text changes. With the provider
+    /// `anthropic` it needs an API key in `ANTHROPIC_API_KEY` or in
+    /// `--anthropic-api-key-file`. With `--judge-provider claude-cli` or
+    /// `codex-cli` it needs no key, only the program, installed and
+    /// logged in. A judge that fails never fails the command: the fields
+    /// are then `unavailable`. Ctrl-C stops the judge and its program.
     #[arg(long)]
     judge: bool,
 
@@ -279,7 +282,7 @@ async fn main() -> Result<()> {
             init_tracing(LogFormat::Pretty, "warn")?;
             let engine = engine_with_policy(args.policy.as_deref())?;
             if args.judge {
-                let stack = judge::for_cli(&args.client, judge::key_from_env())?;
+                let stack = judge::for_cli(&args.client, judge::key_from_env)?;
                 commands::assess_judged(engine, &args.input, stack).await
             } else {
                 commands::assess(&engine, &args.input)

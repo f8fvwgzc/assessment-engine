@@ -51,6 +51,8 @@ COPY --from=builder /out/assessment-engine /usr/local/bin/assessment-engine
 # example /run/secrets/anthropic_api_key. Never put a key into the image, a build argument or an
 # ENV line here. A server with a judge also needs ASSESSMENT_AUTH_TOKEN, because it listens on
 # 0.0.0.0.
+# The command line providers (ASSESSMENT_JUDGE_PROVIDER=claude-cli or codex-cli) do not work in
+# this image: it holds neither program and no login.
 ENV ASSESSMENT_ADDR=0.0.0.0:50061 \
     ASSESSMENT_LOG_FORMAT=json
 

@@ -46,8 +46,12 @@ jobs:
         run: cargo clippy --locked -p assessment-grpc --no-default-features --features client -- -D warnings
       - name: assessment-grpc, server only
         run: cargo clippy --locked -p assessment-grpc --no-default-features --features server -- -D warnings
-      - name: assessment-judge without the Anthropic client
-        run: cargo clippy --locked -p assessment-judge --no-default-features -- -D warnings
+      - name: assessment-judge without a provider
+        run: cargo clippy --locked -p assessment-judge --no-default-features --all-targets -- -D warnings
+      - name: assessment-judge, Anthropic client only
+        run: cargo clippy --locked -p assessment-judge --no-default-features --features anthropic --all-targets -- -D warnings
+      - name: assessment-judge, command line providers only
+        run: cargo clippy --locked -p assessment-judge --no-default-features --features cli --all-targets -- -D warnings
       - name: assessment-server without the judge
         run: cargo clippy --locked -p assessment-server --no-default-features --all-targets -- -D warnings
       - name: assessment-core depends on four crates only
@@ -64,6 +68,15 @@ jobs:
           found=$(cargo tree --locked -p assessment-grpc --no-default-features --features client \
             -e normal --prefix none --target all \
             | grep -E '^(assessment-judge|reqwest|hyper-rustls|tokio-rustls|rustls[a-z-]*|aws-lc-[a-z]+|ring|openssl[a-z-]*|native-tls) ' || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            exit 1
+          fi
+      - name: A judge with the command line providers only has no HTTP client or TLS crate
+        run: |
+          found=$(cargo tree --locked -p assessment-judge --no-default-features --features cli \
+            -e normal --prefix none --target all \
+            | grep -E '^(reqwest|hyper-rustls|tokio-rustls|rustls[a-z-]*|aws-lc-[a-z]+|ring|openssl[a-z-]*|native-tls) ' || true)
           if [ -n "$found" ]; then
             echo "$found"
             exit 1

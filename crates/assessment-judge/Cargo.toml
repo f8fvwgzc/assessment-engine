@@ -13,10 +13,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["anthropic"]
+default = ["anthropic", "cli"]
 # The HTTP client for the Anthropic Messages API. Without it the crate has
 # no HTTP or TLS dependency.
 anthropic = ["dep:reqwest"]
+# Judges that run a locally installed agent command line (Claude Code or
+# Codex) as a child process. Without it the crate starts no process.
+cli = ["tokio/process", "tokio/io-util", "tokio/fs"]
 
 [dependencies]
 assessment-core.workspace = true
@@ -33,9 +36,13 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "anthropic_http"
 required-features = ["anthropic"]
 
+[[test]]
+name = "cli_process"
+required-features = ["cli"]
+
 [[example]]
 name = "judge_cases"
-required-features = ["anthropic"]
+required-features = ["anthropic", "cli"]
 
 [lints]
 workspace = true
