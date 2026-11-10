@@ -35,7 +35,7 @@ async fn run_until(
     // Checked before the journal is opened: a bad judge setup fails fast.
     let judge = judge::from_args(
         &args.judge,
-        judge::key_from_env(),
+        judge::key_from_env,
         args.addr,
         auth.is_enabled(),
     )?;
@@ -181,7 +181,7 @@ async fn compact_on_shutdown(registry: Arc<Registry>) {
 }
 
 /// Completes on SIGINT (Ctrl-C) or SIGTERM.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let interrupt = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %err, "failed to listen for SIGINT");
@@ -248,6 +248,11 @@ mod tests {
             "--journal",
             journal,
         ];
+        // A flag wins over `ASSESSMENT_JUDGE_PROVIDER`, which the machine
+        // that runs the tests may have set.
+        if !extra.contains(&"--judge-provider") {
+            argv.extend_from_slice(&["--judge-provider", "anthropic"]);
+        }
         argv.extend_from_slice(extra);
         Cli::try_parse_from(argv).expect("parses").serve
     }

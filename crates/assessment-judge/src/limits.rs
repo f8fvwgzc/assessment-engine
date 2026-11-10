@@ -317,10 +317,16 @@ impl LimitedJudge {
         let mut state = self.lock();
         match result {
             Ok(verdict) => {
-                let model = verdict
-                    .source
-                    .strip_prefix("anthropic/")
-                    .unwrap_or(&self.limits.model);
+                // A command line provider is not billed per token, whatever
+                // model the limits name.
+                let model = if crate::price::is_subscription(&verdict.source) {
+                    verdict.source.as_str()
+                } else {
+                    verdict
+                        .source
+                        .strip_prefix("anthropic/")
+                        .unwrap_or(&self.limits.model)
+                };
                 state.settle(id, Some(cost_usd(model, &verdict.usage)));
                 state.failures = 0;
                 state.bad_request = None;
@@ -345,6 +351,18 @@ impl LimitedJudge {
 
     fn count_failure(&self, state: &mut State, now: Instant, failure: &JudgeError) {
         let status = failure.http_status();
+        if failure.is_persistent() {
+            state.paused_until = Some(now + LONG_PAUSE);
+            state.failures = 0;
+            // The message of a persistent failure is a fixed text.
+            tracing::error!(
+                judge = self.inner.id(),
+                error = failure.message(),
+                pause_secs = LONG_PAUSE.as_secs(),
+                "the judge is paused: this failure needs the operator"
+            );
+            return;
+        }
         if failure.kind() == JudgeErrorKind::Api && matches!(status, Some(401 | 403 | 404)) {
             state.paused_until = Some(now + LONG_PAUSE);
             state.failures = 0;
@@ -795,6 +813,48 @@ mod tests {
             assert!(!judge.paused(), "{status}");
             judge.judge(&question(1), soon()).await.expect("verdict");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_persistent_failure_pauses_for_300_seconds_at_once() {
+        let (inner, judge) = limited(ScriptedJudge::ok(), Limits::default());
+        inner.push(fail(
+            JudgeError::new(JudgeErrorKind::Api, "codex CLI is not logged in").persistent(),
+        ));
+        judge.judge(&question(1), soon()).await.expect_err("fails");
+        assert!(judge.paused());
+        let error = judge.judge(&question(1), soon()).await.expect_err("paused");
+        assert_eq!(error.kind(), JudgeErrorKind::Paused);
+        assert_eq!(inner.calls(), 1);
+        tokio::time::advance(LONG_PAUSE - Duration::from_millis(1)).await;
+        assert!(judge.paused());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(!judge.paused());
+        judge.judge(&question(1), soon()).await.expect("verdict");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_spend_cap_does_not_bind_a_subscription_provider() {
+        for id in ["codex-cli/default", "claude-cli/claude-opus-5-5"] {
+            let limits = Limits {
+                usd_per_hour: 0.0,
+                model: id.to_owned(),
+                ..Limits::default()
+            };
+            let (inner, judge) = limited(ScriptedJudge::ok(), limits);
+            for n in 0..5 {
+                judge.judge(&question(n), soon()).await.expect("verdict");
+            }
+            assert_eq!(inner.calls(), 5);
+        }
+        // The same cap stops a provider that is billed per token.
+        let limits = Limits {
+            usd_per_hour: 0.0,
+            ..Limits::default()
+        };
+        let (_, judge) = limited(ScriptedJudge::ok(), limits);
+        let error = judge.judge(&question(1), soon()).await.expect_err("capped");
+        assert_eq!(error.kind(), JudgeErrorKind::SpendCap);
     }
 
     #[tokio::test(start_paused = true)]

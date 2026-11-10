@@ -27,6 +27,24 @@ pub const UNKNOWN_PRICE: Price = Price {
     output_per_mtok: 50.0,
 };
 
+/// The price of a call that is not billed per token.
+pub const FREE: Price = Price {
+    input_per_mtok: 0.0,
+    output_per_mtok: 0.0,
+};
+
+/// The id prefixes of the providers that run an agent command line on a
+/// subscription login. Their calls are not billed per token, so the cost
+/// of one is reported as 0 and the spend limit does not bind.
+pub const SUBSCRIPTION_PREFIXES: [&str; 2] = ["claude-cli/", "codex-cli/"];
+
+/// Whether `id` names a provider that is not billed per token.
+pub fn is_subscription(id: &str) -> bool {
+    SUBSCRIPTION_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
 const TABLE: [(&str, Price); 3] = [
     (
         "claude-opus-5-5",
@@ -52,8 +70,12 @@ const TABLE: [(&str, Price); 3] = [
 ];
 
 /// The price of `model`. A dated name such as `claude-opus-5-5-20261001`
-/// has the price of its base name.
+/// has the price of its base name. A judge id of a command line provider,
+/// such as `codex-cli/default`, is [`FREE`].
 pub fn price_for(model: &str) -> Price {
+    if is_subscription(model) {
+        return FREE;
+    }
     let model = model.strip_prefix("anthropic/").unwrap_or(model);
     TABLE
         .iter()
@@ -113,6 +135,31 @@ mod tests {
     fn unknown_models_have_the_highest_price() {
         for model in ["claude-fable-5-1", "claude-opus-5-55", "claude-opus-5", ""] {
             assert_eq!(price_for(model), UNKNOWN_PRICE, "{model}");
+        }
+    }
+
+    #[test]
+    fn command_line_providers_are_not_billed() {
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        for id in [
+            "claude-cli/claude-opus-5-5",
+            "claude-cli/default",
+            "codex-cli/default",
+            "codex-cli/some-model",
+        ] {
+            assert!(is_subscription(id), "{id}");
+            assert_eq!(price_for(id), FREE, "{id}");
+            assert!(close(cost_usd(id, &usage), 0.0), "{id}");
+            assert!(close(reserve_usd(id, 100_000, 4096), 0.0), "{id}");
+        }
+        // Only the whole prefix counts.
+        for id in ["claude-cli", "codex-cli-x/default", "anthropic/codex-cli/x"] {
+            assert!(!is_subscription(id), "{id}");
+            assert_eq!(price_for(id), UNKNOWN_PRICE, "{id}");
         }
     }
 

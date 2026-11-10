@@ -49,18 +49,32 @@ pub(crate) async fn assess_judged(engine: Engine, input: &Path, stack: JudgeStac
     let (request, source) = read_request(input)?;
     // No deadline for the command: each judge call has the whole timeout.
     let flow = Flow::new().with_judge(stack.judge, stack.settings);
-    let judged = flow::assess_judged(Arc::new(engine), request, &flow, None)
-        .await
-        .with_context(|| format!("failed to assess the request in {source}"))?;
+    // A program a command line judge runs is in a process group of its
+    // own, so Ctrl-C in the terminal does not reach it. The signal is
+    // taken here: the calls are dropped, which kills each program and
+    // removes its directory, and then the command ends.
+    let judged = tokio::select! {
+        judged = flow::assess_judged(Arc::new(engine), request, &flow, None) => judged,
+        () = crate::serve::shutdown_signal() => {
+            anyhow::bail!("interrupted: the judge was stopped and nothing was printed")
+        }
+    }
+    .with_context(|| format!("failed to assess the request in {source}"))?;
     let report = &judged.report;
+    // A command line provider runs on a subscription: there is no price
+    // to report for it.
+    let cost = if stack.metered {
+        format!("~${:.4}", report.cost_usd)
+    } else {
+        "cost not measured".to_owned()
+    };
     eprintln!(
-        "judge: {} flagged, {} judged ({}, {}/{} tokens, ~${:.4})",
+        "judge: {} flagged, {} judged ({}, {}/{} tokens, {cost})",
         report.flagged,
         report.judged,
         stack.model,
         report.usage.input_tokens,
         report.usage.output_tokens,
-        report.cost_usd
     );
     print_json(&judged.assessment)
 }

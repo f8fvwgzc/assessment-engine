@@ -8,6 +8,54 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Command line judge providers, for a machine without an Anthropic API
+  key. `codex-cli` is not a Claude model. It was added at the user's
+  request.
+  - `assessment-judge`: `CliJudge`, `CliConfig`, `CliKind` and
+    `cli::find_program` (feature `cli`, on by default). A `CliJudge` runs
+    the Claude Code command line (`claude-cli/<model>`) or the Codex
+    command line (`codex-cli/<model>`) once per question. The texts go to
+    the program on standard input only. The program runs without tools
+    (Claude Code) or in a read-only sandbox (Codex), in an empty private
+    directory that each call makes and removes, and is stopped with its
+    process group at the deadline or when the call is dropped. The signal
+    is sent before the call returns, not by a later task. At most 1 MiB
+    of output is read. A call is not tried again.
+  - The program does not get the environment of the engine. It gets the
+    variables in `cli::PASSED_ENV` (such as `HOME`, `PATH` and the proxy
+    variables) and `CLAUDE_CONFIG_DIR` or `CODEX_HOME`. No key, token or
+    endpoint variable reaches it. Codex also runs with
+    `-c shell_environment_policy.inherit=none`.
+  - `assess --judge` takes SIGINT and SIGTERM: it stops the judge and its
+    program, removes the directory of the call and ends with an error.
+  - The prompt and the strict answer parser are shared by all providers:
+    `prompt::Answer`, `prompt::single_prompt` and
+    `prompt::MAX_RATIONALE_CHARS`. `Effort` and `DEFAULT_MODEL` are now in
+    the crate root and no longer need the `anthropic` feature. The old
+    paths in `anthropic` still work.
+  - `price::is_subscription`, `price::FREE` and
+    `price::SUBSCRIPTION_PREFIXES`: a call of a command line provider
+    costs 0, so the hourly spend cap does not bind. `JudgeError::persistent`
+    marks a failure that will not go away soon (not logged in, usage limit
+    reached): `LimitedJudge` pauses for 300 s at once.
+  - Server flags `--judge-provider anthropic|claude-cli|codex-cli`
+    (`ASSESSMENT_JUDGE_PROVIDER`, default `anthropic`) and
+    `--judge-cli-path` (`ASSESSMENT_JUDGE_CLI_PATH`), for `serve` and
+    `assess --judge`. A command line provider reads no API key. `--judge
+    on` does not start when the program is not found, and `auto` then runs
+    without a judge. `--judge-base-url`, `--judge-fallbacks`,
+    `--judge-max-tokens`, `--anthropic-api-key-file` and the efforts
+    `xhigh` and `max` are refused with a command line provider.
+    `--judge-cli-path` is refused with `anthropic`. The default of
+    `--judge-concurrency` is 2 with a command line provider.
+    `--judge-model` defaults to the program's own model with `codex-cli`.
+  - `assess --judge` prints `cost not measured` instead of a price for a
+    command line provider.
+  - `examples/judge_cases.rs` takes `JUDGE_PROVIDER` and `JUDGE_CLI_PATH`.
+    With a command line provider it needs no key and prints the time of
+    each case. One run through Codex 0.160.0 (default model, free
+    ChatGPT login) passed all six cases at 4.5 s per case.
+  - A model name that starts with `-` is refused by every provider.
 - Text judgments (core). The engine flags a text change whose meaning its
   word counts cannot settle, and uses a judgment of it when one is supplied.
   The engine never calls a model: a judgment is plain data in the request.

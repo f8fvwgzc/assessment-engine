@@ -4,13 +4,17 @@
 //! [`PROMPT_VERSION`] whenever the system prompt, the user content or the
 //! schema changes, so cached answers of the old prompt are not reused.
 
-use serde::Serialize;
+use assessment_core::model::TextRelation;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{Hints, Question};
+use crate::{Hints, Question, Verdict, truncate_chars};
 
 /// The version of the prompt. It is part of every cache key.
 pub const PROMPT_VERSION: u32 = 1;
+
+/// The longest rationale that is kept, in characters.
+pub const MAX_RATIONALE_CHARS: usize = 400;
 
 /// The relation names, in the order of the schema.
 pub const RELATIONS: [&str; 6] = [
@@ -95,11 +99,58 @@ pub fn user_content(question: &Question) -> String {
     serde_json::to_string(&content).unwrap_or_default()
 }
 
+/// One prompt for a provider that has no separate system prompt: the
+/// instructions first, then the user content as the last line. The texts
+/// stay inside the JSON object, so they are data here too.
+pub fn single_prompt(user: &str) -> String {
+    format!(
+        "{SYSTEM_PROMPT}\n\nThe user message follows. It is the one JSON object on the last line \
+         of this prompt. Do not run commands and do not read or write files. Only answer.\n\n{user}\n"
+    )
+}
+
+/// An answer in the shape of the schema, checked strictly: an unknown
+/// relation, a missing or an extra key, or a confidence that is not a
+/// finite number in `[0, 1]` is not an answer.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Answer {
+    pub relation: TextRelation,
+    pub confidence: f64,
+    pub rationale: String,
+}
+
+impl Answer {
+    /// Reads one answer text. `None` when it is not exactly an answer.
+    pub fn parse(text: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(text.trim()).ok()?.checked()
+    }
+
+    /// Reads an answer that is already parsed JSON.
+    pub fn from_value(value: Value) -> Option<Self> {
+        serde_json::from_value::<Self>(value).ok()?.checked()
+    }
+
+    fn checked(self) -> Option<Self> {
+        (self.confidence.is_finite() && (0.0..=1.0).contains(&self.confidence)).then_some(self)
+    }
+
+    /// The verdict of `source`. The rationale is cut to
+    /// [`MAX_RATIONALE_CHARS`].
+    pub fn into_verdict(self, source: impl Into<String>) -> Verdict {
+        Verdict::new(
+            self.relation,
+            self.confidence,
+            truncate_chars(self.rationale.trim(), MAX_RATIONALE_CHARS),
+            source,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use assessment_core::assessment::JudgmentReason;
-    use assessment_core::model::TextRelation;
 
     #[test]
     fn the_prompt_names_every_relation_and_the_data_rule() {
@@ -217,5 +268,48 @@ mod tests {
     fn equal_questions_give_equal_bytes() {
         let a = Question::new("description", "issue", "x", "y");
         assert_eq!(user_content(&a), user_content(&a.clone()));
+    }
+
+    #[test]
+    fn an_answer_is_read_strictly() {
+        let good = r#" {"relation":"replaced","confidence":0.9,"rationale":"x"} "#;
+        let answer = Answer::parse(good).expect("an answer");
+        assert_eq!(answer.relation, TextRelation::Replaced);
+        assert_eq!(
+            Answer::from_value(serde_json::from_str(good).expect("json")),
+            Some(answer)
+        );
+        for bad in [
+            r#"{"relation":"replaced","confidence":0.9}"#,
+            r#"{"relation":"replaced","confidence":0.9,"rationale":"x","extra":1}"#,
+            r#"{"relation":"other","confidence":0.9,"rationale":"x"}"#,
+            r#"{"relation":"replaced","confidence":1.5,"rationale":"x"}"#,
+            r#"{"relation":"replaced","confidence":-0.1,"rationale":"x"}"#,
+            r#"{"relation":"replaced","confidence":"high","rationale":"x"}"#,
+            r#"Here it is: {"relation":"replaced","confidence":0.9,"rationale":"x"}"#,
+            "",
+        ] {
+            assert_eq!(Answer::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_long_rationale_is_cut() {
+        let answer = Answer {
+            relation: TextRelation::Equivalent,
+            confidence: 1.0,
+            rationale: format!("  {}  ", "ө".repeat(1000)),
+        };
+        let verdict = answer.into_verdict("fake/model");
+        assert_eq!(verdict.rationale.chars().count(), MAX_RATIONALE_CHARS);
+        assert_eq!(verdict.source, "fake/model");
+    }
+
+    #[test]
+    fn the_single_prompt_holds_the_instructions_and_ends_with_the_user_content() {
+        let user = user_content(&Question::new("title", "issue", "a", "b"));
+        let prompt = single_prompt(&user);
+        assert!(prompt.starts_with(SYSTEM_PROMPT));
+        assert!(prompt.ends_with(&format!("\n{user}\n")));
     }
 }
