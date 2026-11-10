@@ -69,6 +69,34 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub fsync: bool,
 
+    /// Compact the journal into a snapshot once it holds this many
+    /// operations, and on a clean shutdown (0 = never).
+    ///
+    /// A compaction writes the current state to `<journal>.snapshot` and
+    /// starts a new, empty journal, so the next start does not replay the
+    /// whole history. Without `--journal` this does nothing.
+    #[arg(
+        long,
+        env = "ASSESSMENT_COMPACT_AFTER_OPS",
+        value_name = "N",
+        default_value_t = 100_000,
+        value_parser = parse_compact_after_ops
+    )]
+    pub compact_after_ops: u64,
+
+    /// Keep the content of only the N newest versions of each entity, at
+    /// least 1 (default: all).
+    ///
+    /// Older versions stay in the history, but `GetEntity` and
+    /// `CompareVersions` no longer answer for them. This bounds memory.
+    #[arg(
+        long,
+        env = "ASSESSMENT_HISTORY_LIMIT",
+        value_name = "N",
+        value_parser = parse_history_limit
+    )]
+    pub history_limit: Option<usize>,
+
     /// A partial policy (JSON) merged over the default policy.
     #[arg(long, env = "ASSESSMENT_POLICY", value_name = "FILE")]
     pub policy: Option<PathBuf>,
@@ -101,8 +129,8 @@ pub(crate) struct ServeArgs {
 
     /// Most stateless assessments (`Assess`, `CompareText`, batch and stream
     /// items) the server runs at once, and separately most registry calls
-    /// (`PutEntity`, `DeleteEntity`, `RecordActivity`, `CompareVersions`);
-    /// at least 1 (default: the number of CPUs).
+    /// (`PutEntity`, `DeleteEntity`, `RecordActivity`, `CompareVersions`,
+    /// and each chunk of an `Import`); at least 1 (default: the number of CPUs).
     ///
     /// More wait their turn. Unary and batch calls queue within the request
     /// timeout and fail with CANCELLED if it passes while they wait. Stream
@@ -129,6 +157,22 @@ fn parse_slots(text: &str) -> Result<usize, String> {
         Ok(n) if n > MAX_SLOTS => Err(format!("must be at most {MAX_SLOTS}")),
         Ok(n) => Ok(n),
         Err(_) => Err(format!("must be a whole number from 1 to {MAX_SLOTS}")),
+    }
+}
+
+/// Parses `--compact-after-ops`: a whole number, where 0 means never.
+fn parse_compact_after_ops(text: &str) -> Result<u64, String> {
+    text.trim()
+        .parse::<u64>()
+        .map_err(|_| "must be a whole number (0 = never)".to_owned())
+}
+
+/// Parses `--history-limit`: a whole number, at least 1.
+fn parse_history_limit(text: &str) -> Result<usize, String> {
+    match text.trim().parse::<usize>() {
+        Ok(0) => Err("must be at least 1 (leave it out to keep every version)".to_owned()),
+        Ok(n) => Ok(n),
+        Err(_) => Err("must be a whole number, at least 1".to_owned()),
     }
 }
 
@@ -301,6 +345,50 @@ mod tests {
         for bad in ["0", too_many.as_str(), "many"] {
             let err =
                 Cli::try_parse_from(["assessment-engine", FLAG, bad]).expect_err("out of range");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+        let err = Cli::try_parse_from(["assessment-engine", FLAG, "0"]).expect_err("zero");
+        assert!(err.to_string().contains("must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn compact_after_ops_defaults_to_one_hundred_thousand_and_zero_means_never() {
+        const FLAG: &str = "--compact-after-ops";
+        let cli = Cli::try_parse_from(["assessment-engine"]).expect("parses");
+        assert_eq!(cli.serve.compact_after_ops, 100_000);
+        let cli = Cli::try_parse_from(["assessment-engine", FLAG, "0"]).expect("parses");
+        assert_eq!(cli.serve.compact_after_ops, 0);
+        let cli = Cli::try_parse_from(["assessment-engine", "serve", FLAG, "250"]).expect("parses");
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.compact_after_ops, 250);
+
+        for bad in ["-1", "1.5", "many", "99999999999999999999999"] {
+            // `=` so that a leading `-` is read as the value.
+            let err = Cli::try_parse_from(["assessment-engine", &format!("{FLAG}={bad}")])
+                .expect_err("not a count");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+            assert!(err.to_string().contains("must be a whole number"), "{err}");
+        }
+    }
+
+    #[test]
+    fn history_limit_is_optional_and_at_least_one() {
+        const FLAG: &str = "--history-limit";
+        let cli = Cli::try_parse_from(["assessment-engine"]).expect("parses");
+        assert_eq!(cli.serve.history_limit, None);
+        let cli = Cli::try_parse_from(["assessment-engine", FLAG, "1"]).expect("parses");
+        assert_eq!(cli.serve.history_limit, Some(1));
+        let cli = Cli::try_parse_from(["assessment-engine", "serve", FLAG, "20"]).expect("parses");
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(args.history_limit, Some(20));
+
+        for bad in ["0", "-3", "all"] {
+            let err = Cli::try_parse_from(["assessment-engine", &format!("{FLAG}={bad}")])
+                .expect_err("out of range");
             assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
         }
         let err = Cli::try_parse_from(["assessment-engine", FLAG, "0"]).expect_err("zero");

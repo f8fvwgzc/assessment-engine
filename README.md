@@ -95,7 +95,11 @@ cargo run --release -p assessment-server -- serve --addr 127.0.0.1:50061
 
 Options (flags or env): `--journal <file>` / `ASSESSMENT_JOURNAL` (persist the
 registry as an append-only JSON-lines journal; in memory otherwise),
-`--fsync`, `--policy <patch.json>`, `--auth-token` / `ASSESSMENT_AUTH_TOKEN`
+`--fsync`, `--compact-after-ops <n>` / `ASSESSMENT_COMPACT_AFTER_OPS` (compact
+the journal into `<file>.snapshot` after that many operations and on a clean
+shutdown; default 100000, 0 = never), `--history-limit <n>` /
+`ASSESSMENT_HISTORY_LIMIT` (keep the content of only the newest `n` versions
+of each entity; default all), `--policy <patch.json>`, `--auth-token` / `ASSESSMENT_AUTH_TOKEN`
 (require `authorization: Bearer <token>`), `--max-message-bytes`,
 `--request-timeout-secs`, `--concurrency-limit`,
 `--max-concurrent-assessments` (stateless assessments run at once, and
@@ -106,6 +110,44 @@ CPUs; more wait their turn), `--log-format json`, `RUST_LOG`. Health (`grpc.heal
 ```bash
 grpcurl -plaintext -d @ 127.0.0.1:50061 assessment.v1.AssessmentEngine/Assess < examples/requests/parent_rewrite.json
 ```
+
+#### Durability
+
+Without `--journal` the registry lives in memory and is empty after a
+restart. With it, the state on disk is two files: the journal and, after the
+first compaction, `<file>.snapshot` next to it.
+
+* **Journal.** Every acknowledged write is appended as one JSON line. On
+  start the server loads the snapshot, if there is one, and replays the
+  journal over it. A torn last line from a crash is dropped.
+* **Snapshot.** A compaction writes the full state to the snapshot and
+  starts a new journal, so a start does not replay the whole history. It
+  runs once the journal holds `--compact-after-ops` operations (default
+  100000) and on a clean shutdown. With `--compact-after-ops 0` the server
+  never writes a snapshot and the journal keeps growing. The snapshot has a
+  checksum: a corrupt or cut-off snapshot stops the start, and is never
+  loaded in part.
+* **`--fsync` is off by default.** A write is then handed to the operating
+  system before the call is answered, but not forced to disk. It survives a
+  crash or a kill of the server. A power cut or a crash of the machine can
+  lose the last writes. With `--fsync` every write is synced to disk before
+  it is answered, which is slower; an `Import` then syncs once per chunk,
+  not once per item. Snapshots are always synced, whatever the flag says.
+* **`--history-limit <n>`** keeps the content of only the newest `n`
+  versions of each entity, to bound memory. Older versions stay in the
+  history with their version and scores, but `GetEntity` and
+  `CompareVersions` no longer answer for them. A snapshot holds only what
+  was in memory, so a limit that was in force at a compaction is permanent
+  for the versions it dropped.
+
+An older server (0.1, 0.2) cannot go back to a compacted journal: it
+refuses to start on it. On a journal that was never compacted it starts,
+ignores every `source_seq`, and may drop a last `seq` line; see the
+changelog.
+
+Back up or copy the journal and its snapshot together. If the engine is fed
+from a system of record, its state can also be rebuilt from an empty
+journal with `Import`.
 
 ### Offline CLI (same engine, JSON in / JSON out)
 
@@ -166,6 +208,30 @@ parent arrives after the child — and keeps history in memory, bounded with
 `Registry::with_history_limit(n)` / `open_with_history_limit`. The journal is
 append-only JSON lines; a torn last line from a crash is truncated on open.
 
+To follow a system of record, load with `Registry::import(items)`: new
+entities are stored at their first version without an assessment, unchanged
+ones are skipped and changed ones are assessed like a put. It returns an
+`ImportSummary` of counts. `PutOptions::source_seq`,
+`DeleteOptions::source_seq` (with `Registry::delete_with`) and
+`ImportItem::with_source_seq` carry the source's sequence for the entity; a
+change that is not above the stored sequence is skipped. See
+[`Import`](#loading-and-syncing-many-entities-import) for the rules.
+
+The journal grows with every write. `Registry::compact()` writes the full
+state to `<journal>.snapshot` and starts a fresh journal, so the next open
+loads the snapshot and replays only what came after it. The snapshot has a
+checksum; a corrupt or cut-off snapshot fails the open and is never loaded
+in part. `Registry::open_with` takes `RegistryOptions { fsync, history_limit,
+compact_after_ops }`; with `compact_after_ops` the registry compacts on its
+own after that many journal operations. `fsync` is off by default: a write
+then survives a crash of the process, and a power cut can lose the last
+writes. Snapshots are always synced. Keep the journal and its snapshot
+together when you copy or back them up.
+
+The registry keeps the text analysis of each stored entity in memory, so a
+put analyses only the text that changed. Results are the same with and
+without it. `Registry::with_analysis_cache(false)` turns it off.
+
 ### From any language over gRPC
 
 Generate a client from `proto/assessment/v1/assessment.proto` (`buf generate`,
@@ -173,6 +239,92 @@ Generate a client from `proto/assessment/v1/assessment.proto` (`buf generate`,
 neighbourhood) or `PutEntity` (stateful: the server diffs against what it
 stored). Your service then branches on `assessment.recommendation`,
 `impacts[].action` and `changes[].bump`.
+
+### Loading and syncing many entities: `Import`
+
+`PutEntity` is for one live change: it assesses the change and answers with
+the full assessment. `Import` is for many entities at once: a first load
+from your system of record, a re-sync after an outage, or a replay of an
+outbox. It is a client stream of `ImportRequest` items and answers once,
+with counts instead of assessments. If you need the assessment of each
+change, use `PutEntity`.
+
+```bash
+grpcurl -plaintext -d @ 127.0.0.1:50061 assessment.v1.AssessmentEngine/Import <<'EOF'
+{"entity": {"id": "ENG-12", "kind": "issue", "fields": {"title": {"text": "Authentication for the customer portal"}}}, "sourceSeq": 41}
+{"entity": {"id": "ENG-14", "kind": "sub_issue", "parentId": "ENG-12", "fields": {"title": {"text": "Password reset email flow"}}}, "sourceSeq": 7}
+{"entity": {"id": "ENG-9"}, "deleted": true, "sourceSeq": 3}
+EOF
+```
+
+```json
+{ "created": "2", "unchanged": "1" }
+```
+
+The server handles each item by what it holds for the item's id:
+
+| The item is… | The server… | Counted in |
+|---|---|---|
+| new | stores it at its first version (1.0.0, or the `version` it carries) **without an assessment**, and sets the pins a put would set | `created` |
+| the same as what is stored | does nothing | `unchanged` |
+| different from what is stored | assesses and versions it like `PutEntity` | `assessed` |
+| `deleted`, and stored | deletes it like `DeleteEntity` | `deleted` |
+| `deleted`, and not stored | does nothing | `unchanged` |
+| older than what is stored (see `source_seq`) | does nothing | `skipped_stale` |
+| not valid (no entity, an empty id, a bad value) | skips it and goes on | `failed`, `failed_total` |
+
+`failed` lists the id and the error of at most the first 1000 failed items;
+`failed_total` counts all of them. A listed id is cut to 256 bytes and an
+error to 1024 bytes (a cut text ends in `...`), so the list stays small.
+Only a message that cannot be decoded or
+a journal that cannot be written fails the whole call.
+
+**Ordering.** Items are applied in the order you send them, so two items
+for the same id end in the state of the later one. Any order of entities
+gives the same versions and pins: a child that arrives before its parent is
+pinned when the parent arrives. Parents before children is the cheapest
+order. A new entity is not assessed, so its history entry has score 0 and
+no changed fields.
+
+**`source_seq`.** Set it on `Import` items, `PutEntity` and `DeleteEntity`
+when your source numbers its changes per entity (an outbox id, an update
+time in microseconds). The server keeps the highest sequence it has applied
+for each id, also after a deletion.
+
+* A change whose sequence is not above the stored one is skipped. Nothing
+  is assessed or stored, and `skipped_stale` is set (`PutEntityResponse`,
+  `DeleteEntityResponse`) or counted (`ImportResponse`). So a replay, a
+  duplicate delivery or a late delivery cannot overwrite newer state.
+* A deletion of an id that is not stored still stores its sequence.
+  `DeleteEntity` answers `NOT_FOUND` and `Import` counts it in `unchanged`,
+  and a put with a lower sequence that arrives later is skipped. The same
+  deletion sent again is then a skip like any other (`skipped_stale`, not
+  `NOT_FOUND`). A dry run stores no sequence.
+* A skipped `PutEntity` returns the stored item in `entity`. If the id is
+  not stored (deleted, or only its sequence is known), it returns the item
+  as sent: the server does not hold it.
+* An equal sequence is also skipped. A replay of a stream with the same
+  sequences is counted in `skipped_stale`, not in `unchanged`.
+* A change without a sequence is always applied, and the stored sequence
+  stays as it was.
+* The check comes first: a stale `PutEntity` is skipped even when its
+  `expected_version` does not match, and on a dry run.
+
+A `PutEntity` that matches what is stored is not assessed either:
+`unchanged` is set. For `unchanged` and `skipped_stale` the `assessment` in
+the answer is empty (no changes, no impacts, score 0).
+
+**Chunks, timeout and retries.** The server reads the stream in chunks of
+up to 512 items or 4 MiB and applies each chunk as one registry call. Other
+calls are served between chunks, and one import holds one chunk in memory.
+The whole stream runs within `--request-timeout-secs` (30 by default);
+raise it, or set 0, for a long import. If the call ends early (the client
+goes away, the deadline passes), no further chunk starts and the chunks
+already applied stay applied. Sending the same stream again is safe.
+
+From Rust, `AssessmentClient::import_iter(items)` and `import(stream)` send
+`ImportItem`s and return an `ImportReport`; in-process,
+`Registry::import(items)` returns an `ImportSummary` with the same counts.
 
 ## Wiring it into nexc-engine
 

@@ -43,7 +43,10 @@ use assessment_core::model::{
     StatusCategory,
 };
 use assessment_core::policy::Policy;
-use assessment_core::registry::{PutOptions, PutOutcome, StaleEntry, VersionRecord};
+use assessment_core::registry::{
+    DeleteOptions, DeleteOutcome, ImportFailure, ImportItem, ImportSummary, PutOptions, PutOutcome,
+    StaleEntry, VersionRecord,
+};
 use assessment_core::semver::{SemVer, VersionBump};
 use assessment_core::text::{StructureDiff, TextDiff};
 use chrono::{DateTime, Utc};
@@ -1292,6 +1295,8 @@ impl From<PutOutcome> for pb::PutEntityResponse {
             stored: o.stored,
             bump: version_bump_to_pb(o.bump),
             assessment: Some(o.assessment.into()),
+            skipped_stale: o.skipped_stale,
+            unchanged: o.unchanged,
         }
     }
 }
@@ -1306,6 +1311,8 @@ impl TryFrom<pb::PutEntityResponse> for PutOutcome {
             stored: o.stored,
             bump: version_bump_from_pb(o.bump).at("bump")?,
             assessment: assessment_field(o.assessment)?,
+            unchanged: o.unchanged,
+            skipped_stale: o.skipped_stale,
         })
     }
 }
@@ -1320,6 +1327,7 @@ pub fn put_request_to_pb(entity: Entity, options: PutOptions) -> pb::PutEntityRe
         now: options.now.map(timestamp_to_pb),
         disable_auto_pin: !options.auto_pin,
         options: Some(options.assess.into()),
+        source_seq: options.source_seq,
     }
 }
 
@@ -1335,8 +1343,135 @@ pub fn put_request_from_pb(
         now: ts_opt(request.now).at("now")?,
         auto_pin: !request.disable_auto_pin,
         assess: options_from_pb(request.options),
+        source_seq: request.source_seq,
     };
     Ok((entity, options))
+}
+
+/// A `DeleteEntityRequest` for `id` with `options`.
+pub fn delete_request_to_pb(
+    id: impl Into<String>,
+    options: DeleteOptions,
+) -> pb::DeleteEntityRequest {
+    pb::DeleteEntityRequest {
+        id: id.into(),
+        dry_run: options.dry_run,
+        expected_version: options.expected_version.map(Into::into),
+        now: options.now.map(timestamp_to_pb),
+        source_seq: options.source_seq,
+    }
+}
+
+/// The id and the options of a `DeleteEntityRequest`.
+pub fn delete_request_from_pb(
+    request: pb::DeleteEntityRequest,
+) -> Result<(String, DeleteOptions), ConvertError> {
+    let options = DeleteOptions {
+        dry_run: request.dry_run,
+        expected_version: request.expected_version.map(Into::into),
+        now: ts_opt(request.now).at("now")?,
+        source_seq: request.source_seq,
+    };
+    Ok((request.id, options))
+}
+
+impl From<DeleteOutcome> for pb::DeleteEntityResponse {
+    fn from(o: DeleteOutcome) -> Self {
+        Self {
+            assessment: Some(o.assessment.into()),
+            deleted: o.deleted,
+            skipped_stale: o.skipped_stale,
+        }
+    }
+}
+
+impl TryFrom<pb::DeleteEntityResponse> for DeleteOutcome {
+    type Error = ConvertError;
+
+    fn try_from(o: pb::DeleteEntityResponse) -> Result<Self> {
+        Ok(DeleteOutcome {
+            deleted: o.deleted,
+            assessment: assessment_field(o.assessment)?,
+            skipped_stale: o.skipped_stale,
+        })
+    }
+}
+
+impl From<ImportItem> for pb::ImportRequest {
+    fn from(item: ImportItem) -> Self {
+        Self {
+            entity: Some(item.entity.into()),
+            source_seq: item.source_seq,
+            deleted: item.deleted,
+        }
+    }
+}
+
+impl TryFrom<pb::ImportRequest> for ImportItem {
+    type Error = ConvertError;
+
+    /// For a deletion only the entity's id is read, so the rest of it is
+    /// not checked.
+    fn try_from(r: pb::ImportRequest) -> Result<Self> {
+        let entity = required(r.entity).at("entity")?;
+        let item = if r.deleted {
+            ImportItem::delete(entity.id)
+        } else {
+            ImportItem::upsert(Entity::try_from(entity).at("entity")?)
+        };
+        Ok(ImportItem {
+            source_seq: r.source_seq,
+            ..item
+        })
+    }
+}
+
+impl From<ImportFailure> for pb::ImportFailure {
+    fn from(f: ImportFailure) -> Self {
+        Self {
+            id: f.id,
+            error: f.error,
+        }
+    }
+}
+
+impl From<pb::ImportFailure> for ImportFailure {
+    fn from(f: pb::ImportFailure) -> Self {
+        Self {
+            id: f.id,
+            error: f.error,
+        }
+    }
+}
+
+/// `failed_total` is the length of `failed`: a summary lists every failure.
+impl From<ImportSummary> for pb::ImportResponse {
+    fn from(s: ImportSummary) -> Self {
+        Self {
+            created: s.created,
+            unchanged: s.unchanged,
+            assessed: s.assessed,
+            skipped_stale: s.skipped_stale,
+            deleted: s.deleted,
+            failed_total: s.failed.len() as u64,
+            failed: s.failed.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `failed_total` is not part of a summary. When the server cut the list
+/// short, it is larger than `failed.len()`; read it from the message.
+impl From<pb::ImportResponse> for ImportSummary {
+    fn from(r: pb::ImportResponse) -> Self {
+        Self {
+            created: r.created,
+            unchanged: r.unchanged,
+            assessed: r.assessed,
+            skipped_stale: r.skipped_stale,
+            deleted: r.deleted,
+            failed: r.failed.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Decodes a list of protobuf messages, prefixing errors with `name[i]`.

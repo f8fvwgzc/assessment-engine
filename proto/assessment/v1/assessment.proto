@@ -15,7 +15,8 @@
 // * Stateful — `PutEntity`, `DeleteEntity`, `RecordActivity`, `GetEntity`,
 //   `GetHistory`, `CompareVersions`, `ListStale`, `Acknowledge`: the server
 //   keeps every item's versions and history, builds the context itself, and
-//   tracks which plans are behind a breaking change.
+//   tracks which plans are behind a breaking change. `Import` loads or
+//   re-syncs many items in one stream.
 //
 // Scores are in [0, 1]. Timestamps are UTC. Unknown string values of open
 // vocabularies (entity kinds, field names) are accepted.
@@ -62,6 +63,18 @@ service AssessmentEngine {
   rpc ListStale(ListStaleRequest) returns (ListStaleResponse);
   // Re-pins an item to the current versions of what it was planned against.
   rpc Acknowledge(AcknowledgeRequest) returns (AcknowledgeResponse);
+  // Loads or re-syncs many items from the source of truth, in stream order.
+  // A new item is stored at its first version without an assessment. An
+  // item that matches what is stored is skipped. A changed item is assessed
+  // and versioned like PutEntity. A deleted one is deleted like
+  // DeleteEntity. An item that cannot be applied is counted in `failed` and
+  // the rest still runs.
+  //
+  // The server applies the stream in chunks. If the call ends early (the
+  // client goes away, the deadline passes, the journal cannot be written),
+  // the chunks already applied stay applied. Sending the same stream again
+  // is safe: what is already stored is skipped.
+  rpc Import(stream ImportRequest) returns (ImportResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +580,11 @@ message PutEntityRequest {
   // Do not pin the parent's / blockers' versions on creation and re-parenting.
   bool disable_auto_pin = 6;
   AssessOptions options = 7;
+  // The position of this change in the source's own order for the item (an
+  // outbox id, an update time in microseconds). A put whose sequence is not
+  // above the one stored for the item is skipped: see `skipped_stale`.
+  // Absent = always apply, and keep the stored sequence.
+  optional uint64 source_seq = 8;
 }
 
 message PutEntityResponse {
@@ -575,7 +593,16 @@ message PutEntityResponse {
   bool created = 2;
   bool stored = 3;
   VersionBump bump = 4;
+  // When `skipped_stale` or `unchanged` is set, nothing was assessed: this
+  // is an empty assessment (no changes, no impacts, score 0).
   Assessment assessment = 5;
+  // `source_seq` was not above the stored sequence. Nothing was assessed or
+  // stored. `entity` is the stored item. If the id is not stored (it was
+  // deleted, or only its sequence is known from a deletion), `entity` is the
+  // item as sent, without a stored version: the server does not hold it.
+  bool skipped_stale = 6;
+  // The item matches what is stored. Nothing was assessed or stored.
+  bool unchanged = 7;
 }
 
 message DeleteEntityRequest {
@@ -583,11 +610,22 @@ message DeleteEntityRequest {
   bool dry_run = 2;
   SemVer expected_version = 3;
   google.protobuf.Timestamp now = 4;
+  // See `PutEntityRequest.source_seq`. A deletion of an id that is not
+  // stored fails with NOT_FOUND, and its sequence is still remembered (not
+  // on a dry run), so an older put that arrives later is skipped. The same
+  // request sent again is therefore answered OK with `skipped_stale`, not
+  // with NOT_FOUND.
+  optional uint64 source_seq = 5;
 }
 
 message DeleteEntityResponse {
+  // An empty assessment when `skipped_stale` is set.
   Assessment assessment = 1;
+  // False on a dry run and on a stale skip.
   bool deleted = 2;
+  // `source_seq` was not above the stored sequence. Nothing was assessed or
+  // deleted.
+  bool skipped_stale = 3;
 }
 
 message RecordActivityRequest {
@@ -656,4 +694,42 @@ message AcknowledgeRequest {
 
 message AcknowledgeResponse {
   Entity entity = 1;
+}
+
+// One item of an `Import` stream.
+message ImportRequest {
+  // The item as the source holds it. Its `version` is kept only when the id
+  // is new. For a deletion only its `id` is read.
+  Entity entity = 1;
+  // See `PutEntityRequest.source_seq`.
+  optional uint64 source_seq = 2;
+  // The source deleted the item.
+  bool deleted = 3;
+}
+
+// An item of an import that was not applied.
+message ImportFailure {
+  // The item's id (empty when the item carried no entity). At most 256
+  // bytes: a longer id is cut and ends in `...`.
+  string id = 1;
+  // At most 1024 bytes: a longer text is cut and ends in `...`.
+  string error = 2;
+}
+
+// What an import did, in numbers of items.
+message ImportResponse {
+  // New items, stored at their first version without an assessment.
+  uint64 created = 1;
+  // Items that match what is stored, and deletions of items not stored.
+  uint64 unchanged = 2;
+  // Changed items, assessed and stored like PutEntity.
+  uint64 assessed = 3;
+  // Items whose `source_seq` was not above the stored sequence.
+  uint64 skipped_stale = 4;
+  // Stored items that were deleted.
+  uint64 deleted = 5;
+  // The items that failed, in stream order. At most the first 1000 are
+  // listed; `failed_total` counts all of them.
+  repeated ImportFailure failed = 6;
+  uint64 failed_total = 7;
 }

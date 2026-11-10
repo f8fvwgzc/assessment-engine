@@ -13,12 +13,21 @@
 //! `RecordActivity`, `CompareVersions`) use the other. A registry call can
 //! wait on the registry lock or on a journal sync while it holds its slot;
 //! with its own pool, that wait never takes a slot from a stateless call.
+//!
+//! `Import` reads its stream in chunks ([`ServiceLimits::max_import_chunk`]
+//! items, or [`IMPORT_CHUNK_BYTES`] of messages, whichever comes first). Each
+//! chunk is one registry call: it waits for a registry slot, runs on the
+//! blocking pool and gives the slot back. So the server holds one chunk of
+//! a stream in memory, however long the stream is, and other registry calls
+//! get their turn between chunks.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
 use assessment_core::engine::{MAX_EMBEDDING_DIM, MAX_TEXT_BYTES};
+use assessment_core::registry::{ImportItem, ImportSummary};
 use assessment_core::{Engine, Error as CoreError, ErrorKind, Registry};
+use prost::Message as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
@@ -66,7 +75,33 @@ pub struct ServiceLimits {
     /// Default: the number of CPUs. [`AssessmentService::with_limits`] keeps
     /// it within 1 and [`MAX_SLOTS`].
     pub max_concurrent_assessments: usize,
+    /// Most items of an `Import` stream the server applies as one registry
+    /// call. A chunk also ends once its messages reach
+    /// [`IMPORT_CHUNK_BYTES`]. The server reads the next chunk only after
+    /// the last one is applied, so this bounds the memory one import holds.
+    /// Default 512. [`AssessmentService::with_limits`] keeps it within 1
+    /// and [`MAX_IMPORT_CHUNK`].
+    pub max_import_chunk: usize,
 }
+
+/// The largest [`ServiceLimits::max_import_chunk`] the service accepts.
+pub const MAX_IMPORT_CHUNK: usize = 65_536;
+
+/// The encoded size of the messages after which an `Import` chunk ends,
+/// whatever its item count: 4 MiB. A chunk can pass it by one message.
+pub const IMPORT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Most failed items one `ImportResponse` lists. `failed_total` counts all.
+pub const MAX_IMPORT_FAILURES: usize = 1_000;
+
+/// Most bytes of an item's id that an `ImportFailure` carries. A longer id
+/// is cut and ends in `...`.
+pub const MAX_IMPORT_FAILURE_ID_BYTES: usize = 256;
+
+/// Most bytes of an error text that an `ImportFailure` carries. A longer
+/// text is cut and ends in `...`. With [`MAX_IMPORT_FAILURES`] and
+/// [`MAX_IMPORT_FAILURE_ID_BYTES`] this keeps the list under 1.5 MiB.
+pub const MAX_IMPORT_FAILURE_ERROR_BYTES: usize = 1_024;
 
 /// The largest `max_concurrent_assessments` and `max_in_flight` the service
 /// accepts (the most permits a tokio semaphore can hold).
@@ -79,6 +114,7 @@ impl Default for ServiceLimits {
             max_batch_size: 1_000,
             max_in_flight: cpus.max(2),
             max_concurrent_assessments: cpus.max(1),
+            max_import_chunk: 512,
         }
     }
 }
@@ -107,12 +143,21 @@ impl ServiceLimits {
         self
     }
 
+    /// These limits with `max_import_chunk` (at least 1, at most
+    /// [`MAX_IMPORT_CHUNK`]).
+    #[must_use]
+    pub fn with_max_import_chunk(mut self, items: usize) -> Self {
+        self.max_import_chunk = items.clamp(1, MAX_IMPORT_CHUNK);
+        self
+    }
+
     /// These limits with every value brought into its valid range. The
     /// fields are public, so a caller can set any number.
     fn normalised(mut self) -> Self {
         self.max_batch_size = self.max_batch_size.max(1);
         self.max_in_flight = self.max_in_flight.clamp(1, MAX_SLOTS);
         self.max_concurrent_assessments = self.max_concurrent_assessments.clamp(1, MAX_SLOTS);
+        self.max_import_chunk = self.max_import_chunk.clamp(1, MAX_IMPORT_CHUNK);
         self
     }
 }
@@ -129,8 +174,9 @@ pub struct AssessmentService {
     /// the last `with_limits`.
     stateless_slots: Arc<Semaphore>,
     /// One permit per registry call that may run at once: `PutEntity`,
-    /// `DeleteEntity`, `RecordActivity`, `CompareVersions`. Separate, so a
-    /// wait on the registry lock or the journal never holds a stateless slot.
+    /// `DeleteEntity`, `RecordActivity`, `CompareVersions`, and each chunk
+    /// of an `Import`. Separate, so a wait on the registry lock or the
+    /// journal never holds a stateless slot.
     registry_slots: Arc<Semaphore>,
 }
 
@@ -161,8 +207,9 @@ impl AssessmentService {
     /// This service with other limits.
     ///
     /// Values out of range are brought into range first: every limit is at
-    /// least 1, and `max_in_flight` and `max_concurrent_assessments` are at
-    /// most [`MAX_SLOTS`]. [`limits`](Self::limits) returns the values in
+    /// least 1, `max_in_flight` and `max_concurrent_assessments` are at
+    /// most [`MAX_SLOTS`], and `max_import_chunk` is at most
+    /// [`MAX_IMPORT_CHUNK`]. [`limits`](Self::limits) returns the values in
     /// force.
     ///
     /// This starts fresh slot pools. Clones made before this call keep the
@@ -448,6 +495,115 @@ enum Pending {
 }
 
 // ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+/// What the chunks of one `Import` call did so far.
+#[derive(Debug, Default)]
+struct ImportTotals {
+    summary: ImportSummary,
+    /// Every failed item, including those `summary.failed` no longer lists.
+    failed_total: u64,
+}
+
+impl ImportTotals {
+    fn add(&mut self, chunk: ImportSummary) {
+        self.summary.created += chunk.created;
+        self.summary.unchanged += chunk.unchanged;
+        self.summary.assessed += chunk.assessed;
+        self.summary.skipped_stale += chunk.skipped_stale;
+        self.summary.deleted += chunk.deleted;
+        self.failed_total += chunk.failed.len() as u64;
+        let room = MAX_IMPORT_FAILURES.saturating_sub(self.summary.failed.len());
+        // Ids have no length limit and the error repeats the id, so both
+        // are cut: the list then has a fixed largest size.
+        self.summary
+            .failed
+            .extend(chunk.failed.into_iter().take(room).map(|mut f| {
+                cut(&mut f.id, MAX_IMPORT_FAILURE_ID_BYTES);
+                cut(&mut f.error, MAX_IMPORT_FAILURE_ERROR_BYTES);
+                f
+            }));
+    }
+
+    fn into_pb(self) -> pb::ImportResponse {
+        let failed_total = self.failed_total;
+        pb::ImportResponse {
+            failed_total,
+            ..self.summary.into()
+        }
+    }
+}
+
+/// Cuts `text` to at most `max` bytes, on a character boundary. A text
+/// that was cut ends in `...` (inside the limit).
+fn cut(text: &mut String, max: usize) {
+    const MARK: &str = "...";
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max.saturating_sub(MARK.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(MARK);
+}
+
+/// Applies one chunk of an import, in order (blocking).
+///
+/// An item that does not decode is listed as failed at its place, like an
+/// item the registry rejects; the items around it are still applied. Only a
+/// journal that cannot be written fails the chunk.
+fn import_chunk(
+    registry: &Registry,
+    chunk: Vec<pb::ImportRequest>,
+) -> Result<ImportSummary, CoreError> {
+    let mut summary = ImportSummary::default();
+    let mut add = |part: ImportSummary| {
+        summary.created += part.created;
+        summary.unchanged += part.unchanged;
+        summary.assessed += part.assessed;
+        summary.skipped_stale += part.skipped_stale;
+        summary.deleted += part.deleted;
+        summary.failed.extend(part.failed);
+    };
+    // Valid items go to the registry in runs, so that a failure to decode
+    // keeps its place among the failures the registry reports.
+    let mut run: Vec<ImportItem> = Vec::with_capacity(chunk.len());
+    for request in chunk {
+        let id = request.entity.as_ref().map(|e| e.id.clone());
+        match ImportItem::try_from(request) {
+            Ok(item) => run.push(item),
+            Err(e) => {
+                if !run.is_empty() {
+                    add(registry.import(std::mem::take(&mut run))?);
+                }
+                add(ImportSummary {
+                    failed: vec![assessment_core::registry::ImportFailure {
+                        id: id.unwrap_or_default(),
+                        error: e.to_string(),
+                    }],
+                    ..ImportSummary::default()
+                });
+            }
+        }
+    }
+    if !run.is_empty() {
+        add(registry.import(run)?);
+    }
+    Ok(summary)
+}
+
+/// Logs why the registry's last automatic compaction failed, if one did.
+/// The write that set it off was stored all the same.
+fn log_compaction_error(registry: &Registry) {
+    if let Some(err) = registry.take_compaction_error() {
+        log_internal(&err);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The service
 // ---------------------------------------------------------------------------
 
@@ -675,7 +831,11 @@ impl AssessmentEngine for AssessmentService {
         let (entity, options) = convert::put_request_from_pb(request.into_inner())?;
         let registry = Arc::clone(&self.registry);
         let outcome = self
-            .registry_blocking(move || into_core_result(registry.put(entity, options)))
+            .registry_blocking(move || {
+                let outcome = registry.put(entity, options);
+                log_compaction_error(&registry);
+                into_core_result(outcome)
+            })
             .await?;
         Ok(Response::new(outcome.into()))
     }
@@ -684,20 +844,16 @@ impl AssessmentEngine for AssessmentService {
         &self,
         request: Request<pb::DeleteEntityRequest>,
     ) -> Result<Response<pb::DeleteEntityResponse>, Status> {
-        let r = request.into_inner();
-        let now = convert::decode_time(r.now, "now")?;
-        let expected = r.expected_version.map(Into::into);
-        let dry_run = r.dry_run;
+        let (id, options) = convert::delete_request_from_pb(request.into_inner())?;
         let registry = Arc::clone(&self.registry);
-        let assessment = self
+        let outcome = self
             .registry_blocking(move || {
-                into_core_result(registry.delete(&r.id, dry_run, expected, now))
+                let outcome = registry.delete_with(&id, options);
+                log_compaction_error(&registry);
+                into_core_result(outcome)
             })
             .await?;
-        Ok(Response::new(pb::DeleteEntityResponse {
-            assessment: Some(assessment.into()),
-            deleted: !dry_run,
-        }))
+        Ok(Response::new(outcome.into()))
     }
 
     async fn record_activity(
@@ -780,10 +936,76 @@ impl AssessmentEngine for AssessmentService {
         let r = request.into_inner();
         let now = convert::decode_time(r.now, "now")?;
         let registry = Arc::clone(&self.registry);
-        let entity = blocking(move || into_core_result(registry.acknowledge(&r.id, now))).await?;
+        let entity = blocking(move || {
+            let entity = registry.acknowledge(&r.id, now);
+            log_compaction_error(&registry);
+            into_core_result(entity)
+        })
+        .await?;
         Ok(Response::new(pb::AcknowledgeResponse {
             entity: Some(entity.into()),
         }))
+    }
+
+    async fn import(
+        &self,
+        request: Request<Streaming<pb::ImportRequest>>,
+    ) -> Result<Response<pb::ImportResponse>, Status> {
+        let mut inbound = request.into_inner();
+        let max_items = self.limits.max_import_chunk;
+        let mut totals = ImportTotals::default();
+        let mut chunk: Vec<pb::ImportRequest> = Vec::new();
+        let mut bytes = 0usize;
+        // One chunk at a time: the next message is read only after the
+        // chunk before it is applied, so the transport's flow control holds
+        // the client back and memory stays at one chunk. If this call is
+        // dropped (the client went away, the deadline passed), no further
+        // chunk starts; a chunk that has started commits.
+        loop {
+            // A stream that fails (the client reset it, or sent a message
+            // that does not decode) ends the call. The items read since the
+            // last chunk are not applied.
+            let next = inbound.message().await?;
+            let ended = next.is_none();
+            if let Some(item) = next {
+                bytes = bytes.saturating_add(item.encoded_len());
+                chunk.push(item);
+            }
+            if ended && !chunk.is_empty() {
+                // A client that cancels the call looks like the end of the
+                // stream here. Giving the transport one turn lets it drop
+                // this call for a cancelled stream, before the items that
+                // were read last are applied.
+                tokio::task::yield_now().await;
+            }
+            let full = chunk.len() >= max_items || bytes >= IMPORT_CHUNK_BYTES;
+            if !chunk.is_empty() && (ended || full) {
+                let items = std::mem::take(&mut chunk);
+                bytes = 0;
+                let registry = Arc::clone(&self.registry);
+                let summary = self
+                    .registry_blocking(move || {
+                        let summary = import_chunk(&registry, items);
+                        log_compaction_error(&registry);
+                        into_core_result(summary)
+                    })
+                    .await?;
+                totals.add(summary);
+            }
+            if ended {
+                break;
+            }
+        }
+        tracing::debug!(
+            created = totals.summary.created,
+            unchanged = totals.summary.unchanged,
+            assessed = totals.summary.assessed,
+            skipped_stale = totals.summary.skipped_stale,
+            deleted = totals.summary.deleted,
+            failed = totals.failed_total,
+            "import applied"
+        );
+        Ok(Response::new(totals.into_pb()))
     }
 }
 
@@ -798,6 +1020,43 @@ mod tests {
     use assessment_core::semver::SemVer;
 
     use super::*;
+
+    #[test]
+    fn a_long_failure_text_is_cut_on_a_character_boundary() {
+        let mut short = "ENG-1".to_owned();
+        cut(&mut short, 8);
+        assert_eq!(short, "ENG-1");
+
+        let mut exact = "12345678".to_owned();
+        cut(&mut exact, 8);
+        assert_eq!(exact, "12345678");
+
+        let mut long = "123456789".to_owned();
+        cut(&mut long, 8);
+        assert_eq!(long, "12345...");
+
+        // "é" is two bytes: the cut does not split it.
+        let mut accents = "éééééé".to_owned();
+        cut(&mut accents, 8);
+        assert_eq!(accents, "éé...");
+        assert!(accents.len() <= 8);
+    }
+
+    #[test]
+    fn import_totals_cut_the_id_and_the_error_of_a_failure() {
+        let mut totals = ImportTotals::default();
+        totals.add(ImportSummary {
+            failed: vec![assessment_core::registry::ImportFailure {
+                id: "x".repeat(10_000),
+                error: "y".repeat(10_000),
+            }],
+            ..ImportSummary::default()
+        });
+        assert_eq!(totals.failed_total, 1);
+        let f = &totals.summary.failed[0];
+        assert_eq!(f.id.len(), MAX_IMPORT_FAILURE_ID_BYTES);
+        assert_eq!(f.error.len(), MAX_IMPORT_FAILURE_ERROR_BYTES);
+    }
 
     /// How long a call must stay pending to count as "waiting for a slot".
     const BLOCKED: Duration = Duration::from_millis(100);
@@ -850,9 +1109,7 @@ mod tests {
     fn delete_request() -> pb::DeleteEntityRequest {
         pb::DeleteEntityRequest {
             id: "ENG-1".to_owned(),
-            dry_run: false,
-            expected_version: None,
-            now: None,
+            ..Default::default()
         }
     }
 
@@ -1078,17 +1335,21 @@ mod tests {
             max_batch_size: 0,
             max_in_flight: 0,
             max_concurrent_assessments: 0,
+            max_import_chunk: 0,
         };
         let svc = AssessmentService::in_memory().with_limits(limits);
         assert_eq!(svc.limits().max_batch_size, 1);
         assert_eq!(svc.limits().max_in_flight, 1);
         assert_eq!(svc.limits().max_concurrent_assessments, 1);
+        assert_eq!(svc.limits().max_import_chunk, 1);
         assert_eq!(svc.stateless_slots.available_permits(), 1);
         assert_eq!(svc.registry_slots.available_permits(), 1);
 
         limits.max_in_flight = usize::MAX;
         limits.max_concurrent_assessments = usize::MAX;
+        limits.max_import_chunk = usize::MAX;
         let svc = AssessmentService::in_memory().with_limits(limits);
+        assert_eq!(svc.limits().max_import_chunk, MAX_IMPORT_CHUNK);
         assert_eq!(svc.limits().max_in_flight, MAX_SLOTS);
         assert_eq!(svc.limits().max_concurrent_assessments, MAX_SLOTS);
         assert_eq!(svc.stateless_slots.available_permits(), MAX_SLOTS);

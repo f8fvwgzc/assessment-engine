@@ -14,7 +14,10 @@ use assessment_core::model::{
     EntityKind, FieldChange, FieldValue, HistoryPoint, Relation, RelationKind, StatusCategory,
 };
 use assessment_core::policy::Policy;
-use assessment_core::registry::{PutOptions, PutOutcome, StaleEntry, VersionRecord};
+use assessment_core::registry::{
+    DeleteOptions, DeleteOutcome, ImportFailure, ImportItem, ImportSummary, PutOptions, PutOutcome,
+    StaleEntry, VersionRecord,
+};
 use assessment_core::semver::{SemVer, VersionBump};
 use assessment_core::text::{StructureDiff, TextDiff};
 use assessment_core::{Engine, ErrorKind};
@@ -23,13 +26,16 @@ use assessment_grpc::client::{AssessmentClient, ClientErrorKind, ItemResponse};
 use assessment_grpc::convert::{self, AssessInput};
 use assessment_grpc::pb;
 use assessment_grpc::server::{ServeError, ServerOptions, serve_with_incoming_shutdown};
-use assessment_grpc::service::AssessmentService;
+use assessment_grpc::service::{
+    AssessmentService, MAX_IMPORT_FAILURE_ERROR_BYTES, MAX_IMPORT_FAILURE_ID_BYTES,
+    MAX_IMPORT_FAILURES, ServiceLimits,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use proptest::prelude::*;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::Code;
 
 // ---------------------------------------------------------------------------
@@ -926,6 +932,623 @@ async fn version_conflict_is_aborted() {
 }
 
 // ---------------------------------------------------------------------------
+// Import and source sequences
+// ---------------------------------------------------------------------------
+
+fn issue(id: &str, title: &str) -> Entity {
+    Entity::new(id, "issue").with_title(title)
+}
+
+/// An in-memory service that applies an import `chunk` items at a time,
+/// with `slots` registry slots.
+fn import_service(chunk: usize, slots: usize) -> AssessmentService {
+    AssessmentService::in_memory().with_limits(
+        ServiceLimits::default()
+            .with_max_import_chunk(chunk)
+            .with_max_concurrent_assessments(slots),
+    )
+}
+
+/// Waits until the server holds `id`.
+async fn wait_for_entity(client: &mut AssessmentClient, id: &str) -> Entity {
+    loop {
+        match client.get_entity(id, None).await {
+            Ok(entity) => return entity,
+            Err(err) => assert_eq!(err.code(), Some(Code::NotFound), "{err}"),
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn import_counts_created_unchanged_assessed_stale_deleted_and_failed() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let first = client
+            .import_iter(vec![
+                ImportItem::upsert(issue("ENG-1", "Rate limits for the public API"))
+                    .with_source_seq(5),
+                ImportItem::upsert(issue("ENG-2", "Usage dashboard")),
+                ImportItem::upsert(issue("ENG-3", "Billing export")),
+            ])
+            .await
+            .expect("the first import runs");
+        assert_eq!(
+            first.summary,
+            ImportSummary {
+                created: 3,
+                ..ImportSummary::default()
+            }
+        );
+        assert_eq!(first.failed_total, 0);
+
+        let second = client
+            .import_iter(vec![
+                // Older than what the server holds: skipped.
+                ImportItem::upsert(issue("ENG-1", "Rate limits")).with_source_seq(3),
+                // The same content: nothing to do.
+                ImportItem::upsert(issue("ENG-2", "Usage dashboard")),
+                // New content: assessed and stored.
+                ImportItem::upsert(issue("ENG-3", "Billing export to CSV and PDF")),
+                ImportItem::upsert(issue("ENG-4", "Audit log")),
+                // Not a valid entity: reported, and the rest still runs.
+                ImportItem::upsert(
+                    issue("ENG-5", "Estimate").with_field("points", FieldValue::Number(f64::NAN)),
+                ),
+                ImportItem::delete("ENG-2"),
+            ])
+            .await
+            .expect("the second import runs");
+        assert_eq!(second.summary.created, 1, "{second:?}");
+        assert_eq!(second.summary.unchanged, 1, "{second:?}");
+        assert_eq!(second.summary.assessed, 1, "{second:?}");
+        assert_eq!(second.summary.skipped_stale, 1, "{second:?}");
+        assert_eq!(second.summary.deleted, 1, "{second:?}");
+        assert_eq!(second.failed_total, 1, "{second:?}");
+        assert_eq!(second.summary.failed.len(), 1, "{second:?}");
+        assert_eq!(second.summary.failed[0].id, "ENG-5");
+        assert!(!second.summary.failed[0].error.is_empty());
+
+        let kept = client.get_entity("ENG-1", None).await.expect("is stored");
+        assert_eq!(kept.title(), "Rate limits for the public API");
+        let changed = client.get_entity("ENG-3", None).await.expect("is stored");
+        assert_eq!(changed.title(), "Billing export to CSV and PDF");
+        assert_eq!(client.history("ENG-3", 0).await.expect("history").len(), 2);
+        client.get_entity("ENG-4", None).await.expect("is stored");
+        for gone in ["ENG-2", "ENG-5"] {
+            let err = client.get_entity(gone, None).await.expect_err("not stored");
+            assert_eq!(err.code(), Some(Code::NotFound), "{gone}");
+        }
+
+        // Sending the same items again changes nothing.
+        let again = client
+            .import_iter(vec![
+                ImportItem::upsert(issue("ENG-3", "Billing export to CSV and PDF")),
+                ImportItem::upsert(issue("ENG-4", "Audit log")),
+            ])
+            .await
+            .expect("the repeat runs");
+        assert_eq!(
+            again.summary,
+            ImportSummary {
+                unchanged: 2,
+                ..ImportSummary::default()
+            }
+        );
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn import_keeps_the_order_of_repeated_ids_across_chunks() {
+    within(E2E_LIMIT, async {
+        // Two items per chunk, so the five versions of ENG-1 are spread
+        // over several registry calls.
+        let server = TestServer::start_with(import_service(2, 2), ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let titles = [
+            "Rate limits",
+            "Rate limits for the API",
+            "Rate limits for the public API",
+            "Rate limits for the public and the partner API",
+            "Rate limits and quotas for the public and the partner API",
+        ];
+        let mut items = Vec::new();
+        for (n, title) in titles.iter().enumerate() {
+            items.push(ImportItem::upsert(issue("ENG-1", title)));
+            items.push(ImportItem::upsert(issue(&format!("OTHER-{n}"), "Filler")));
+        }
+        // Created, deleted and created again: it is there at the end.
+        items.push(ImportItem::upsert(issue("ENG-2", "Usage dashboard")));
+        items.push(ImportItem::delete("ENG-2"));
+        items.push(ImportItem::upsert(issue("ENG-2", "Usage dashboard, again")));
+        // Created and deleted: it is gone at the end.
+        items.push(ImportItem::upsert(issue("ENG-3", "Billing export")));
+        items.push(ImportItem::delete("ENG-3"));
+
+        let report = client.import_iter(items).await.expect("the import runs");
+        assert_eq!(report.failed_total, 0, "{report:?}");
+        assert_eq!(report.summary.deleted, 2, "{report:?}");
+        assert_eq!(report.summary.assessed, 4, "{report:?}");
+
+        let last = client.get_entity("ENG-1", None).await.expect("is stored");
+        assert_eq!(last.title(), titles[4]);
+        let history = client.history("ENG-1", 0).await.expect("history");
+        let seen: Vec<String> = history
+            .iter()
+            .map(|record| {
+                record
+                    .snapshot
+                    .as_ref()
+                    .expect("a snapshot")
+                    .title()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(seen, titles, "every version, in the order it was sent");
+
+        let again = client.get_entity("ENG-2", None).await.expect("is stored");
+        assert_eq!(again.title(), "Usage dashboard, again");
+        let err = client.get_entity("ENG-3", None).await.expect_err("deleted");
+        assert_eq!(err.code(), Some(Code::NotFound));
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn other_calls_are_answered_while_an_import_is_open() {
+    within(E2E_LIMIT, async {
+        // One registry slot: an import that kept it between chunks would
+        // block the put below.
+        let server = TestServer::start_with(import_service(2, 1), ServerOptions::default()).await;
+        let mut client = server.client().await;
+        let mut importer = server.client().await;
+
+        let (items, stream) = tokio::sync::mpsc::channel::<ImportItem>(8);
+        let import =
+            tokio::spawn(async move { importer.import(ReceiverStream::new(stream)).await });
+        for id in ["ENG-1", "ENG-2"] {
+            items
+                .send(ImportItem::upsert(issue(id, "First chunk")))
+                .await
+                .expect("the import reads");
+        }
+
+        // The first chunk is applied and visible while the stream is open.
+        wait_for_entity(&mut client, "ENG-2").await;
+        assert!(!import.is_finished(), "the import waits for more items");
+        client.get_entity("ENG-1", None).await.expect("answers");
+        let put = client
+            .put_entity(
+                issue("ENG-9", "Put during the import"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("a put gets the registry slot between chunks");
+        assert!(put.created);
+        assert_eq!(client.history("ENG-1", 0).await.expect("answers").len(), 1);
+
+        items
+            .send(ImportItem::upsert(issue("ENG-3", "Second chunk")))
+            .await
+            .expect("the import reads");
+        drop(items);
+        let report = import
+            .await
+            .expect("the import task finishes")
+            .expect("the import runs");
+        assert_eq!(report.summary.created, 3, "{report:?}");
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn get_entity_answers_during_a_large_import() {
+    within(E2E_LIMIT, async {
+        const ITEMS: usize = 3_000;
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+        let mut importer = server.client().await;
+        client
+            .put_entity(parent(), PutOptions::default())
+            .await
+            .expect("creates");
+
+        let items: Vec<ImportItem> = (0..ITEMS)
+            .map(|n| {
+                ImportItem::upsert(issue(
+                    &format!("BULK-{n}"),
+                    &format!("Imported work item number {n}"),
+                ))
+            })
+            .collect();
+        let import = tokio::spawn(async move { importer.import_iter(items).await });
+
+        let mut reads = 0u32;
+        while !import.is_finished() {
+            let entity =
+                tokio::time::timeout(Duration::from_secs(5), client.get_entity("ENG-12", None))
+                    .await
+                    .expect("a read does not wait for the import")
+                    .expect("answers");
+            assert_eq!(entity.id, "ENG-12");
+            reads += 1;
+        }
+        assert!(reads > 0);
+
+        let report = import
+            .await
+            .expect("the import task finishes")
+            .expect("the import runs");
+        assert_eq!(report.summary.created, ITEMS as u64, "{report:?}");
+        assert_eq!(report.failed_total, 0);
+        // The first and the last item, from different chunks.
+        client.get_entity("BULK-0", None).await.expect("is stored");
+        client
+            .get_entity(format!("BULK-{}", ITEMS - 1), None)
+            .await
+            .expect("is stored");
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_dropped_import_keeps_its_applied_chunks_and_applies_no_more() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start_with(import_service(2, 2), ServerOptions::default()).await;
+        let mut client = server.client().await;
+        let mut importer = server.client().await;
+
+        let (items, stream) = tokio::sync::mpsc::channel::<ImportItem>(8);
+        let import =
+            tokio::spawn(async move { importer.import(ReceiverStream::new(stream)).await });
+        for id in ["ENG-1", "ENG-2", "ENG-3"] {
+            items
+                .send(ImportItem::upsert(issue(id, "Sent before the client left")))
+                .await
+                .expect("the import reads");
+        }
+        wait_for_entity(&mut client, "ENG-2").await;
+
+        // The client gives up with ENG-3 sent but its chunk not full, and
+        // without ending the stream.
+        import.abort();
+        let _ = import.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client
+            .get_entity("ENG-1", None)
+            .await
+            .expect("stays stored");
+        client
+            .get_entity("ENG-2", None)
+            .await
+            .expect("stays stored");
+        let err = client
+            .get_entity("ENG-3", None)
+            .await
+            .expect_err("the unfinished chunk is not applied");
+        assert_eq!(err.code(), Some(Code::NotFound));
+        drop(items);
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_import_that_passes_the_deadline_keeps_its_applied_chunks() {
+    within(E2E_LIMIT, async {
+        let options =
+            ServerOptions::default().with_request_timeout(Some(Duration::from_millis(1_500)));
+        let server = TestServer::start_with(import_service(2, 2), options).await;
+        let mut client = server.client().await;
+        let mut importer = server.client().await;
+
+        let (items, stream) = tokio::sync::mpsc::channel::<ImportItem>(8);
+        let import =
+            tokio::spawn(async move { importer.import(ReceiverStream::new(stream)).await });
+        for id in ["ENG-1", "ENG-2", "ENG-3"] {
+            items
+                .send(ImportItem::upsert(issue(id, "Sent before the deadline")))
+                .await
+                .expect("the import reads");
+        }
+        // The stream stays open, so the call runs into the deadline.
+        let err = import
+            .await
+            .expect("the import task finishes")
+            .expect_err("the deadline passes");
+        assert_eq!(err.code(), Some(Code::Cancelled), "{err}");
+
+        client
+            .get_entity("ENG-1", None)
+            .await
+            .expect("stays stored");
+        client
+            .get_entity("ENG-2", None)
+            .await
+            .expect("stays stored");
+        let err = client
+            .get_entity("ENG-3", None)
+            .await
+            .expect_err("the unfinished chunk is not applied");
+        assert_eq!(err.code(), Some(Code::NotFound));
+        drop(items);
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn import_lists_an_item_without_an_entity_as_failed_and_goes_on() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let mut unspecified_status = pb::Entity::from(issue("ENG-2", "Status without a category"));
+        unspecified_status.fields.insert(
+            "status".to_owned(),
+            pb::FieldValue {
+                kind: Some(pb::field_value::Kind::Status(pb::Status {
+                    category: pb::StatusCategory::Unspecified.into(),
+                    name: "Somewhere".to_owned(),
+                })),
+            },
+        );
+        let requests = vec![
+            pb::ImportRequest::from(ImportItem::upsert(issue("ENG-1", "Before"))),
+            pb::ImportRequest::default(),
+            pb::ImportRequest {
+                entity: Some(unspecified_status),
+                ..Default::default()
+            },
+            pb::ImportRequest::from(ImportItem::upsert(issue("", "No id"))),
+            pb::ImportRequest::from(ImportItem::upsert(issue("ENG-3", "After"))),
+        ];
+        let response = client
+            .raw()
+            .import(tokio_stream::iter(requests))
+            .await
+            .expect("the stream as a whole is accepted")
+            .into_inner();
+        assert_eq!(response.created, 2, "{response:?}");
+        assert_eq!(response.failed_total, 3, "{response:?}");
+        let failed: Vec<(&str, &str)> = response
+            .failed
+            .iter()
+            .map(|f| (f.id.as_str(), f.error.as_str()))
+            .collect();
+        assert_eq!(failed.len(), 3, "{failed:?}");
+        assert_eq!(failed[0], ("", "entity: is required"));
+        assert_eq!(failed[1].0, "ENG-2");
+        assert!(
+            failed[1].1.starts_with("entity.fields[\"status\"]"),
+            "{failed:?}"
+        );
+        assert_eq!(failed[2].0, "");
+        client.get_entity("ENG-1", None).await.expect("is stored");
+        client.get_entity("ENG-3", None).await.expect("is stored");
+
+        // The same entities fail a put for the same reason.
+        let err = client
+            .raw()
+            .put_entity(pb::PutEntityRequest {
+                entity: None,
+                ..Default::default()
+            })
+            .await
+            .expect_err("a put without an entity");
+        assert_eq!(err.code(), Code::InvalidArgument);
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+/// Ids have no length limit, and each failure repeats the id in its error.
+/// The answer must still fit in one message.
+#[tokio::test]
+async fn import_answers_when_a_thousand_failed_items_have_very_long_ids() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let long = "é".repeat(5_000);
+        let mut items: Vec<ImportItem> = (0..MAX_IMPORT_FAILURES)
+            .map(|n| {
+                ImportItem::upsert(
+                    issue(&format!("BAD-{n}-{long}"), "Estimate")
+                        .with_field("points", FieldValue::Number(f64::INFINITY)),
+                )
+            })
+            .collect();
+        items.push(ImportItem::upsert(issue("ENG-1", "Valid")));
+
+        let report = client
+            .import_iter(items)
+            .await
+            .expect("the answer fits in one message");
+        assert_eq!(report.summary.created, 1);
+        assert_eq!(report.failed_total, MAX_IMPORT_FAILURES as u64);
+        assert_eq!(report.summary.failed.len(), MAX_IMPORT_FAILURES);
+        for f in &report.summary.failed {
+            assert!(f.id.len() <= MAX_IMPORT_FAILURE_ID_BYTES, "{}", f.id.len());
+            assert!(
+                f.error.len() <= MAX_IMPORT_FAILURE_ERROR_BYTES,
+                "{}",
+                f.error.len()
+            );
+            assert!(f.id.ends_with("..."), "a cut id says so");
+        }
+        assert!(report.summary.failed[0].id.starts_with("BAD-0-é"));
+        server.shutdown().await;
+    })
+    .await;
+}
+
+/// A deletion can arrive before the item it deletes. It fails, and its
+/// sequence still guards the id against the older put.
+#[tokio::test]
+async fn delete_entity_of_an_item_that_is_not_stored_keeps_its_sequence() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let err = client
+            .delete_entity_with(
+                "ENG-1",
+                DeleteOptions {
+                    source_seq: Some(5),
+                    ..DeleteOptions::default()
+                },
+            )
+            .await
+            .expect_err("nothing is stored to delete");
+        assert_eq!(err.code(), Some(Code::NotFound));
+
+        let late = client
+            .put_entity(
+                issue("ENG-1", "Late"),
+                PutOptions {
+                    source_seq: Some(3),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .expect("the put answers");
+        assert!(late.skipped_stale && !late.stored && !late.created);
+        // The item as sent: the server does not hold it.
+        assert_eq!(late.entity.title(), "Late");
+        assert_eq!(late.entity.version, None);
+        let err = client
+            .get_entity("ENG-1", None)
+            .await
+            .expect_err("the late put did not bring the item back");
+        assert_eq!(err.code(), Some(Code::NotFound));
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn import_lists_at_most_a_thousand_failures_and_counts_them_all() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+
+        let extra = 7;
+        let mut items: Vec<ImportItem> = (0..MAX_IMPORT_FAILURES + extra)
+            .map(|n| {
+                ImportItem::upsert(
+                    issue(&format!("BAD-{n}"), "Estimate")
+                        .with_field("points", FieldValue::Number(f64::INFINITY)),
+                )
+            })
+            .collect();
+        items.push(ImportItem::upsert(issue("ENG-1", "Valid")));
+
+        let report = client.import_iter(items).await.expect("the import runs");
+        assert_eq!(report.summary.created, 1, "{:?}", report.summary.created);
+        assert_eq!(report.failed_total, (MAX_IMPORT_FAILURES + extra) as u64);
+        assert_eq!(report.summary.failed.len(), MAX_IMPORT_FAILURES);
+        assert_eq!(report.summary.failed[0].id, "BAD-0");
+        assert_eq!(
+            report.summary.failed[MAX_IMPORT_FAILURES - 1].id,
+            format!("BAD-{}", MAX_IMPORT_FAILURES - 1),
+            "the first failures, in input order"
+        );
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_put_or_delete_with_an_older_source_seq_is_skipped() {
+    within(E2E_LIMIT, async {
+        let server = TestServer::start(ServerOptions::default()).await;
+        let mut client = server.client().await;
+        let seq = |n| PutOptions {
+            source_seq: Some(n),
+            ..PutOptions::default()
+        };
+
+        let created = client
+            .put_entity(issue("ENG-1", "Rate limits"), seq(10))
+            .await
+            .expect("creates");
+        assert!(created.created && created.stored && !created.skipped_stale);
+
+        let stale = client
+            .put_entity(issue("ENG-1", "An older title that arrives late"), seq(4))
+            .await
+            .expect("answers");
+        assert!(stale.skipped_stale, "{stale:?}");
+        assert!(!stale.stored);
+        assert_eq!(stale.entity.title(), "Rate limits", "the stored entity");
+
+        let stale = client
+            .delete_entity_with(
+                "ENG-1",
+                DeleteOptions {
+                    source_seq: Some(9),
+                    ..DeleteOptions::default()
+                },
+            )
+            .await
+            .expect("answers");
+        assert!(stale.skipped_stale && !stale.deleted, "{stale:?}");
+        let entity = client.get_entity("ENG-1", None).await.expect("still there");
+        assert_eq!(entity.title(), "Rate limits");
+        assert_eq!(client.history("ENG-1", 0).await.expect("history").len(), 1);
+
+        let newer = client
+            .put_entity(issue("ENG-1", "Rate limits for the public API"), seq(11))
+            .await
+            .expect("updates");
+        assert!(newer.stored && !newer.skipped_stale && !newer.unchanged);
+        let same = client
+            .put_entity(
+                issue("ENG-1", "Rate limits for the public API"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("answers");
+        assert!(same.unchanged, "{same:?}");
+
+        let deleted = client
+            .delete_entity_with(
+                "ENG-1",
+                DeleteOptions {
+                    source_seq: Some(12),
+                    ..DeleteOptions::default()
+                },
+            )
+            .await
+            .expect("deletes");
+        assert!(deleted.deleted && !deleted.skipped_stale);
+        let err = client.get_entity("ENG-1", None).await.expect_err("deleted");
+        assert_eq!(err.code(), Some(Code::NotFound));
+
+        server.shutdown().await;
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Auth, health, reflection
 // ---------------------------------------------------------------------------
 
@@ -1380,9 +2003,21 @@ fn registry_and_text_types_round_trip() {
         stored: false,
         bump: VersionBump::Minor,
         assessment,
+        unchanged: false,
+        skipped_stale: false,
     };
     let back = PutOutcome::try_from(pb::PutEntityResponse::from(outcome.clone())).expect("decodes");
     assert_eq!(back, outcome);
+    for (unchanged, skipped_stale) in [(true, false), (false, true)] {
+        let outcome = PutOutcome {
+            unchanged,
+            skipped_stale,
+            ..outcome.clone()
+        };
+        let back =
+            PutOutcome::try_from(pb::PutEntityResponse::from(outcome.clone())).expect("decodes");
+        assert_eq!(back, outcome);
+    }
 
     for (snapshot, change_type) in [
         (Some(Entity::new("A", "issue")), ChangeType::Created),
@@ -1426,6 +2061,7 @@ fn registry_and_text_types_round_trip() {
             explain: false,
             max_contributions: 1,
         },
+        source_seq: None,
     };
     let entity = Entity::new("ENG-1", "issue");
     let (e, o) =
@@ -1508,6 +2144,109 @@ fn proto_defaults_apply() {
     assert_eq!(
         err.to_string(),
         "kind: relation kind has the unknown value 42"
+    );
+}
+
+#[test]
+fn import_and_delete_messages_round_trip() {
+    let entity = rich_request().changes[0].after.clone().expect("an after");
+
+    let put = PutOptions {
+        source_seq: Some(u64::MAX),
+        expected_version: Some(SemVer::new(1, 2, 3)),
+        now: Some(precise_time()),
+        ..PutOptions::default()
+    };
+    let (back_entity, back_put) =
+        convert::put_request_from_pb(convert::put_request_to_pb(entity.clone(), put.clone()))
+            .expect("decodes");
+    assert_eq!(back_entity, entity);
+    assert_eq!(back_put, put);
+
+    for options in [
+        DeleteOptions::default(),
+        DeleteOptions {
+            dry_run: true,
+            expected_version: Some(SemVer::new(4, 0, 1)),
+            now: Some(precise_time()),
+            source_seq: Some(77),
+        },
+    ] {
+        let (id, back) = convert::delete_request_from_pb(convert::delete_request_to_pb(
+            "ENG-1",
+            options.clone(),
+        ))
+        .expect("decodes");
+        assert_eq!(id, "ENG-1");
+        assert_eq!(back, options);
+    }
+    // A request from a client that does not know `source_seq`.
+    let (_, old) = convert::delete_request_from_pb(pb::DeleteEntityRequest {
+        id: "ENG-1".to_owned(),
+        ..Default::default()
+    })
+    .expect("decodes");
+    assert_eq!(old, DeleteOptions::default());
+
+    for (deleted, skipped_stale) in [(true, false), (false, true), (false, false)] {
+        let outcome = DeleteOutcome {
+            deleted,
+            assessment: rich_assessments().remove(0),
+            skipped_stale,
+        };
+        let back = DeleteOutcome::try_from(pb::DeleteEntityResponse::from(outcome.clone()))
+            .expect("decodes");
+        assert_eq!(back, outcome);
+    }
+    let err = DeleteOutcome::try_from(pb::DeleteEntityResponse::default())
+        .expect_err("an assessment is required");
+    assert!(err.to_string().contains("assessment"), "{err}");
+
+    for item in [
+        ImportItem::upsert(entity.clone()),
+        ImportItem::upsert(entity.clone()).with_source_seq(0),
+        ImportItem::delete("ENG-1"),
+        ImportItem::delete("ENG-1").with_source_seq(42),
+    ] {
+        let back = ImportItem::try_from(pb::ImportRequest::from(item.clone())).expect("decodes");
+        assert_eq!(back, item);
+    }
+    // Only the id of a deleted entity is read.
+    let deletion = pb::ImportRequest {
+        entity: Some(entity.clone().into()),
+        source_seq: Some(3),
+        deleted: true,
+    };
+    assert_eq!(
+        ImportItem::try_from(deletion).expect("decodes"),
+        ImportItem::delete(entity.id.clone()).with_source_seq(3)
+    );
+    let err = ImportItem::try_from(pb::ImportRequest::default()).expect_err("no entity");
+    assert_eq!(err.to_string(), "entity: is required");
+
+    let summary = ImportSummary {
+        created: 1,
+        unchanged: 2,
+        assessed: 3,
+        skipped_stale: 4,
+        deleted: 5,
+        failed: vec![
+            ImportFailure {
+                id: "ENG-7".to_owned(),
+                error: "entity: is required".to_owned(),
+            },
+            ImportFailure {
+                id: String::new(),
+                error: "the entity id is empty".to_owned(),
+            },
+        ],
+    };
+    let message = pb::ImportResponse::from(summary.clone());
+    assert_eq!(message.failed_total, 2);
+    assert_eq!(ImportSummary::from(message), summary);
+    assert_eq!(
+        ImportSummary::from(pb::ImportResponse::default()),
+        ImportSummary::default()
     );
 }
 
@@ -1698,6 +2437,16 @@ proptest! {
     #[test]
     fn requests_round_trip(request in arb_request()) {
         prop_assert_eq!(round_trip_request(&request), request);
+    }
+
+    #[test]
+    fn import_items_round_trip(
+        entity in arb_entity(),
+        source_seq in proptest::option::of(any::<u64>()),
+    ) {
+        let item = ImportItem { entity, source_seq, deleted: false };
+        let back = ImportItem::try_from(pb::ImportRequest::from(item.clone())).expect("valid");
+        prop_assert_eq!(back, item);
     }
 
     #[test]

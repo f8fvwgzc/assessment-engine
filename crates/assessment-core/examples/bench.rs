@@ -9,7 +9,10 @@
 //! Each row builds one request (see `tests/support/mod.rs`), times parsing its
 //! JSON once, and times `Engine::assess` (median and minimum of several runs).
 //! The registry rows store a project tree put by put and then time a put that
-//! rewrites the changed issue. Record the numbers in `docs/PERFORMANCE.md`.
+//! rewrites the changed issue, with and without the analysis cache. The
+//! import rows time `Registry::import` of new entities, the first put after
+//! it (which analyses the imported texts) and a put after that. Record the
+//! numbers in `docs/PERFORMANCE.md`.
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -18,6 +21,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use assessment_core::prelude::*;
+use assessment_core::registry::ImportItem;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
@@ -80,8 +84,77 @@ fn assess_row(name: &str, req: &AssessmentRequest, runs: usize) -> Row {
 
 /// Loads a registry from `req` put by put (timed once), then times a put that
 /// rewrites the changed issue, alternating between its two texts.
-fn registry_rows(name: &str, req: &AssessmentRequest, runs: usize) -> Vec<Row> {
+fn registry_row(name: String, entities: usize, median: Duration, min: Duration) -> Row {
+    Row {
+        name,
+        entities,
+        json_mb: 0.0,
+        parse_ms: 0.0,
+        median_ms: ms(median),
+        min_ms: ms(min),
+    }
+}
+
+/// Imports the graph of `siblings x{n}` as new entities, then puts rewrites
+/// of the changed issue: the first one analyses the imported texts.
+fn import_rows(label: &str, n: usize, runs: usize) -> Vec<Row> {
+    let req = support::siblings(n, 268, 100);
+    let order = support::load_order(&req);
+    let entities = order.len();
     let registry = Registry::new(engine());
+    let items: Vec<ImportItem> = order.into_iter().map(ImportItem::upsert).collect();
+    let (import, _) = time(1, || {
+        black_box(registry.import(items.clone()).expect("the graph imports"));
+    });
+    let opts = || PutOptions {
+        now: Some(support::now()),
+        ..PutOptions::default()
+    };
+    let before = req.changes[0].before.clone().expect("a before");
+    let after = req.changes[0].after.clone().expect("an after");
+    let (first, _) = time(1, || {
+        black_box(
+            registry
+                .put(after.clone(), opts())
+                .expect("the change stores"),
+        );
+    });
+    let mut flip = true;
+    let (median, min) = time(runs, || {
+        flip = !flip;
+        let next = if flip { after.clone() } else { before.clone() };
+        black_box(registry.put(next, opts()).expect("the change stores"));
+    });
+    vec![
+        registry_row(
+            format!("registry: import {label} new entities"),
+            entities,
+            import,
+            import,
+        ),
+        registry_row(
+            format!("registry: first put after the {label} import"),
+            entities,
+            first,
+            first,
+        ),
+        registry_row(
+            format!("registry: put after the {label} import"),
+            entities,
+            median,
+            min,
+        ),
+    ]
+}
+
+fn registry_rows(name: &str, req: &AssessmentRequest, runs: usize) -> Vec<Row> {
+    let mut rows = stored_rows(name, req, runs, true);
+    rows.extend(stored_rows(name, req, runs, false).into_iter().skip(1));
+    rows
+}
+
+fn stored_rows(name: &str, req: &AssessmentRequest, runs: usize, cache: bool) -> Vec<Row> {
+    let registry = Registry::new(engine()).with_analysis_cache(cache);
     let opts = || PutOptions {
         now: Some(support::now()),
         ..PutOptions::default()
@@ -101,23 +174,19 @@ fn registry_rows(name: &str, req: &AssessmentRequest, runs: usize) -> Vec<Row> {
         let next = if flip { after.clone() } else { before.clone() };
         black_box(registry.put(next, opts()).expect("the change stores"));
     });
+    let put = if cache {
+        "put on the stored graph"
+    } else {
+        "put on the stored graph, analysis cache off"
+    };
     vec![
-        Row {
-            name: format!("{name}: bulk load (put by put)"),
+        registry_row(
+            format!("{name}: bulk load (put by put)"),
             entities,
-            json_mb: 0.0,
-            parse_ms: 0.0,
-            median_ms: ms(load),
-            min_ms: ms(load),
-        },
-        Row {
-            name: format!("{name}: put on the stored graph"),
-            entities,
-            json_mb: 0.0,
-            parse_ms: 0.0,
-            median_ms: ms(median),
-            min_ms: ms(min),
-        },
+            load,
+            load,
+        ),
+        registry_row(format!("{name}: {put}"), entities, median, min),
     ]
 }
 
@@ -186,6 +255,10 @@ fn main() {
         &support::cousins(stored, 3, 268, 100),
         7,
     ));
+    rows.extend(import_rows("1k", 1_000, 7));
+    if !quick {
+        rows.extend(import_rows("10k", 10_000, 3));
+    }
 
     println!(
         "assessment-core bench ({profile} build, idf_scope {scope}{})",

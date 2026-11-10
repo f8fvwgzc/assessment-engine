@@ -727,11 +727,33 @@ fn count_terms(mut terms: Vec<String>) -> BTreeMap<String, u32> {
     runs.into_iter().collect()
 }
 
+/// Test-only: how many texts this thread has analysed ([`term_counts`] and
+/// [`analyze_with`] calls), so a test can check what a cache saves.
+#[cfg(test)]
+pub(crate) mod analysed {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TEXTS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        TEXTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Texts analysed on this thread so far.
+    pub(crate) fn texts() -> u64 {
+        TEXTS.with(Cell::get)
+    }
+}
+
 /// The term counts of a text, exactly as [`analyze_with`] computes
 /// `Analysis::counts`, without building passages, segments, list items,
 /// headings or the normalized copy. For texts whose only use is a TF-IDF
 /// vector (context documents and titles).
 pub(crate) fn term_counts(text: &str, lex: &Lexicon<'_>) -> BTreeMap<String, u32> {
+    #[cfg(test)]
+    analysed::count();
     let mut terms: Vec<String> = Vec::new();
     for line in text.lines() {
         let Some((_, body)) = line_body(line) else {
@@ -751,6 +773,8 @@ pub(crate) fn term_counts(text: &str, lex: &Lexicon<'_>) -> BTreeMap<String, u32
 /// Analyzes a text once for every measure (each sentence is tokenized once
 /// and each token's term computed once), with the caller's lexicon.
 pub(crate) fn analyze_with(text: &str, lex: &Lexicon<'_>) -> Analysis {
+    #[cfg(test)]
+    analysed::count();
     let mut items = Vec::new();
     let mut headings = BTreeSet::new();
     let mut passages = Vec::new();
