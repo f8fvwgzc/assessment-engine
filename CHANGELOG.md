@@ -8,6 +8,67 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- OpenAI judge provider, so that the judge does not depend on one vendor.
+  `anthropic` stays the default, and the other providers did not change.
+  The provider is tested against a local server only: it has not been run
+  against the real OpenAI API, and nothing about its answers, cost or
+  latency has been measured.
+  - `assessment-judge`: `OpenAiJudge`, `OpenAiConfig` and
+    `DEFAULT_OPENAI_MODEL` (feature `openai`, on by default). An
+    `OpenAiJudge` (`openai/<model>`) sends one `POST
+    {base}/chat/completions` per question with a bearer key, the shared
+    prompt, `max_completion_tokens`, `reasoning_effort`, a strict
+    `json_schema` answer format and `store: false`. It sends no
+    `temperature`, tools or user id. A refusal, a content filter, a cut-off
+    answer and an answer that does not fit the schema are errors, never a
+    guess. Cached input tokens are counted as cache reads. A 400 that
+    names `reasoning_effort` is tried once more without that field, and
+    the field is left out from then on. The retries, the 1 MiB answer cap,
+    the refusal of redirects and the base URL rule (https, or http on
+    loopback) are the ones of the Anthropic client: both now share one
+    private HTTP module. `ApiKey` is exported at the crate root.
+  - `price`: twelve OpenAI models in the price table. `price_for` takes
+    an `openai/` prefix off a name, as it does with `anthropic/`. A name
+    has the price of a table name only when it is that name, or that name
+    and a date (`-20260101` or `-2026-01-01`). So `gpt-5.4-mini` is never
+    priced as `gpt-5.4`, and a tier the table does not know (`gpt-5.5-pro`)
+    has the high price of an unknown model, not the price of the cheaper
+    model whose name it starts with. `price::assumed_usage` is the usage
+    behind a reservation. The prices are estimates for the spend cap.
+    They are not a bill.
+  - A 200 answer of the OpenAI API that reports no usage (a gateway may
+    leave it out) is counted at the assumed usage of the request: the
+    estimated input and the whole of `--judge-max-tokens`. So it is never
+    free for the spend cap. A warning is logged once.
+  - The key is also kept out of what a server sends back. A masked copy
+    of the key in an error body (`sk-ab...wxyz`) is replaced with
+    `[redacted]`, and a key that a 200 answer echoes in its model name or
+    its rationale does not reach the judgment. This holds for the
+    Anthropic client as well.
+  - Server: `--judge-provider openai` and `--openai-api-key-file`
+    (`OPENAI_API_KEY_FILE`), for `serve` and `assess --judge`. The key is
+    read only from `OPENAI_API_KEY` or from that file. There is no flag
+    that takes the key. Each provider reads only its own variables:
+    `ANTHROPIC_API_KEY` and `ANTHROPIC_API_KEY_FILE` are not read with
+    `openai`, and `OPENAI_API_KEY` and `OPENAI_API_KEY_FILE` are not read
+    with `anthropic`. So a machine that has the variables of both
+    providers can change the provider alone. The default model is `gpt-6.1-sol` and the
+    default base URL is `https://api.openai.com/v1`. `--judge-base-url`,
+    `--judge-max-tokens` and every `--judge-effort` are taken.
+    `--judge-fallbacks on|off`, `--judge-cli-path` and
+    `--anthropic-api-key-file` are refused with `openai`, and
+    `--openai-api-key-file` is refused with every other provider.
+    A `--judge-base-url` (`ASSESSMENT_JUDGE_BASE_URL`) on
+    `api.anthropic.com` is refused with `openai`, and one on
+    `api.openai.com` is refused with `anthropic`: the two providers share
+    that setting, and the key must not go to the other company.
+    `--judge on` without a key is a startup error that names
+    `OPENAI_API_KEY`, and `--judge auto` runs without a judge.
+  - `assess --judge` with `openai` names the judge id in its report line:
+    `openai/gpt-6.1-sol`.
+  - `examples/judge_cases.rs` takes `JUDGE_PROVIDER=openai`. It is a paid
+    run, needs `OPENAI_API_KEY` and has not been run.
+  - CI lints `assessment-judge` with the `openai` feature alone.
 - Command line judge providers, for a machine without an Anthropic API
   key. `codex-cli` is not a Claude model. It was added at the user's
   request.

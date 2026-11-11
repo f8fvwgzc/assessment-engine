@@ -203,7 +203,9 @@ struct AssessArgs {
 
     /// Ask a model about the flagged text changes. With the provider
     /// `anthropic` it needs an API key in `ANTHROPIC_API_KEY` or in
-    /// `--anthropic-api-key-file`. With `--judge-provider claude-cli` or
+    /// `--anthropic-api-key-file`. With `--judge-provider openai` it
+    /// needs one in `OPENAI_API_KEY` or in `--openai-api-key-file`. With
+    /// `--judge-provider claude-cli` or
     /// `codex-cli` it needs no key, only the program, installed and
     /// logged in. A judge that fails never fails the command: the fields
     /// are then `unavailable`. Ctrl-C stops the judge and its program.

@@ -82,7 +82,7 @@ Any other language: generate a client from
 |---|---|---|
 | [`assessment-core`](crates/assessment-core) | The engine: pure Rust, no I/O except the optional registry journal. `Engine`, `Registry`, `Policy`. | You are in Rust and want it in-process. |
 | [`assessment-grpc`](crates/assessment-grpc) | Generated protobuf types, conversions, the tonic service, and a typed client. | You serve or call it over gRPC from Rust. |
-| [`assessment-judge`](crates/assessment-judge) | The optional model judge: asks the Anthropic API, or a logged-in Claude Code or Codex command line, how two texts relate. The only crate that makes network calls out or starts a program. | You want the server to judge flagged text changes. |
+| [`assessment-judge`](crates/assessment-judge) | The optional model judge: asks the Anthropic API, the OpenAI API, or a logged-in Claude Code or Codex command line, how two texts relate. The only crate that makes network calls out or starts a program. | You want the server to judge flagged text changes. |
 | [`assessment-server`](crates/assessment-server) | The `assessment-engine` binary: gRPC server (health, reflection, auth, limits, graceful shutdown) and an offline CLI. | You run it as a service for any language. |
 | [`proto/assessment/v1/assessment.proto`](proto/assessment/v1/assessment.proto) | The contract. | You generate a client in Go, TypeScript, Python, Java, C#… |
 
@@ -378,9 +378,9 @@ is stale.
 
 ### Let the server ask a model
 
-`serve --judge on` makes the server ask the Anthropic API about the flagged
-`title` and `description` changes and assess again with the answers. It is
-off by default. Details, flags, limits and the threat model are in
+`serve --judge on` makes the server ask a model about the flagged
+`title` and `description` changes and assess again with the answers. The
+default provider is the Anthropic API. It is off by default. Details, flags, limits and the threat model are in
 [docs/JUDGE.md](docs/JUDGE.md).
 
 ```bash
@@ -388,6 +388,22 @@ export ANTHROPIC_API_KEY=...          # or --anthropic-api-key-file <file>
 assessment-engine serve --judge on --auth-token "$TOKEN"
 assessment-engine assess request.json --judge      # the same from the command line
 ```
+
+The OpenAI API is a second provider with a key of its own:
+
+```bash
+export OPENAI_API_KEY=...             # or --openai-api-key-file <file>
+assessment-engine serve --judge on --judge-provider openai --auth-token "$TOKEN"
+assessment-engine assess request.json --judge --judge-provider openai
+```
+
+It asks the Chat Completions API at `https://api.openai.com/v1` with the
+model `gpt-6.1-sol`. `--judge-model` and `--judge-base-url` change both,
+and the base URL includes `/v1`. Each provider reads only its own key:
+`ANTHROPIC_API_KEY` is ignored with `openai`, and `OPENAI_API_KEY` is
+ignored with `anthropic`. This provider is tested against a local server
+only. It has not been run against the real OpenAI API yet. See
+[The OpenAI provider](docs/JUDGE.md#the-openai-provider).
 
 Without an API key you can use a command line that is already installed
 and logged in on your machine: Claude Code or Codex.
@@ -397,7 +413,7 @@ assessment-engine assess request.json --judge --judge-provider codex-cli
 assessment-engine serve --judge on --judge-provider claude-cli --addr 127.0.0.1:50061
 ```
 
-`--judge-provider` is `anthropic` (the default), `claude-cli` or
+`--judge-provider` is `anthropic` (the default), `openai`, `claude-cli` or
 `codex-cli`. `--judge-cli-path` names the program when it is not in
 `PATH`. A command line provider reads no API key. It uses the login and
 the quota of the account that is logged in, and no cost is measured. The
@@ -430,7 +446,8 @@ start with a judge on an address that is not loopback unless
   two judge passes.
 * **To see whether a server has a judge**, read `GetPolicyResponse.judge`
   (`AssessmentClient::judge_info`). It holds the judge id, for example
-  `anthropic/claude-opus-5-5` or `codex-cli/default`, and is empty
+  `anthropic/claude-opus-5-5`, `openai/gpt-6.1-sol` or
+  `codex-cli/default`, and is empty
   without a judge.
 
 **Privacy: what leaves the process.** With the judge off, nothing does.
@@ -441,7 +458,9 @@ counts (list items, negations, requirement words, numbers that changed).
 No ids, no other fields, no other entities and no comments are sent. At
 startup the server also sends one `GET /v1/models/{model}` to check the key
 and the model. Texts longer than `--judge-max-text-chars` (8000) are not
-sent. With `claude-cli` the same content goes to Anthropic through the
+sent. With `openai` the same content goes to the OpenAI API, or to the
+host that `--judge-base-url` names, and the startup request is one
+`GET {base}/models/{model}`. With `claude-cli` the same content goes to Anthropic through the
 Claude Code program, under its logged-in account. With `codex-cli` it goes
 to OpenAI through the Codex program, under its logged-in account. There is
 no startup request with these two.
@@ -454,7 +473,8 @@ the price table in `crates/assessment-judge/src/price.rs` that is about one
 to two US cents on the default model. Expect a few seconds per judged
 call. Equal questions are answered from a cache at no cost. The server
 stops asking at `--judge-max-usd-per-hour` (10). The price table is there
-for that cap and is not a bill. With a command line provider no cost is
+for that cap and is not a bill. The OpenAI prices in it are estimates
+too, and nothing has been measured with the OpenAI provider. With a command line provider no cost is
 measured and the spend cap has no effect. The limits of the subscription
 apply. The six evaluation cases ran once through Codex 0.160.0 on a free
 ChatGPT login: all six got the expected relation, at 4.5 seconds per case

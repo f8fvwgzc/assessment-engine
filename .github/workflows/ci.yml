@@ -50,6 +50,8 @@ jobs:
         run: cargo clippy --locked -p assessment-judge --no-default-features --all-targets -- -D warnings
       - name: assessment-judge, Anthropic client only
         run: cargo clippy --locked -p assessment-judge --no-default-features --features anthropic --all-targets -- -D warnings
+      - name: assessment-judge, OpenAI client only
+        run: cargo clippy --locked -p assessment-judge --no-default-features --features openai --all-targets -- -D warnings
       - name: assessment-judge, command line providers only
         run: cargo clippy --locked -p assessment-judge --no-default-features --features cli --all-targets -- -D warnings
       - name: assessment-server without the judge

@@ -657,6 +657,31 @@ async fn a_body_of_exactly_the_limit_is_read() {
         .expect("verdict");
 }
 
+/// An endpoint could repeat the key in a 200 response: as the model name
+/// and inside the answer. Both go on to the caller, so the key is taken
+/// out of them.
+#[tokio::test]
+async fn a_key_echoed_in_an_answer_never_reaches_the_verdict() {
+    let answer = json!({
+        "relation": "replaced",
+        "confidence": 0.9,
+        "rationale": format!("key is {KEY}.")
+    })
+    .to_string();
+    let mut body: Value = serde_json::from_str(&message("end_turn", &answer)).expect("json");
+    body["model"] = json!(KEY);
+    let server = Server::start(vec![respond(200, body.to_string())]);
+    let verdict = judge(&server)
+        .judge(&question(), in_secs(10.0))
+        .await
+        .expect("verdict");
+    let shown = format!("{verdict:?}");
+    assert!(!shown.contains(KEY), "{shown}");
+    assert!(!shown.contains("LOCAL-ONLY"), "{shown}");
+    assert_eq!(verdict.source, "anthropic/claude-opus-5-5");
+    assert_eq!(verdict.rationale, "key is [redacted].");
+}
+
 #[tokio::test]
 async fn the_key_never_shows_in_any_error_text() {
     let echo = format!("invalid x-api-key {KEY}; got header x-api-key: {KEY}");

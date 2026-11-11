@@ -48,9 +48,10 @@ COPY --from=builder /out/assessment-engine /usr/local/bin/assessment-engine
 #
 # The judge is off by default. To turn it on, set ASSESSMENT_JUDGE=on (or auto) and give the API
 # key at run time as a secret: mount it as a file and set ANTHROPIC_API_KEY_FILE to its path, for
-# example /run/secrets/anthropic_api_key. Never put a key into the image, a build argument or an
-# ENV line here. A server with a judge also needs ASSESSMENT_AUTH_TOKEN, because it listens on
-# 0.0.0.0.
+# example /run/secrets/anthropic_api_key. With ASSESSMENT_JUDGE_PROVIDER=openai the variable is
+# OPENAI_API_KEY_FILE instead, for example /run/secrets/openai_api_key. Never put a key into the
+# image, a build argument or an ENV line here. A server with a judge also needs
+# ASSESSMENT_AUTH_TOKEN, because it listens on 0.0.0.0.
 # The command line providers (ASSESSMENT_JUDGE_PROVIDER=claude-cli or codex-cli) do not work in
 # this image: it holds neither program and no login.
 ENV ASSESSMENT_ADDR=0.0.0.0:50061 \

@@ -7,19 +7,22 @@ It is optional and off by default. `assessment-core` never calls it: the
 server asks the judge and hands the answers to the engine as plain
 judgments.
 
-There are three providers. `anthropic` is the default: it asks the
-Anthropic Messages API and needs an API key. `claude-cli` and `codex-cli`
+There are four providers. `anthropic` is the default: it asks the
+Anthropic Messages API and needs an API key. `openai` asks the OpenAI Chat
+Completions API and needs an API key of its own. It is described in
+[The OpenAI provider](#the-openai-provider). `claude-cli` and `codex-cli`
 run an agent command line that is installed and logged in on the same
 machine, and need no key. They are described in
 [Command line providers](#command-line-providers). Everything else in this
-file holds for all three unless it says otherwise.
+file holds for all four unless it says otherwise.
 
 Status: the judge is tested against local fake servers and fake programs
 only. The paid evaluation against the real API
 (`cargo run -p assessment-judge --example judge_cases`, six cases, at most
 0.30 US dollars) has not been run yet. The cost and latency numbers of the
-API below are estimates. The Claude Code command line has not been run for
-real at all. The Codex command line ran the same six cases once on
+API below are estimates. The OpenAI provider has not yet been run against
+the real OpenAI API: it is tested against a local server only. The Claude
+Code command line has not been run for real at all. The Codex command line ran the same six cases once on
 2026-11-10 (Codex 0.160.0, its default model, a free ChatGPT login): all
 six got the expected relation. See
 [Command line providers](#command-line-providers).
@@ -82,7 +85,7 @@ is `unavailable` with a `detail`, like any other field.
 Each judged call writes one log line, `judged call`, with the counts
 (flagged, judged, cached, unavailable), the tokens and the estimated cost.
 `GetPolicyResponse.judge` holds the judge id, for example
-`anthropic/claude-opus-5-5`.
+`anthropic/claude-opus-5-5` or `openai/gpt-6.1-sol`.
 
 ## Flags
 
@@ -91,10 +94,10 @@ All are flags of `serve`. Each has an environment variable.
 | Flag | Variable | Default | Meaning |
 | --- | --- | --- | --- |
 | `--judge off\|on\|auto` | `ASSESSMENT_JUDGE` | `off` | `on` needs a key, or the program of a command line provider. `auto` runs without a judge when that is missing. |
-| `--judge-provider anthropic\|claude-cli\|codex-cli` | `ASSESSMENT_JUDGE_PROVIDER` | `anthropic` | Who answers. See [Command line providers](#command-line-providers). |
+| `--judge-provider anthropic\|openai\|claude-cli\|codex-cli` | `ASSESSMENT_JUDGE_PROVIDER` | `anthropic` | Who answers. See [The OpenAI provider](#the-openai-provider) and [Command line providers](#command-line-providers). |
 | `--judge-cli-path` | `ASSESSMENT_JUDGE_CLI_PATH` | `claude` or `codex` | The program of a command line provider. A bare name is looked up in `PATH`. |
 | `--judge-default on\|off` | `ASSESSMENT_JUDGE_DEFAULT` | `on` | Whether a call that does not set `options.judge` is judged. |
-| `--judge-model` | `ASSESSMENT_JUDGE_MODEL` | `claude-opus-5-5` | The model. With `codex-cli` the default is the program's own model. |
+| `--judge-model` | `ASSESSMENT_JUDGE_MODEL` | `claude-opus-5-5` | The model. With `openai` the default is `gpt-6.1-sol`. With `codex-cli` the default is the program's own model. |
 | `--judge-effort` | `ASSESSMENT_JUDGE_EFFORT` | `low` | `low`, `medium`, `high`, `xhigh` or `max`. A command line provider takes only the first three. |
 | `--judge-timeout-secs` | `ASSESSMENT_JUDGE_TIMEOUT_SECS` | 15 | Longest time for one judge call (1 to 600). |
 | `--judge-max-fields-per-request` | `ASSESSMENT_JUDGE_MAX_FIELDS_PER_REQUEST` | 4 | Most fields of one request that are asked. |
@@ -103,36 +106,125 @@ All are flags of `serve`. Each has an environment variable.
 | `--judge-max-calls-per-minute` | `ASSESSMENT_JUDGE_MAX_CALLS_PER_MINUTE` | 60 | Rate limit. |
 | `--judge-max-usd-per-hour` | `ASSESSMENT_JUDGE_MAX_USD_PER_HOUR` | 10 | Spend cap, from the price table. It has no effect with a command line provider. |
 | `--judge-max-text-chars` | `ASSESSMENT_JUDGE_MAX_TEXT_CHARS` | 8000 | Longer texts are not sent. |
-| `--judge-max-tokens` | `ASSESSMENT_JUDGE_MAX_TOKENS` | 4096 | Largest answer. Only `anthropic`. |
+| `--judge-max-tokens` | `ASSESSMENT_JUDGE_MAX_TOKENS` | 4096 | Largest answer. Only `anthropic` and `openai`. |
 | `--judge-cache-entries` | `ASSESSMENT_JUDGE_CACHE_ENTRIES` | 4096 | Answers kept in memory. |
 | `--judge-fallbacks auto\|on\|off` | `ASSESSMENT_JUDGE_FALLBACKS` | `auto` | Whether the API may answer with another model when the first declines. `auto` is on for the default model only. Only `anthropic`. |
-| `--judge-base-url` | `ASSESSMENT_JUDGE_BASE_URL` | `https://api.anthropic.com` | The API root. Only `anthropic`. |
+| `--judge-base-url` | `ASSESSMENT_JUDGE_BASE_URL` | `https://api.anthropic.com`, or `https://api.openai.com/v1` with `openai` | The API root. With `openai` it includes `/v1`. Only `anthropic` and `openai`. The two share it: change it when the provider changes. |
 | `--judge-allow-unauthenticated` | `ASSESSMENT_JUDGE_ALLOW_UNAUTHENTICATED` | off | See the threat model. |
-| `--anthropic-api-key-file` | `ANTHROPIC_API_KEY_FILE` | none | A file that holds the key. Only `anthropic`. |
+| `--anthropic-api-key-file` | `ANTHROPIC_API_KEY_FILE` | none | A file that holds the Anthropic key. Only `anthropic`. |
+| `--openai-api-key-file` | `OPENAI_API_KEY_FILE` | none | A file that holds the OpenAI key. Only `openai`. |
 
-The key comes from `ANTHROPIC_API_KEY` or from the key file. The file wins.
-A key file that cannot be read or is empty is an error, also with `auto`.
-There is no flag that takes the key itself, so it never shows in a process
-list.
+With `anthropic` the key comes from `ANTHROPIC_API_KEY` or from
+`--anthropic-api-key-file`. With `openai` it comes from `OPENAI_API_KEY`
+or from `--openai-api-key-file`. The file wins, and the flag wins over
+the key file variable. A provider reads only its own variables: the key
+and the key file variable of the other provider are never read, and a
+command line provider reads none of them. So one environment can hold the
+variables of both providers. A key file that cannot be read or is empty
+is an error, also with `auto`. There is no flag that takes the key
+itself, so it never shows in a process list.
 
-A flag that is marked "Only `anthropic`" is refused at startup with a
-command line provider, also with `--judge auto` and also when it comes
-from its environment variable. `--judge-cli-path` is refused with
-`anthropic`. Nothing is checked with `--judge off`.
+A flag that is marked "Only" for some providers is refused at startup with
+every other provider, also with `--judge auto` and also when it comes from
+its environment variable. So `--judge-fallbacks on` or `off` and
+`--anthropic-api-key-file` are refused with `openai`,
+`--openai-api-key-file` is refused with `anthropic`, and all of these are
+refused with a command line provider. The two key file variables are the
+exception: only the flag of another provider is refused, and its variable
+is not looked at. `--judge-fallbacks auto` is the default and is taken
+with `openai`: it turns nothing on there. `--judge-cli-path` is refused
+with `anthropic` and `openai`. Nothing is checked with `--judge off`.
+
+`anthropic` and `openai` share `--judge-base-url` and
+`ASSESSMENT_JUDGE_BASE_URL`. A base URL that stays behind when only the
+provider is changed would send the key of one provider to the other. So a
+base URL on `api.anthropic.com` is refused with `openai`, and one on
+`api.openai.com` is refused with `anthropic`. Any other host, such as a
+gateway, is taken as it is: check it when you change the provider.
 
 `assess --judge` takes the provider, program path, model, effort, timeout,
-fields per request, tokens, fallbacks, base URL and key file flags. It
+fields per request, tokens, fallbacks, base URL and both key file flags. It
 asks the provider directly, without the cache and the limits, and each
 judge call has the whole timeout. It prints one line on stderr:
 
     judge: 1 flagged, 1 judged (claude-opus-5-5, 2100/180 tokens, ~$0.0120)
 
-The numbers in that line are made up for this example. With a command line
-provider the line names the judge id and has no price:
+The numbers in that line are made up for this example. With `openai` the
+line names the judge id, for example `openai/gpt-6.1-sol`. With a command
+line provider the line names the judge id and has no price:
 
     judge: 1 flagged, 1 judged (codex-cli/default, 14179/52 tokens, cost not measured)
 
 That line is from one real Codex run through `assess --judge`.
+
+## The OpenAI provider
+
+`--judge-provider openai` asks the OpenAI Chat Completions API. It is not
+a Claude model. It is there so that a deployment does not depend on one
+vendor.
+
+Status: this provider has not yet been run against the real OpenAI API. It
+is tested against a local server only. Nothing about its answers, its cost
+or its latency has been measured.
+
+```bash
+export OPENAI_API_KEY=...             # or --openai-api-key-file <file>
+assessment-engine serve --judge on --judge-provider openai --auth-token "$TOKEN"
+assessment-engine assess request.json --judge --judge-provider openai
+```
+
+* **The key.** It is read from `OPENAI_API_KEY` or from the file that
+  `--openai-api-key-file` (`OPENAI_API_KEY_FILE`) names, and the file
+  wins. There is no flag that takes the key. It is sent only as the
+  `Authorization: Bearer` header to `--judge-base-url`, and it is kept out
+  of `Debug` output, errors, logs and details. `ANTHROPIC_API_KEY` is not
+  read with this provider. `--judge on` without a key does not start and
+  names `OPENAI_API_KEY`. `--judge auto` without a key runs without a
+  judge.
+* **The request.** One `POST {base}/chat/completions` per flagged field,
+  with the model, a system message (the shared prompt), a user message
+  (the question as JSON), `max_completion_tokens` (`--judge-max-tokens`),
+  `reasoning_effort` (`--judge-effort`), a strict `json_schema` answer
+  format named `verdict`, and `store: false`. No `temperature`, `top_p`,
+  tools, stream or user id is sent.
+* **What leaves the process.** The same content as with `anthropic`: the
+  two texts of the flagged `title` or `description`, the field name, the
+  entity kind, the entity's title as context, and the four counts. It
+  goes to OpenAI, or to whatever host `--judge-base-url` names. At
+  startup one `GET {base}/models/{model}` checks the key and the model.
+  It sends no text.
+* **The base URL.** The default is `https://api.openai.com/v1`. Unlike the
+  Anthropic one it includes `/v1`: the client adds only
+  `/chat/completions` and `/models/{model}`. It must be https, or http on
+  a loopback address, and redirects are not followed. An endpoint of
+  another vendor or a gateway that speaks the same protocol can be named
+  here. That is possible but untested, and such a host then gets the key
+  and the texts.
+* **The model.** The default is `gpt-6.1-sol`. `--judge-model` names
+  another one.
+* **The effort.** `low`, `medium`, `high`, `xhigh` and `max` are sent as
+  they are. When the API answers 400 and names `reasoning_effort`, the
+  request is sent once more without that field, and the field is left out
+  for the rest of the process. No other 400 is tried again.
+* **The answer.** The first choice must end with `stop` and hold a
+  verdict that fits the schema. A refusal and a content filter are
+  `refused`. An answer cut off at the token limit and any other finish
+  reason are errors. The judge never guesses.
+* **Tokens and cost.** Cached prompt tokens are counted as cache reads.
+  The prices of the OpenAI models in the price table are estimates for
+  the spend cap (`--judge-max-usd-per-hour`). They are not a bill, and a
+  model the table does not know is counted at a high price on purpose. A
+  name has the price of a table name only when it is that name, or that
+  name and a date: `gpt-5.5-pro` is unknown, it is not `gpt-5.5`. An
+  answer that reports no usage, as some gateways send, is counted at the
+  estimated input and the whole of `--judge-max-tokens`, never at zero.
+* **Flags.** `--judge-fallbacks on|off`, `--judge-cli-path` and
+  `--anthropic-api-key-file` are refused. The default of
+  `--judge-concurrency` is 8, as with `anthropic`. The limits, the cache,
+  the retries and the breaker below are the same.
+* **The evaluation.** `JUDGE_PROVIDER=openai cargo run -p assessment-judge
+  --example judge_cases` runs the six cases against the real API. It is a
+  paid run, needs `OPENAI_API_KEY`, and has not been run.
 
 ## Command line providers
 
@@ -329,7 +421,7 @@ The field's status is `unavailable`, the result is the engine's own, and
 | `the judge call rate limit is reached` | Over the calls per minute. |
 | `the judge is paused after repeated failures` | The breaker is open. |
 | `the answer was cut off at the token limit` | The model ran out of tokens. |
-| `the answer is not a valid verdict`, `unexpected stop reason: …` | The answer cannot be used. |
+| `the answer is not a valid verdict`, `unexpected stop reason: …`, `unexpected finish reason: …` | The answer cannot be used. The last one is from `openai`. |
 
 A failure without a message of its own reads `the judge failed (<kind>)`.
 A detail is at most 200 characters and never holds the key.
@@ -362,7 +454,8 @@ CI runs the same check in the container image with `--network none`.
   render it as HTML or Markdown, and do not feed it to another model as
   instructions.
 * **The key.** It is read from the environment or a file, never from a
-  flag. It is kept out of `Debug` output, errors, logs and details. With
+  flag. It is kept out of `Debug` output, errors, logs and details. Only
+  the key of the chosen provider is read. With
   a command line provider it is not read, and the program does not get
   it: its environment is a short fixed list, not the environment of the
   engine.
@@ -376,7 +469,12 @@ CI runs the same check in the container image with `--network none`.
 * **Where the text goes.** With `anthropic`, only to `--judge-base-url`.
   Redirects are not followed. Plain `http://` is refused unless the
   address is loopback. At startup one `GET /v1/models/{model}` checks the
-  key and the model. It costs nothing and sends no text. With a command
+  key and the model. It costs nothing and sends no text. With `openai`
+  the same rules hold: the text and the key go only to `--judge-base-url`,
+  which is OpenAI by default and any host you name otherwise, and the
+  startup check is one `GET {base}/models/{model}`. Choosing `openai`
+  sends the flagged texts to another company than `anthropic` does, so
+  it is a decision about your data and not only about a model. With a command
   line provider the text goes to the program, and the program sends it to
   its own service: Anthropic for `claude-cli`, OpenAI for `codex-cli`.
   The engine does not choose or check that address. It does keep the
