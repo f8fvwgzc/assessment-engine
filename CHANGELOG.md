@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Documents for working with the Codex command line. `AGENTS.md` at the
+  root holds the commands and the rules of the project for coding agents.
+  `docs/CODEX.md` covers the setup on a new computer, Codex as the coding
+  agent (sandbox and tests), Codex as the judge, prompts to copy, and what
+  was tested. The README has the new sections "What it can do" and
+  "Codex". No code changed.
+
+### Fixed
+
+- Documents: the judge sends six counts with a flagged field, not four
+  (`README.md`, `docs/JUDGE.md`). The code did not change.
 - OpenAI judge provider, so that the judge does not depend on one vendor.
   `anthropic` stays the default, and the other providers did not change.
   The provider is tested against a local server only: it has not been run

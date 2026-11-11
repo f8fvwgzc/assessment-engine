@@ -43,6 +43,60 @@ critical impact (score 0.83, confidence 0.90); breaking change to "Authenticatio
 recommendation: re-plan everything under "Authentication for the customer portal"
 ```
 
+## What it can do
+
+**It can:**
+
+- **Assess one change without storing anything** (`Assess`, `AssessBatch`,
+  `AssessStream`, or the `assess` command). You send the changed item and
+  the items around it. You get the version bump, the affected items with
+  an action each, the plan conflicts and a recommendation.
+- **Keep the items and their versions for you** (`PutEntity`,
+  `DeleteEntity`, `GetEntity`, `GetHistory`, `CompareVersions`). Every item
+  gets a semantic version. The server can keep them in a journal on disk.
+- **Tell which plans are out of date** (`ListStale`, `Acknowledge`). A
+  child that was planned against version 1 of its parent is reported when
+  the parent moves to version 2.
+- **Read comments** (`RecordActivity`) for blockers, scope changes, risks
+  and schedule slips, without changing a version.
+- **Load a whole tracker fast** (`Import`): about one microsecond per new
+  item in the measured in-process run (in memory, without gRPC and without
+  a journal), see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+- **Compare two texts** (`CompareText`, or the `compare-text` command) and
+  show every measure.
+- **Flag the text changes it cannot decide alone**, such as a paraphrase
+  or one word replaced by another, and take the answer from you
+  ([Bring your own judgments](#bring-your-own-judgments)) or from a model
+  ([Let the server ask a model](#let-the-server-ask-a-model)). The model
+  can be reached through the Anthropic API, the OpenAI API, or a logged-in
+  Claude Code or Codex command line. The flags are always reported.
+  Asking a model is off by default.
+- **Be tuned** with a policy file: every weight and threshold is a number
+  you can change (`policy` command, [Tuning](#tuning)).
+- **Run in three ways**: as a gRPC server for any language, as a command
+  that reads JSON and prints JSON, or as a Rust library in your process.
+
+**It cannot, and does not try to:**
+
+- It is not a tracker and has no user interface. It does not re-plan
+  anything. It tells you that a re-plan is needed and where.
+- Without a judge it does not understand meaning. It measures words,
+  structure and numbers. The gray-zone rules, the stemmer, the stop-words
+  and the typo guard are English. The word lists for negation,
+  requirement words and comment signals are in the policy: they are
+  English plus a few Mongolian terms by default, and you can add your
+  own. Text in other languages is accepted and scored by the measures
+  that do not depend on a language.
+- With the judge off, it sends nothing anywhere. With the judge on, one
+  request leaves the process for each flagged title or description: the
+  two texts of that field, the field name, the entity kind, the item's
+  title as context and six counts. No ids, no other fields, no other
+  items and no comments ([Privacy](#let-the-server-ask-a-model)).
+- It runs as one process. There is no clustering.
+
+Working on this repository with Codex, and using Codex as the judge:
+[docs/CODEX.md](docs/CODEX.md).
+
 ## Install
 
 The server, as a container image (linux/amd64 and linux/arm64, signed build
@@ -453,8 +507,9 @@ start with a judge on an address that is not loopback unless
 **Privacy: what leaves the process.** With the judge off, nothing does.
 With it on, for each flagged field one request goes to the Anthropic API
 with: the two texts of that field, the field name, the entity kind, the
-entity's title as context (not for the title field itself), and four
-counts (list items, negations, requirement words, numbers that changed).
+entity's title as context (not for the title field itself), and six
+counts (list items added, removed and modified; negations, requirement
+words and numbers that changed).
 No ids, no other fields, no other entities and no comments are sent. At
 startup the server also sends one `GET /v1/models/{model}` to check the key
 and the model. Texts longer than `--judge-max-text-chars` (8000) are not
@@ -522,7 +577,53 @@ JSON object merged over the server's), for example:
 }
 ```
 
+## Codex
+
+There are two ways to use the Codex command line with this project. Both
+are described step by step in [docs/CODEX.md](docs/CODEX.md).
+
+**Codex as the coding agent.** [AGENTS.md](AGENTS.md) at the root holds
+the commands and the rules of this project, and Codex reads it by itself.
+
+```bash
+codex --sandbox workspace-write --ask-for-approval on-request
+```
+
+The sandbox of Codex blocks the network, and that includes the local ports
+that many tests open. It also blocks `ps`, which seven tests run. Approve
+the test run when Codex asks. To let the port tests pass without asking,
+allow the network for the sandbox in `~/.codex/config.toml` (the seven
+`ps` tests still need your approval):
+
+```toml
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true   # opens the whole network to the sandbox, not only 127.0.0.1
+```
+
+[docs/CODEX.md](docs/CODEX.md#4-prompts-for-codex) has prompts to copy:
+get to know the project, check the clone, explain an assessment, fix a
+bug, add a feature, connect a tracker, review before a commit.
+
+**Codex as the judge.** The engine starts a logged-in `codex` program to
+ask about flagged text changes. No API key is needed.
+
+```bash
+codex login                           # once, yourself
+cargo build --release -p assessment-server
+target/release/assessment-engine assess examples/requests/paraphrase.core.json --judge --judge-provider codex-cli
+```
+
+The flagged texts go to OpenAI under that login. The engine does not use
+your `~/.codex/config.toml` for these calls. This is for a developer
+computer or a host with one tenant, not for a shared server. See
+[Command line providers](docs/JUDGE.md#command-line-providers).
+
 ## Development
+
+Coding agents: read [AGENTS.md](AGENTS.md) first.
 
 ```bash
 cargo test --all --workspace          # unit, scenario, property and gRPC tests

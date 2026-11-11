@@ -189,7 +189,7 @@ assessment-engine assess request.json --judge --judge-provider openai
   tools, stream or user id is sent.
 * **What leaves the process.** The same content as with `anthropic`: the
   two texts of the flagged `title` or `description`, the field name, the
-  entity kind, the entity's title as context, and the four counts. It
+  entity kind, the entity's title as context, and the six counts. It
   goes to OpenAI, or to whatever host `--judge-base-url` names. At
   startup one `GET {base}/models/{model}` checks the key and the model.
   It sends no text.
@@ -281,7 +281,7 @@ the engine's user, which are files that user can read.
 
 **What leaves the process, and to whom.** The same content as with the
 API: the two texts, the field name, the entity kind, the context title and
-the four counts. With `claude-cli` it goes to Anthropic, under the account
+the six counts. With `claude-cli` it goes to Anthropic, under the account
 that is logged in to Claude Code. With `codex-cli` it goes to OpenAI,
 under the account that is logged in to Codex. The terms and the data
 handling of that account apply, not those of an API key. The program adds
