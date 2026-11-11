@@ -13,10 +13,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["anthropic", "cli"]
-# The HTTP client for the Anthropic Messages API. Without it the crate has
-# no HTTP or TLS dependency.
+default = ["anthropic", "openai", "cli"]
+# The HTTP client for the Anthropic Messages API.
 anthropic = ["dep:reqwest"]
+# The HTTP client for the OpenAI Chat Completions API. Without `anthropic`
+# and `openai` the crate has no HTTP or TLS dependency.
+openai = ["dep:reqwest"]
 # Judges that run a locally installed agent command line (Claude Code or
 # Codex) as a child process. Without it the crate starts no process.
 cli = ["tokio/process", "tokio/io-util", "tokio/fs"]
@@ -37,12 +39,16 @@ name = "anthropic_http"
 required-features = ["anthropic"]
 
 [[test]]
+name = "openai_http"
+required-features = ["openai"]
+
+[[test]]
 name = "cli_process"
 required-features = ["cli"]
 
 [[example]]
 name = "judge_cases"
-required-features = ["anthropic", "cli"]
+required-features = ["anthropic", "openai", "cli"]
 
 [lints]
 workspace = true

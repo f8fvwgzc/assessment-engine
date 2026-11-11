@@ -18,10 +18,14 @@ path = "src/main.rs"
 
 [features]
 default = ["judge"]
-# The judge providers: the HTTP client for the Anthropic Messages API and the
-# runners of the Claude Code and Codex command lines. Without it the binary has
-# no judge and `--judge on` is refused.
-judge = ["assessment-judge/anthropic", "assessment-judge/cli"]
+# The judge providers: the HTTP clients for the Anthropic Messages API and the
+# OpenAI Chat Completions API, and the runners of the Claude Code and Codex
+# command lines. Without it the binary has no judge and `--judge on` is refused.
+judge = [
+    "assessment-judge/anthropic",
+    "assessment-judge/openai",
+    "assessment-judge/cli",
+]
 
 [dependencies]
 anyhow.workspace = true

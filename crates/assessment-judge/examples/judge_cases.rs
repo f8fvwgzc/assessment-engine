@@ -12,6 +12,13 @@
 //!   ANTHROPIC_API_KEY=... cargo run -p assessment-judge --example judge_cases
 //!   ```
 //!
+//! * `openai`: the paid OpenAI API, with the same budget. Without a key it
+//!   refuses to run and sends nothing.
+//!
+//!   ```text
+//!   JUDGE_PROVIDER=openai OPENAI_API_KEY=... cargo run -p assessment-judge --example judge_cases
+//!   ```
+//!
 //! * `claude-cli` or `codex-cli`: the Claude Code or the Codex command
 //!   line that is installed and logged in on this machine. No key is read.
 //!   The calls use the quota of the logged-in account. The cost is not
@@ -25,7 +32,8 @@
 //!   `JUDGE_CLI_PATH` names the program when it is not in `PATH`.
 //!
 //! `JUDGE_MODEL` picks another model. The default is `claude-opus-5-5`,
-//! and the program's own model with `codex-cli`.
+//! `gpt-6.1-sol` with `openai`, and the program's own model with
+//! `codex-cli`.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -35,7 +43,7 @@ use assessment_core::model::TextRelation;
 use assessment_judge::price::cost_usd;
 use assessment_judge::{
     AnthropicConfig, AnthropicJudge, ApiKey, CliConfig, CliJudge, CliKind, DEFAULT_MODEL, Judge,
-    LimitedJudge, Limits, Question, ask,
+    JudgeError, LimitedJudge, Limits, OpenAiConfig, OpenAiJudge, Question, ask,
 };
 use tokio::time::Instant;
 
@@ -100,11 +108,12 @@ const CASES: [Case; 6] = [
 async fn main() -> ExitCode {
     let provider = std::env::var("JUDGE_PROVIDER").unwrap_or_else(|_| "anthropic".to_owned());
     match provider.as_str() {
-        "anthropic" => run_api().await,
+        "anthropic" => run_api(Api::Anthropic).await,
+        "openai" => run_api(Api::OpenAi).await,
         "claude-cli" => run_cli(CliKind::ClaudeCode).await,
         "codex-cli" => run_cli(CliKind::Codex).await,
         _ => {
-            eprintln!("JUDGE_PROVIDER must be anthropic, claude-cli or codex-cli.");
+            eprintln!("JUDGE_PROVIDER must be anthropic, openai, claude-cli or codex-cli.");
             ExitCode::from(2)
         }
     }
@@ -191,46 +200,96 @@ async fn run_cli(kind: CliKind) -> ExitCode {
     }
 }
 
-/// The six cases through the paid Anthropic API.
-async fn run_api() -> ExitCode {
-    let Ok(raw_key) = std::env::var("ANTHROPIC_API_KEY") else {
+/// A provider that is billed per token.
+#[derive(Clone, Copy)]
+enum Api {
+    Anthropic,
+    OpenAi,
+}
+
+impl Api {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+        }
+    }
+
+    /// The variable that holds the key of this provider. The key of the
+    /// other provider is never read.
+    fn key_variable(self) -> &'static str {
+        match self {
+            Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::OpenAi => "OPENAI_API_KEY",
+        }
+    }
+
+    /// The judge, the model name and the answer limit.
+    fn judge(self, key: ApiKey) -> Result<(Arc<dyn Judge>, String, u32), JudgeError> {
+        let model = std::env::var("JUDGE_MODEL").ok();
+        match self {
+            Self::Anthropic => {
+                let mut config = AnthropicConfig::default();
+                if let Some(model) = model {
+                    config.model = model;
+                }
+                let (model, max_tokens) = (config.model.clone(), config.max_tokens);
+                Ok((
+                    Arc::new(AnthropicJudge::new(key, config)?),
+                    model,
+                    max_tokens,
+                ))
+            }
+            Self::OpenAi => {
+                let mut config = OpenAiConfig::default();
+                if let Some(model) = model {
+                    config.model = model;
+                }
+                let (model, max_tokens) = (config.model.clone(), config.max_tokens);
+                Ok((Arc::new(OpenAiJudge::new(key, config)?), model, max_tokens))
+            }
+        }
+    }
+}
+
+/// The six cases through a paid API.
+async fn run_api(api: Api) -> ExitCode {
+    let variable = api.key_variable();
+    let Ok(raw_key) = std::env::var(variable) else {
         eprintln!(
-            "ANTHROPIC_API_KEY is not set. This example calls the paid Anthropic API \
-             and does not run without a key."
+            "{variable} is not set. This example calls the paid {} API \
+             and does not run without a key. Nothing was sent.",
+            api.name()
         );
         return ExitCode::from(2);
     };
     let key = match ApiKey::new(&raw_key) {
         Ok(key) => key,
         Err(error) => {
-            eprintln!("ANTHROPIC_API_KEY cannot be used: {error}");
+            eprintln!("{variable} cannot be used: {error}");
             return ExitCode::from(2);
         }
     };
     drop(raw_key);
 
-    let mut config = AnthropicConfig::default();
-    if let Ok(model) = std::env::var("JUDGE_MODEL") {
-        config.model = model;
-    }
-    let limits = Limits {
-        usd_per_hour: BUDGET_USD,
-        model: config.model.clone(),
-        max_tokens: config.max_tokens,
-        timeout: TIMEOUT,
-        ..Limits::default()
-    };
-    let model = config.model.clone();
-    let anthropic = match AnthropicJudge::new(key, config) {
-        Ok(judge) => Arc::new(judge),
+    let (inner, model, max_tokens) = match api.judge(key) {
+        Ok(parts) => parts,
         Err(error) => {
             eprintln!("cannot set up the judge: {error}");
             return ExitCode::from(2);
         }
     };
-    let judge = LimitedJudge::new(anthropic, limits);
+    let limits = Limits {
+        usd_per_hour: BUDGET_USD,
+        model: model.clone(),
+        max_tokens,
+        timeout: TIMEOUT,
+        ..Limits::default()
+    };
+    let id = inner.id().to_owned();
+    let judge = LimitedJudge::new(inner, limits);
 
-    println!("model: {model}; budget: ${BUDGET_USD:.2}");
+    println!("judge: {id}; budget: ${BUDGET_USD:.2}");
     let mut passed = 0;
     let mut spent = 0.0;
     for case in &CASES {

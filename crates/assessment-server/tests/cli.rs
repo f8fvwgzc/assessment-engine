@@ -29,7 +29,10 @@ fn engine() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_assessment-engine"));
     for (name, _) in std::env::vars_os() {
         let name_text = name.to_string_lossy();
-        if name_text.starts_with("ASSESSMENT_") || name_text.starts_with("ANTHROPIC_") {
+        if name_text.starts_with("ASSESSMENT_")
+            || name_text.starts_with("ANTHROPIC_")
+            || name_text.starts_with("OPENAI_")
+        {
             command.env_remove(&name);
         }
     }
@@ -577,12 +580,276 @@ fn a_command_line_provider_whose_program_is_missing_is_an_error() {
             "--addr",
             "127.0.0.1:0",
             "--judge-provider",
-            "openai",
+            "gemini",
         ])
         .stdin(Stdio::null())
         .output()
         .expect("the binary runs");
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}
+
+/// `assess --judge` with the openai provider and a key that is not real.
+#[cfg(feature = "judge")]
+fn openai_assess(base_url: &str) -> Command {
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge", "--judge-provider", "openai"])
+        .args(["--judge-base-url", base_url])
+        .args(["--judge-timeout-secs", "5"])
+        .env("OPENAI_API_KEY", "dummy");
+    command
+}
+
+#[cfg(feature = "judge")]
+#[test]
+fn an_openai_judge_that_cannot_be_reached_never_fails_assess() {
+    let mut plain = engine();
+    plain.args(["assess", "-"]);
+    let lexical = json(&run_with_stdin(plain, &request(PARAPHRASE)));
+
+    let output = run_with_stdin(openai_assess(CLOSED), &request(PARAPHRASE));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let judged = json(&output);
+    let judgment = description_judgment(&judged);
+    assert_eq!(judgment["status"], "unavailable", "{judgment}");
+    let detail = judgment["detail"].as_str().expect("a detail");
+    assert!(!detail.is_empty());
+    assert!(!detail.contains("dummy"), "{detail}");
+
+    // The result is the engine's own.
+    assert_eq!(judged["changes"][0]["bump"], lexical["changes"][0]["bump"]);
+    assert_eq!(judged["score"], lexical["score"]);
+    assert_eq!(judged["level"], lexical["level"]);
+
+    // The report names the provider and the model.
+    let report = stderr(&output);
+    assert!(
+        report.contains("judge: 1 flagged, 0 judged (openai/gpt-6.1-sol, 0/0 tokens, ~$0.0000)"),
+        "{report}"
+    );
+    assert!(!report.contains("dummy"), "{report}");
+
+    // The provider and the model are read from the environment too.
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge"])
+        .env("ASSESSMENT_JUDGE_PROVIDER", "openai")
+        .env("ASSESSMENT_JUDGE_MODEL", "gpt-6-luna")
+        .env("ASSESSMENT_JUDGE_BASE_URL", CLOSED)
+        .env("ASSESSMENT_JUDGE_TIMEOUT_SECS", "5")
+        .env("OPENAI_API_KEY", "dummy");
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        description_judgment(&json(&output))["status"],
+        "unavailable"
+    );
+    assert!(
+        stderr(&output).contains("(openai/gpt-6-luna, "),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(feature = "judge")]
+#[test]
+fn the_openai_provider_needs_its_own_key() {
+    // The key of another provider is not a key for this one.
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge", "--judge-provider", "openai"])
+        .args(["--judge-base-url", CLOSED])
+        .env("ANTHROPIC_API_KEY", "dummy-key-0123456789");
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    assert!(!output.status.success());
+    let report = stderr(&output);
+    assert!(report.contains("needs an API key"), "{report}");
+    assert!(report.contains("OPENAI_API_KEY"), "{report}");
+    assert!(report.contains("--openai-api-key-file"), "{report}");
+    assert!(!report.contains("dummy-key-0123456789"), "{report}");
+    assert!(output.stdout.is_empty());
+
+    // And the other way round.
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge"])
+        .args(["--judge-base-url", CLOSED])
+        .env("OPENAI_API_KEY", "dummy-key-0123456789");
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    assert!(!output.status.success());
+    let report = stderr(&output);
+    assert!(report.contains("ANTHROPIC_API_KEY"), "{report}");
+    assert!(!report.contains("dummy-key-0123456789"), "{report}");
+
+    // `serve --judge on` refuses to start without the key.
+    let output = engine()
+        .args(["serve", "--addr", "127.0.0.1:0", "--judge", "on"])
+        .args(["--judge-provider", "openai"])
+        .env("ANTHROPIC_API_KEY", "dummy-key-0123456789")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert!(!output.status.success());
+    let report = stderr(&output);
+    assert!(report.contains("needs an API key"), "{report}");
+    assert!(report.contains("OPENAI_API_KEY"), "{report}");
+}
+
+/// A machine that is set up for both API providers has both key file
+/// variables. Each provider reads its own and does not look at the other.
+#[cfg(feature = "judge")]
+#[test]
+fn a_key_file_variable_of_another_provider_changes_nothing() {
+    let dir = std::env::temp_dir().join(format!("assessment-cli-key-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the temporary directory is created");
+    let own = dir.join("key");
+    std::fs::write(&own, "dummy\n").expect("the key file is written");
+    let missing = dir.join("no-such-key");
+
+    let cases = [
+        ("anthropic", "ANTHROPIC_API_KEY_FILE", "OPENAI_API_KEY_FILE"),
+        ("openai", "OPENAI_API_KEY_FILE", "ANTHROPIC_API_KEY_FILE"),
+    ];
+    for (provider, own_env, other_env) in cases {
+        // The file of the other provider does not exist: it is not read.
+        let mut command = engine();
+        command
+            .args(["assess", "-", "--judge", "--judge-provider", provider])
+            .args(["--judge-base-url", CLOSED])
+            .args(["--judge-timeout-secs", "5"])
+            .env(own_env, &own)
+            .env(other_env, &missing);
+        let output = run_with_stdin(command, &request(PARAPHRASE));
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{provider}: {}",
+            stderr(&output)
+        );
+        let judgment = json(&output);
+        assert_eq!(
+            description_judgment(&judgment)["status"],
+            "unavailable",
+            "{provider}"
+        );
+
+        // Its own file must be readable, and the error names the file.
+        let mut command = engine();
+        command
+            .args(["assess", "-", "--judge", "--judge-provider", provider])
+            .args(["--judge-base-url", CLOSED])
+            .env(own_env, &missing)
+            .env(other_env, &own);
+        let output = run_with_stdin(command, &request(PARAPHRASE));
+        assert!(!output.status.success(), "{provider}");
+        let report = stderr(&output);
+        assert!(
+            report.contains("failed to read the API key file"),
+            "{report}"
+        );
+        assert!(report.contains("no-such-key"), "{report}");
+    }
+    // A command line provider reads neither.
+    let mut command = engine();
+    command
+        .args(["assess", "-", "--judge", "--judge-provider", "codex-cli"])
+        .args(["--judge-cli-path", "/nonexistent/assessment-judge-cli"])
+        .env("ANTHROPIC_API_KEY_FILE", &missing)
+        .env("OPENAI_API_KEY_FILE", &missing);
+    let output = run_with_stdin(command, &request(PARAPHRASE));
+    assert!(!output.status.success());
+    let report = stderr(&output);
+    assert!(report.contains("was not found"), "{report}");
+    assert!(!report.contains("key"), "{report}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(feature = "judge")]
+#[test]
+fn openai_flags_that_do_not_fit_the_provider_are_refused() {
+    let cases: [(&str, &[&str], &str); 5] = [
+        (
+            "openai",
+            &["--anthropic-api-key-file", "/nonexistent/key"],
+            "--anthropic-api-key-file is only for the anthropic provider",
+        ),
+        (
+            "anthropic",
+            &["--openai-api-key-file", "/nonexistent/key"],
+            "--openai-api-key-file is only for the openai provider",
+        ),
+        (
+            "codex-cli",
+            &["--openai-api-key-file", "/nonexistent/key"],
+            "--openai-api-key-file is only for the openai provider",
+        ),
+        (
+            "openai",
+            &["--judge-fallbacks", "on"],
+            "--judge-fallbacks (ASSESSMENT_JUDGE_FALLBACKS) is only for the anthropic provider",
+        ),
+        (
+            "openai",
+            &["--judge-cli-path", "/nonexistent/program"],
+            "--judge-cli-path",
+        ),
+    ];
+    for (provider, extra, message) in cases {
+        let mut command = engine();
+        command
+            .args(["assess", "-", "--judge", "--judge-provider", provider])
+            .args(extra)
+            .env("OPENAI_API_KEY", "dummy")
+            .env("ANTHROPIC_API_KEY", "dummy");
+        let output = run_with_stdin(command, &request(PARAPHRASE));
+        assert!(!output.status.success(), "{provider} {extra:?}");
+        let report = stderr(&output);
+        assert!(report.contains(message), "{provider} {extra:?}: {report}");
+        assert!(output.stdout.is_empty());
+    }
+
+    // There is no flag that takes the key itself.
+    let output = engine()
+        .args(["serve", "--addr", "127.0.0.1:0", "--openai-api-key", "x"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}
+
+/// `serve --judge auto` with the openai provider and no key starts, with
+/// the judge off.
+#[cfg(feature = "judge")]
+#[test]
+fn openai_auto_without_a_key_runs_without_a_judge() {
+    use std::io::{BufRead, BufReader};
+
+    let mut child = engine()
+        .args(["serve", "--addr", "127.0.0.1:0", "--judge", "auto"])
+        .args(["--judge-provider", "openai"])
+        // The key of another provider does not turn the judge on.
+        .env("ANTHROPIC_API_KEY", "dummy-key-0123456789")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    let lines = BufReader::new(child.stderr.take().expect("a pipe")).lines();
+    let mut seen = String::new();
+    // The loop ends when the server listens, or when it exits.
+    for line in lines.map_while(Result::ok) {
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains("listening") {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(seen.contains("listening"), "{seen}");
+    assert!(seen.contains("judge=off"), "{seen}");
+    assert!(!seen.contains("dummy-key-0123456789"), "{seen}");
 }
 
 #[test]

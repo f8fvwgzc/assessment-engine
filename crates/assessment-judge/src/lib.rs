@@ -11,10 +11,14 @@
 //! - [`CachedJudge`] and [`LimitedJudge`]: wrappers that cache answers and
 //!   bound calls, spend and failures.
 //! - The providers. `AnthropicJudge` (feature `anthropic`) is the HTTP client
-//!   for the Anthropic Messages API. `CliJudge` (feature `cli`) runs a locally
-//!   installed agent command line, Claude Code or Codex, as a child process
-//!   and uses its login. Without both features the crate has no HTTP, TLS or
-//!   process code.
+//!   for the Anthropic Messages API. `OpenAiJudge` (feature `openai`) is the
+//!   HTTP client for the OpenAI Chat Completions API. Both take an `ApiKey`
+//!   and share one set of HTTP rules: no redirects, plain HTTP only to
+//!   loopback, at most 1 MiB read, the same retries. `CliJudge` (feature
+//!   `cli`) runs a locally installed agent command line, Claude Code or
+//!   Codex, as a child process and uses its login. Without `anthropic` and
+//!   `openai` the crate has no HTTP or TLS code, and without `cli` it starts
+//!   no process.
 //!
 //! The usual stack is `CachedJudge(LimitedJudge(provider))`, so cache hits
 //! cost nothing and never touch a limit.
@@ -35,16 +39,24 @@ pub mod anthropic;
 pub mod cache;
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+mod http;
 pub mod limits;
+#[cfg(feature = "openai")]
+pub mod openai;
 pub mod price;
 pub mod prompt;
 
 #[cfg(feature = "anthropic")]
-pub use anthropic::{AnthropicConfig, AnthropicJudge, ApiKey, Fallbacks};
+pub use anthropic::{AnthropicConfig, AnthropicJudge, Fallbacks};
 pub use cache::CachedJudge;
 #[cfg(feature = "cli")]
 pub use cli::{CliConfig, CliJudge, CliKind};
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub use http::ApiKey;
 pub use limits::{LimitedJudge, Limits};
+#[cfg(feature = "openai")]
+pub use openai::{OpenAiConfig, OpenAiJudge};
 pub use prompt::PROMPT_VERSION;
 
 /// A boxed future. The trait uses it so that it works behind `dyn Judge`.
@@ -55,6 +67,9 @@ pub const MAX_CONTEXT_TITLE_CHARS: usize = 300;
 
 /// The model the Claude providers ask when none is named.
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+
+/// The model the OpenAI provider asks when none is named.
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6.1-sol";
 
 /// How much work the model puts into an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -96,8 +111,8 @@ impl FromStr for Effort {
 
 /// Reads one text change and says how its meaning changed.
 pub trait Judge: Send + Sync + fmt::Debug {
-    /// A stable name, such as `anthropic/claude-opus-5-5` or
-    /// `codex-cli/default`.
+    /// A stable name, such as `anthropic/claude-opus-5-5`,
+    /// `openai/gpt-6.1-sol` or `codex-cli/default`.
     fn id(&self) -> &str;
 
     /// Answers the question before `deadline`.
@@ -466,7 +481,7 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// A model name that is safe in a URL path and as one program argument.
-#[cfg(any(feature = "anthropic", feature = "cli"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "cli"))]
 pub(crate) fn valid_model(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= 128
@@ -478,7 +493,7 @@ pub(crate) fn valid_model(model: &str) -> bool {
 
 /// A pseudo-random number from the process-random hasher keys. Good enough
 /// for jitter and for the name of a private directory; not for secrets.
-#[cfg(any(feature = "anthropic", feature = "cli"))]
+#[cfg(any(feature = "anthropic", feature = "openai", feature = "cli"))]
 pub(crate) fn random_u64() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();

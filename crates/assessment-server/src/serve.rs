@@ -439,6 +439,27 @@ mod tests {
             Some("anthropic/claude-haiku-4-5".to_owned())
         );
         judged.shutdown().await;
+
+        // The openai provider names itself and its model.
+        let args = serve_args(
+            &journal,
+            &[
+                "--judge",
+                "on",
+                "--judge-provider",
+                "openai",
+                "--judge-base-url",
+                "http://127.0.0.1:9/v1",
+                "--openai-api-key-file",
+                key_file.to_str().expect("the path is UTF-8"),
+            ],
+        );
+        let mut judged = Running::start(args).await;
+        assert_eq!(
+            judged.client.judge_info().await.expect("answers"),
+            Some("openai/gpt-6.1-sol".to_owned())
+        );
+        judged.shutdown().await;
         let _ = std::fs::remove_dir_all(journal.parent().expect("the journal has a directory"));
     }
 

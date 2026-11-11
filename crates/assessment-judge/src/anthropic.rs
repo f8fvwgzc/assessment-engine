@@ -6,7 +6,6 @@
 //! key into an error or a log line.
 
 use std::fmt;
-use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,12 +15,14 @@ use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
+pub use crate::http::{ApiKey, MAX_ATTEMPTS, MAX_BACKOFF, MAX_RESPONSE_BYTES};
+use crate::http::{
+    Failure, PROBE_TIMEOUT, build_client, config_error, count, deadline_error, error_detail,
+    is_identifier, run_with_retries, send, status_error, validate_base_url,
+};
 pub use crate::prompt::MAX_RATIONALE_CHARS;
 use crate::prompt::{Answer, SYSTEM_PROMPT, schema, user_content};
-use crate::{
-    BoxFuture, Judge, JudgeError, JudgeErrorKind, Question, Usage, Verdict, random_u64,
-    retryable_status, truncate_chars, valid_model,
-};
+use crate::{BoxFuture, Judge, JudgeError, JudgeErrorKind, Question, Usage, Verdict, valid_model};
 pub use crate::{DEFAULT_MODEL, Effort};
 
 /// The API version this client speaks.
@@ -30,61 +31,6 @@ pub const API_VERSION: &str = "2026-10-21";
 pub const FALLBACKS_BETA: &str = "server-side-fallback-2026-07-01";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
-/// Attempts per question, the first one included.
-pub const MAX_ATTEMPTS: u32 = 3;
-/// The largest response body that is read.
-pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-/// The longest wait between two attempts when the API names none.
-pub const MAX_BACKOFF: Duration = Duration::from_secs(8);
-
-const BASE_BACKOFF: Duration = Duration::from_millis(500);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_ERROR_DETAIL_CHARS: usize = 200;
-const REDACTED: &str = "[redacted]";
-
-/// An API key. It is never printed: `Debug` shows a placeholder.
-#[derive(Clone)]
-pub struct ApiKey(String);
-
-impl ApiKey {
-    /// Takes a key, without the white space around it. The key must be
-    /// visible ASCII, as an HTTP header needs.
-    pub fn new(raw: &str) -> Result<Self, JudgeError> {
-        let key = raw.trim();
-        if key.is_empty() {
-            return Err(config_error("the API key is empty"));
-        }
-        if !key.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(config_error(
-                "the API key has characters that an HTTP header cannot carry",
-            ));
-        }
-        Ok(Self(key.to_owned()))
-    }
-
-    fn header(&self) -> Result<HeaderValue, JudgeError> {
-        let mut value = HeaderValue::from_str(&self.0)
-            .map_err(|_| config_error("the API key cannot be sent as an HTTP header"))?;
-        value.set_sensitive(true);
-        Ok(value)
-    }
-
-    /// Takes the key out of a text that came from outside.
-    fn redact(&self, text: &str) -> String {
-        if text.contains(&self.0) {
-            text.replace(&self.0, REDACTED)
-        } else {
-            text.to_owned()
-        }
-    }
-}
-
-impl fmt::Debug for ApiKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ApiKey([redacted])")
-    }
-}
 
 /// Whether the API may answer with another model when the first one
 /// declines.
@@ -159,52 +105,6 @@ impl fmt::Debug for AnthropicJudge {
     }
 }
 
-/// A setting is wrong. Nothing was sent.
-fn config_error(message: &str) -> JudgeError {
-    JudgeError::new(JudgeErrorKind::Transport, message)
-}
-
-fn deadline_error() -> JudgeError {
-    JudgeError::new(JudgeErrorKind::Deadline, "judge timed out")
-}
-
-/// Checks a base URL. Returns it without a trailing slash, and whether the
-/// host is a loopback address. Errors never repeat the URL: it may hold a
-/// password.
-pub(crate) fn validate_base_url(raw: &str) -> Result<(String, bool), JudgeError> {
-    let url = reqwest::Url::parse(raw.trim())
-        .map_err(|_| config_error("the judge base URL is not a valid URL"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(config_error(
-            "the judge base URL must not carry a user name or a password",
-        ));
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(config_error(
-            "the judge base URL must not carry a query or a fragment",
-        ));
-    }
-    let Some(host) = url.host_str() else {
-        return Err(config_error("the judge base URL has no host"));
-    };
-    let loopback = host == "localhost"
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    match url.scheme() {
-        "https" => {}
-        "http" if loopback => {}
-        _ => {
-            return Err(config_error(
-                "the judge base URL must use https (http is allowed for loopback only)",
-            ));
-        }
-    }
-    Ok((url.as_str().trim_end_matches('/').to_owned(), loopback))
-}
-
 /// The request body. It never holds `thinking`, a sampling setting,
 /// `tool_choice`, `stream` or an assistant turn.
 pub(crate) fn build_body(config: &AnthropicConfig, user: &str, fallbacks: bool) -> Value {
@@ -226,53 +126,6 @@ pub(crate) fn build_body(config: &AnthropicConfig, user: &str, fallbacks: bool) 
         body["fallbacks"] = json!("default");
     }
     body
-}
-
-/// The wait the API asked for. `retry-after-ms` wins over `retry-after`.
-/// Only plain numbers count; a date is ignored.
-pub(crate) fn parse_retry_after(millis: Option<&str>, seconds: Option<&str>) -> Option<Duration> {
-    let number = |text: &str| {
-        text.trim()
-            .parse::<f64>()
-            .ok()
-            .filter(|n| n.is_finite() && *n >= 0.0)
-    };
-    if let Some(ms) = millis.and_then(number) {
-        return Some(Duration::from_secs_f64((ms / 1000.0).min(86_400.0)));
-    }
-    seconds
-        .and_then(number)
-        .map(|s| Duration::from_secs_f64(s.min(86_400.0)))
-}
-
-/// The wait before the next attempt, after `failed` failed attempts:
-/// 0.5 s doubled each time, at most 8 s, shortened by up to a quarter.
-pub(crate) fn backoff(failed: u32, random: u64) -> Duration {
-    let doubled = BASE_BACKOFF.saturating_mul(2u32.saturating_pow(failed.saturating_sub(1)));
-    let base = doubled.min(MAX_BACKOFF);
-    let jitter = (random % 1024) as f64 / 1024.0;
-    base.mul_f64(1.0 - 0.25 * jitter)
-}
-
-/// Makes a text from outside safe for one log line.
-fn clean(text: &str, max_chars: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    truncate_chars(flat.trim(), max_chars)
-}
-
-fn is_identifier(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= 64
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
-}
-
-fn count(value: &Value, name: &str) -> u64 {
-    value.get(name).and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// The usage of a response. With `iterations` it is the sum over them:
@@ -375,74 +228,6 @@ pub(crate) fn parse_response(body: &[u8], default_model: &str) -> Result<Verdict
         .with_usage(usage))
 }
 
-/// The type and the message of an API error body, when it has them.
-fn error_detail(body: &[u8]) -> (Option<String>, Option<String>) {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return (None, None);
-    };
-    let text = |pointer: &str| {
-        value
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    (text("/error/type"), text("/error/message"))
-}
-
-/// One failed attempt.
-struct Failure {
-    error: JudgeError,
-    /// The wait the API asked for.
-    retry_after: Option<Duration>,
-    /// A 400 that names the fallbacks field or its beta header.
-    names_fallbacks: bool,
-}
-
-impl From<JudgeError> for Failure {
-    fn from(error: JudgeError) -> Self {
-        Self {
-            error,
-            retry_after: None,
-            names_fallbacks: false,
-        }
-    }
-}
-
-fn transport_error(error: &reqwest::Error) -> JudgeError {
-    // The text is fixed: a library message could repeat a URL or a header.
-    let message = if error.is_connect() {
-        "could not connect to the API"
-    } else if error.is_timeout() {
-        "the connection to the API timed out"
-    } else if error.is_body() || error.is_decode() {
-        "could not read the API response"
-    } else {
-        "could not send the request to the API"
-    };
-    JudgeError::new(JudgeErrorKind::Transport, message)
-}
-
-/// Reads a body up to `limit` bytes. `Ok(None)` when it is larger.
-async fn read_capped(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Option<Vec<u8>>, reqwest::Error> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Ok(None);
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len() + chunk.len() > limit {
-            return Ok(None);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(Some(body))
-}
-
 impl AnthropicJudge {
     /// Builds the client. Nothing is sent yet.
     pub fn new(key: ApiKey, config: AnthropicConfig) -> Result<Self, JudgeError> {
@@ -455,19 +240,7 @@ impl AnthropicJudge {
         if config.max_tokens == 0 {
             return Err(config_error("the judge max_tokens must be at least 1"));
         }
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("assessment-judge/", env!("CARGO_PKG_VERSION")));
-        builder = if loopback {
-            // A local address is never reached through a proxy.
-            builder.no_proxy()
-        } else {
-            builder.https_only(true)
-        };
-        let client = builder
-            .build()
-            .map_err(|_| config_error("could not set up the HTTP client"))?;
+        let client = build_client(loopback)?;
         let use_fallbacks = match config.fallbacks {
             Fallbacks::Auto => config.model == DEFAULT_MODEL,
             Fallbacks::On => true,
@@ -501,139 +274,70 @@ impl AnthropicJudge {
             .header("anthropic-version", API_VERSION)
     }
 
-    /// An error for a status other than 200.
+    /// An error for a status other than 200. `rejects_option` is set for a
+    /// 400 that names the fallbacks field or its beta header.
     fn status_failure(
         &self,
         status: u16,
         body: Option<&[u8]>,
         retry_after: Option<Duration>,
     ) -> Failure {
-        let (kind, detail) = body.map(error_detail).unwrap_or_default();
+        let detail = error_detail(body);
         let names_fallbacks = status == 400
             && detail
+                .message
                 .as_deref()
                 .is_some_and(|d| d.contains("fallbacks") || d.contains("anthropic-beta"));
-        let mut message = format!("HTTP {status}");
-        if (300..400).contains(&status) {
-            message.push_str(" (redirects are not followed)");
-        }
-        if let Some(kind) = kind.filter(|k| is_identifier(k)) {
-            message.push(' ');
-            message.push_str(&kind);
-        }
-        if let Some(detail) = detail {
-            let detail = clean(&self.key.redact(&detail), MAX_ERROR_DETAIL_CHARS);
-            if !detail.is_empty() {
-                message.push_str(": ");
-                message.push_str(&detail);
-            }
-        }
-        // The error type also comes from the remote side.
-        let message = self.key.redact(&message);
         Failure {
-            error: JudgeError::new(JudgeErrorKind::Api, message).with_http_status(status),
+            error: status_error(&self.key, status, &detail),
             retry_after,
-            names_fallbacks,
+            rejects_option: names_fallbacks,
         }
     }
 
-    async fn attempt(&self, user: &str, fallbacks: bool) -> Result<Verdict, Failure> {
+    async fn attempt(&self, user: &str) -> Result<Verdict, Failure> {
+        let fallbacks = self.fallbacks_on();
         let mut request = self.request(reqwest::Method::POST, "/v1/messages");
         if fallbacks {
             request = request.header("anthropic-beta", FALLBACKS_BETA);
         }
-        let response = request
-            .json(&build_body(&self.config, user, fallbacks))
-            .send()
-            .await
-            .map_err(|e| transport_error(&e))?;
-        let status = response.status().as_u16();
-        let header = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-        };
-        let retry_after = parse_retry_after(header("retry-after-ms"), header("retry-after"));
-
-        if status != 200 {
-            // The body only adds detail, so a body that cannot be read is
-            // left out.
-            let body = read_capped(response, MAX_RESPONSE_BYTES)
-                .await
-                .ok()
-                .flatten();
-            return Err(self.status_failure(status, body.as_deref(), retry_after));
+        let reply = send(request.json(&build_body(&self.config, user, fallbacks))).await?;
+        if reply.status != 200 {
+            let (status, retry_after) = (reply.status, reply.retry_after);
+            let body = reply.error_body().await;
+            let mut failure = self.status_failure(status, body.as_deref(), retry_after);
+            // Only a request that carried the field can drop it.
+            failure.rejects_option &= fallbacks;
+            return Err(failure);
         }
-        let body = read_capped(response, MAX_RESPONSE_BYTES)
-            .await
-            .map_err(|e| transport_error(&e))?;
-        let Some(body) = body else {
-            return Err(JudgeError::new(
-                JudgeErrorKind::InvalidOutput,
-                "the response is larger than 1 MiB",
-            )
-            .into());
-        };
-        // A remote text could repeat the key, so it is taken out here too.
-        parse_response(&body, &self.config.model).map_err(|mut error| {
-            error.message = self.key.redact(&error.message);
-            Failure::from(error)
-        })
+        let body = reply.body().await?;
+        // A remote text could repeat the key, so it is taken out here too:
+        // of an error, and of the model name and the rationale of an answer.
+        parse_response(&body, &self.config.model)
+            .map(|verdict| self.key.scrub(verdict, &self.id))
+            .map_err(|mut error| {
+                error.message = self.key.redact(&error.message);
+                Failure::from(error)
+            })
     }
 
     async fn run(&self, question: &Question, deadline: Instant) -> Result<Verdict, JudgeError> {
         let user = user_content(question);
-        let mut failed = 0;
-        let mut dropped_fallbacks = false;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(deadline_error());
-            }
-            let fallbacks = self.fallbacks_on();
-            let failure =
-                match tokio::time::timeout_at(deadline, self.attempt(&user, fallbacks)).await {
-                    Err(_) => return Err(deadline_error()),
-                    Ok(Ok(verdict)) => return Ok(verdict),
-                    Ok(Err(failure)) => failure,
-                };
-            if fallbacks && failure.names_fallbacks && !dropped_fallbacks {
-                // The API does not take the field here. Ask once more
-                // without it, and leave it out from now on.
-                dropped_fallbacks = true;
+        run_with_retries(
+            &self.id,
+            deadline,
+            || self.attempt(&user),
+            || {
+                // The API does not take the field here. It is left out from
+                // now on.
                 self.fallbacks_rejected.store(true, Ordering::Relaxed);
                 tracing::warn!(
                     judge = %self.id,
                     "the API rejected the fallbacks field; it is off from now on"
                 );
-                continue;
-            }
-            failed += 1;
-            let error = failure.error;
-            let retryable = match error.kind() {
-                JudgeErrorKind::Transport => true,
-                JudgeErrorKind::Api => error.http_status().is_some_and(retryable_status),
-                _ => false,
-            };
-            if !retryable || failed >= MAX_ATTEMPTS {
-                return Err(error);
-            }
-            let wait = failure
-                .retry_after
-                .unwrap_or_else(|| backoff(failed, random_u64()));
-            // A wait that does not fit before the deadline is not started.
-            if Instant::now() + wait >= deadline {
-                return Err(error);
-            }
-            tracing::debug!(
-                judge = %self.id,
-                status = error.http_status(),
-                attempt = failed,
-                wait_ms = wait.as_millis() as u64,
-                "the judge call failed; trying again"
-            );
-            tokio::time::sleep(wait).await;
-        }
+            },
+        )
+        .await
     }
 
     /// Asks the API for the model. It shows whether the key, the model
@@ -641,19 +345,12 @@ impl AnthropicJudge {
     pub async fn probe(&self, deadline: Instant) -> Result<(), JudgeError> {
         let path = format!("/v1/models/{}", self.config.model);
         let call = async {
-            let response = self
-                .request(reqwest::Method::GET, &path)
-                .send()
-                .await
-                .map_err(|e| transport_error(&e))?;
-            let status = response.status().as_u16();
-            if status == 200 {
+            let reply = send(self.request(reqwest::Method::GET, &path)).await?;
+            if reply.status == 200 {
                 return Ok(());
             }
-            let body = read_capped(response, MAX_RESPONSE_BYTES)
-                .await
-                .ok()
-                .flatten();
+            let status = reply.status;
+            let body = reply.error_body().await;
             Err(self.status_failure(status, body.as_deref(), None).error)
         };
         match tokio::time::timeout_at(deadline, call).await {
@@ -700,6 +397,7 @@ impl Judge for AnthropicJudge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::MAX_ERROR_DETAIL_CHARS;
     use assessment_core::model::TextRelation;
 
     const KEY: &str = "sk-ant-test-0123456789abcdef";
@@ -1015,43 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_is_read_from_either_header() {
-        let ms = Duration::from_millis;
-        assert_eq!(parse_retry_after(Some("250"), None), Some(ms(250)));
-        assert_eq!(parse_retry_after(Some("250"), Some("9")), Some(ms(250)));
-        assert_eq!(parse_retry_after(None, Some("2")), Some(ms(2000)));
-        assert_eq!(parse_retry_after(None, Some(" 1.5 ")), Some(ms(1500)));
-        assert_eq!(parse_retry_after(None, Some("0")), Some(ms(0)));
-        assert_eq!(parse_retry_after(Some("soon"), Some("3")), Some(ms(3000)));
-        assert_eq!(parse_retry_after(None, None), None);
-        assert_eq!(parse_retry_after(None, Some("-1")), None);
-        assert_eq!(parse_retry_after(None, Some("NaN")), None);
-        assert_eq!(parse_retry_after(None, Some("inf")), None);
-        assert_eq!(
-            parse_retry_after(None, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
-            None
-        );
-        // A huge number does not overflow.
-        assert!(parse_retry_after(Some("1e300"), None).is_some());
-    }
-
-    #[test]
-    fn the_backoff_doubles_and_never_exceeds_8_seconds() {
-        let ms = Duration::from_millis;
-        assert_eq!(backoff(1, 0), ms(500));
-        assert_eq!(backoff(2, 0), ms(1000));
-        assert_eq!(backoff(3, 0), ms(2000));
-        assert_eq!(backoff(5, 0), ms(8000));
-        for failed in 0..80 {
-            for random in [0, 1, 511, 1023, u64::MAX] {
-                let wait = backoff(failed, random);
-                assert!(wait <= MAX_BACKOFF, "{failed} {random}");
-                assert!(wait >= ms(375), "{failed} {random}");
-            }
-        }
-    }
-
-    #[test]
     fn the_key_never_shows_in_debug_output() {
         let key = ApiKey::new(&format!("  {KEY}\n")).expect("key");
         assert_eq!(format!("{key:?}"), "ApiKey([redacted])");
@@ -1060,23 +721,6 @@ mod tests {
         assert!(!shown.contains(KEY), "{shown}");
         assert!(!shown.contains("0123456789"), "{shown}");
         assert!(shown.contains("anthropic/claude-opus-5-5"));
-    }
-
-    #[test]
-    fn a_bad_key_is_refused_without_repeating_it() {
-        for bad in [
-            "",
-            "   ",
-            "sk-ant\nsecret-part",
-            "sk ant secret-part",
-            "sk-ключ",
-        ] {
-            let error = ApiKey::new(bad).expect_err("bad key");
-            if !bad.trim().is_empty() {
-                assert!(!error.message().contains("secret-part"));
-                assert!(!error.message().contains(bad));
-            }
-        }
     }
 
     #[test]
@@ -1129,7 +773,7 @@ mod tests {
         let names = |status, message: &str| {
             judge
                 .status_failure(status, Some(body(message).as_bytes()), None)
-                .names_fallbacks
+                .rejects_option
         };
         assert!(names(400, "fallbacks: Extra inputs are not permitted"));
         assert!(names(
@@ -1138,52 +782,7 @@ mod tests {
         ));
         assert!(!names(400, "max_tokens: must be positive"));
         assert!(!names(500, "fallbacks"));
-        assert!(!judge.status_failure(400, None, None).names_fallbacks);
-    }
-
-    #[test]
-    fn the_base_url_rules_hold() {
-        let ok = |url: &str| validate_base_url(url).expect(url);
-        assert_eq!(
-            ok("https://api.anthropic.com"),
-            ("https://api.anthropic.com".to_owned(), false)
-        );
-        assert_eq!(
-            ok("https://api.anthropic.com/"),
-            ("https://api.anthropic.com".to_owned(), false)
-        );
-        assert_eq!(
-            ok("https://gateway.example/anthropic/"),
-            ("https://gateway.example/anthropic".to_owned(), false)
-        );
-        assert_eq!(
-            ok("http://127.0.0.1:8080"),
-            ("http://127.0.0.1:8080".to_owned(), true)
-        );
-        assert!(ok("http://localhost:8080").1);
-        assert!(ok("http://[::1]:8080").1);
-        assert!(ok("https://localhost").1);
-        assert!(ok("http://127.8.9.10").1);
-
-        let secret = "hunter2secret";
-        let bad = [
-            "http://api.anthropic.com".to_owned(),
-            "http://10.0.0.5:8080".to_owned(),
-            "http://localhost.example.com".to_owned(),
-            "http://0.0.0.0:8080".to_owned(),
-            "ftp://127.0.0.1".to_owned(),
-            format!("https://user:{secret}@api.anthropic.com"),
-            format!("https://{secret}@api.anthropic.com"),
-            format!("https://api.anthropic.com/?key={secret}"),
-            format!("https://api.anthropic.com/#{secret}"),
-            format!("{secret} not a url"),
-            "api.anthropic.com".to_owned(),
-            String::new(),
-        ];
-        for url in &bad {
-            let error = validate_base_url(url).expect_err(url);
-            assert!(!error.message().contains(secret), "{error}");
-        }
+        assert!(!judge.status_failure(400, None, None).rejects_option);
     }
 
     #[test]
